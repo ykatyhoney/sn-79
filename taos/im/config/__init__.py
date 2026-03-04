@@ -188,14 +188,14 @@ def add_im_validator_args(cls, parser):
         "--scoring.kappa.normalization_min",
         type=float,
         help="Kappa-3 values are normalized to fall within a range so as to produce non-negative value and facilitate scoring calculations. This is the minimum value in the normalization range.",
-        default=-10.0,
+        default=-2.5,
     )
 
     parser.add_argument(
         "--scoring.kappa.normalization_max",
         type=float,
         help="Kappa-3 values are normalized to fall within a range so as to produce non-negative value and facilitate scoring calculations. This is the maximum value in the normalization range.",
-        default=10.0,
+        default=2.5,
     )
     
     parser.add_argument(
@@ -343,4 +343,86 @@ def add_im_validator_args(cls, parser):
         action="store_true",
         help="If set, the validator will not publish metrics.",
         default=False,
+    )
+
+    # ── Exchange engine arguments ──────────────────────────────────────────────
+    parser.add_argument(
+        "--exchange.netuids",
+        type=str,
+        help="Comma-separated subnet UIDs to include as exchange books. "
+             "Empty = auto-discover from chain state on first tick.",
+        default="",
+    )
+
+    parser.add_argument(
+        "--exchange.wallet.mode",
+        type=str,
+        choices=["single", "per_agent"],
+        help="Wallet mode for on-chain execution. "
+             "'single': one default wallet for all agents; "
+             "'per_agent': each agent UID uses a dedicated wallet.",
+        default="single",
+    )
+
+    parser.add_argument(
+        "--exchange.wallet.path",
+        type=str,
+        help="Filesystem path to the bittensor wallets directory.",
+        default="~/.bittensor/wallets",
+    )
+
+    parser.add_argument(
+        "--exchange.timeout",
+        type=float,
+        help="IPC response timeout in seconds for LOB exchange communication.",
+        default=60.0,
+    )
+
+    parser.add_argument(
+        "--exchange.max_retries",
+        type=int,
+        help="Maximum number of send+receive attempts before giving up on a batch.",
+        default=3,
+    )
+
+    parser.add_argument(
+        "--exchange.ipc.request_queue",
+        type=str,
+        help="POSIX message queue name for LOB batch requests.",
+        default="/mvtrx_req_queue",
+    )
+
+    parser.add_argument(
+        "--exchange.ipc.response_queue",
+        type=str,
+        help="POSIX message queue name for LOB batch responses.",
+        default="/mvtrx_res_queue",
+    )
+
+    parser.add_argument(
+        "--exchange.ipc.request_shm",
+        type=str,
+        help="POSIX shared memory name for LOB batch request payloads.",
+        default="/mvtrx_req_shm",
+    )
+
+    parser.add_argument(
+        "--exchange.ipc.response_shm",
+        type=str,
+        help="POSIX shared memory name for LOB batch response payloads.",
+        default="/mvtrx_res_shm",
+    )
+
+    parser.add_argument(
+        "--exchange.ipc.request_semaphore",
+        type=str,
+        help="POSIX semaphore name used to signal the LOB that a request is ready.",
+        default="/mvtrx_req_sem",
+    )
+
+    parser.add_argument(
+        "--exchange.ipc.response_semaphore",
+        type=str,
+        help="POSIX semaphore name used by the LOB to signal that a response is ready.",
+        default="/mvtrx_res_sem",
     )
