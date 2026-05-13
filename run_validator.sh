@@ -313,12 +313,12 @@ _gentrx_validator_setup() {
                 ;;
         esac
         echo
-        _step "Write credentials (gradient server — stays on this host)"
+        _step "Write token — gradient server (stays on this host)"
         _prompt_secret GENTRX_VALIDATOR_S3_WRITE_ACCESS_KEY "Write access key ID"
         _prompt_secret GENTRX_VALIDATOR_S3_WRITE_SECRET_KEY "Write secret access key"
     fi
 
-    _step "Read credentials (committed on-chain — used by miners to discover you)"
+    _step "Read-only token — committed on-chain so miners can find your bucket"
     _prompt_secret GENTRX_VALIDATOR_S3_READ_ACCESS_KEY  "Read-only access key ID"
     _prompt_secret GENTRX_VALIDATOR_S3_READ_SECRET_KEY  "Read-only secret access key"
     echo
@@ -444,6 +444,17 @@ except Exception:
                 _env_write "GENTRX_GRAD_LOCAL" "0"
                 export GENTRX_GRAD_HOST
             fi
+        fi
+        # Prompt for API key if not already set (printed by run_vast/run_gradients after first launch)
+        if [ -z "${GENTRX_API_KEY:-}" ]; then
+            _step "API key"
+            _info "The gradient server requires an API key. Copy it from the GPU host"
+            _info "(printed at the end of run_vast.sh / run_gradients.sh on first launch,"
+            _info "or found in .env on that host as GENTRX_API_KEY)."
+            _prompt_secret GENTRX_API_KEY "API key"
+            export GENTRX_API_KEY
+        else
+            _ok "API key: already set"
         fi
 
     elif [ "${GENTRX_GRAD_LOCAL:-0}" = "1" ]; then

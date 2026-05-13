@@ -132,6 +132,7 @@ class StatePackager:
     def __init__(self) -> None:
         self._step: int = 0
         self._config_saved: bool = False
+        self._current_sim_id: str | None = None
 
     def extract_state(self, state: Any) -> dict:
         """Extract books + events + timestamp from state into a tick dict."""
@@ -169,10 +170,10 @@ class StatePackager:
         sim_events = _extract_sim_events(state)
         if sim_events:
             packet["sim_events"] = sim_events
+            if "ESS" in sim_events:
+                self._config_saved = False
+                self._current_sim_id = None
 
-        # Include decimal config + simulation_id on first packet so the gradient
-        # server knows the scale and can stamp run-identity onto its log events
-        # without having to invent its own id.
         if not self._config_saved:
             config = _val(state, "config", {})
             sim_id = _get(config, "simulation_id", None)
@@ -181,11 +182,17 @@ class StatePackager:
                 "volumeDecimals": _get(config, "volumeDecimals", 8),
                 "simulation_id": sim_id,
             }
-            # Only mark saved once we have a real sim_id so the gradient
-            # server isn't stuck with sim_id=null if the first packet arrives
-            # before the simulator has set its logDir.
             if sim_id is not None:
                 self._config_saved = True
+                self._current_sim_id = sim_id
+
+        if self._current_sim_id is None:
+            cur = _get(_val(state, "config", {}), "simulation_id", None)
+            if cur is not None:
+                self._current_sim_id = cur
+
+        if self._current_sim_id is not None:
+            packet["sim_id"] = self._current_sim_id
 
         self._step += 1
         return packet

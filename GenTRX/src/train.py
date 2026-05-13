@@ -122,7 +122,7 @@ def load_checkpoint(
     device: str = "cpu",
 ) -> dict:
     """Load checkpoint and return the full dict."""
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    ckpt = torch.load(path, map_location=device, weights_only=True)
     if "model_config" not in ckpt and "config" in ckpt:
         ckpt["model_config"] = ckpt.pop("config")
     return ckpt

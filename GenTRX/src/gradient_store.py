@@ -153,6 +153,7 @@ _PROPOSAL_PRUNE_PREFIX = "proposals/{uid}/"
 _DATA_PREFIX = "data/{uid}/{book_id}/intervals/"
 _DATA_BOOKS_PREFIX = "data/{uid}/"
 _DATA_KEY = "data/{uid}/{book_id}/intervals/{filename}"
+_DATA_SIM_MARKER = "data/{uid}/.sim_id"
 
 
 class GradientStore:
@@ -448,6 +449,24 @@ class GradientStore:
                 fname = obj["Key"].split("/")[-1]
                 filenames.append(fname)
         return filenames
+
+    def put_sim_marker(self, validator_uid: int | str, sim_id: str) -> None:
+        """Write data/<uid>/.sim_id marker so future processes can check bucket lineage."""
+        key = self._key(_DATA_SIM_MARKER, uid=validator_uid)
+        self._put_with_retry(key, sim_id.encode("utf-8"))
+
+    def get_sim_marker(self, validator_uid: int | str) -> str | None:
+        """Read data/<uid>/.sim_id; return None if missing or empty."""
+        client = self._get_sync_client()
+        key = self._key(_DATA_SIM_MARKER, uid=validator_uid)
+        try:
+            resp = client.get_object(Bucket=self.bucket, Key=key)
+        except Exception:
+            return None
+        raw = resp["Body"].read()
+        if not raw:
+            return None
+        return raw.decode("utf-8").strip() or None
 
     def list_books(self, validator_uid: int | str) -> list[int]:
         """List book IDs that have data under <validator_uid>'s data shard."""

@@ -38,6 +38,8 @@ class MockGradientServer:
             "4": {"parquets": ["00000000-00000300.parquet"], "max_ts": 300_000_000_000},
         }
         self.received_rounds: list[dict] = []
+        self.received_states: list[bytes] = []
+        self.state_fail_remaining: int = 0
         self.latest_scores: dict | None = None
 
     def data_status(self) -> dict:
@@ -80,6 +82,12 @@ def http_server(mock_server):
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
             if self.path.startswith("/state"):
+                if mock_server.state_fail_remaining > 0:
+                    mock_server.state_fail_remaining -= 1
+                    self.send_response(500)
+                    self.end_headers()
+                    return
+                mock_server.received_states.append(body)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -283,3 +291,95 @@ def test_push_state_swallows_exceptions(http_server):
     packager.extract_state.side_effect = RuntimeError("extraction failed")
     s = GenTRXService(packager=packager, gradient_server_url=http_server)
     s.push_state(MagicMock())  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# TX worker, retry, spool durability
+# ---------------------------------------------------------------------------
+
+
+def _wait_until(predicate, timeout: float = 2.0, interval: float = 0.02) -> bool:
+    import time as _t
+    deadline = _t.time() + timeout
+    while _t.time() < deadline:
+        if predicate():
+            return True
+        _t.sleep(interval)
+    return predicate()
+
+
+def test_push_state_enqueues_and_drains(http_server, mock_server):
+    packager = MagicMock()
+    packager.extract_state.return_value = {"step": 0, "books": {}}
+    s = GenTRXService(packager=packager, gradient_server_url=http_server)
+    s.push_state(MagicMock())
+    assert _wait_until(lambda: len(mock_server.received_states) == 1)
+
+
+def test_push_state_does_not_block_on_failure(http_server, mock_server):
+    import time as _t
+    mock_server.state_fail_remaining = 100
+    packager = MagicMock()
+    packager.extract_state.return_value = {"step": 0, "books": {}}
+    s = GenTRXService(packager=packager, gradient_server_url=http_server)
+    t0 = _t.time()
+    s.push_state(MagicMock())
+    assert (_t.time() - t0) < 0.1
+
+
+def test_tx_worker_retries_on_500(http_server, mock_server):
+    mock_server.state_fail_remaining = 1
+    packager = MagicMock()
+    packager.extract_state.return_value = {"step": 0, "books": {}}
+    s = GenTRXService(packager=packager, gradient_server_url=http_server)
+    s.push_state(MagicMock())
+    assert _wait_until(lambda: len(mock_server.received_states) == 1, timeout=3.0)
+
+
+def test_tx_queue_drops_oldest_without_spool(http_server, mock_server):
+    mock_server.state_fail_remaining = 100_000
+    packager = MagicMock()
+    counter = {"n": 0}
+    def _extract(_):
+        counter["n"] += 1
+        return {"step": counter["n"], "books": {}}
+    packager.extract_state.side_effect = _extract
+    s = GenTRXService(packager=packager, gradient_server_url=http_server)
+    # Spool disabled, so queue is bounded by DEFAULT_TX_QUEUE_SIZE → drop-oldest.
+    s._tx_queue.maxsize = 4
+    while not s._tx_queue.empty():
+        try:
+            s._tx_queue.get_nowait()
+        except Exception:
+            break
+    for _ in range(14):
+        s.push_state(MagicMock())
+    assert _wait_until(lambda: s._tx_drops >= 10, timeout=2.0)
+
+
+def test_spool_persists_unsent_across_instance(http_server, mock_server, tmp_path):
+    import time as _t
+    spool = str(tmp_path / "spool.bin")
+    mock_server.state_fail_remaining = 100
+    packager = MagicMock()
+    packager.extract_state.return_value = {"step": 1, "books": {}}
+    s1 = GenTRXService(packager=packager, gradient_server_url=http_server, tx_spool_path=spool)
+    s1.push_state(MagicMock())
+    _t.sleep(0.2)
+    s1._tx_stop.set()
+
+    mock_server.state_fail_remaining = 0
+    GenTRXService(packager=packager, gradient_server_url=http_server, tx_spool_path=spool)
+    assert _wait_until(lambda: len(mock_server.received_states) >= 1, timeout=2.0)
+
+
+def test_spool_unbounded_queue_replays_all(http_server, mock_server, tmp_path):
+    """C3: when spool is enabled, queue is unbounded so replay > 256 still drains."""
+    import time as _t
+    spool = str(tmp_path / "spool.bin")
+    packager = MagicMock()
+    packager.extract_state.return_value = {"step": 1, "books": {}}
+    s1 = GenTRXService(packager=packager, gradient_server_url=http_server, tx_spool_path=spool)
+    # Maxsize 0 = unbounded.
+    assert s1._tx_queue.maxsize == 0
+    s1._tx_stop.set()

@@ -32,3 +32,4 @@ pyarrow>=14.0
 structlog>=23.2
 sortedcontainers>=2.4
 tqdm>=4.66
+optuna

@@ -792,11 +792,12 @@ class MinerTrainingService:
             return False
 
     def _load_model(self, checkpoint: str) -> None:
-        import torch
+        from GenTRX.src.gradient import load_checkpoint_safely, validate_state_dict
         from GenTRX.src.model import OrderModel, ModelConfig
         from GenTRX.src.tokenizer import OrderTokenizer, TokenizerConfig
+        import torch
 
-        ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        ckpt = load_checkpoint_safely(checkpoint)
         raw_cfg = ckpt.get("model_config", ckpt.get("config", {}))
         self.model_cfg = ModelConfig(
             **{k: v for k, v in raw_cfg.items() if k in ModelConfig.__dataclass_fields__}
@@ -805,8 +806,8 @@ class MinerTrainingService:
         self.tokenizer_cfg = (
             TokenizerConfig.from_dict(tok_dict) if tok_dict else TokenizerConfig()
         )
-
         self.model = OrderModel(self.model_cfg)
+        validate_state_dict(ckpt["model_state_dict"], self.model.state_dict())
         self.model.load_state_dict(ckpt["model_state_dict"])
         self.model.eval()
         self.tokenizer = OrderTokenizer(self.tokenizer_cfg)

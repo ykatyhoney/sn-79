@@ -215,11 +215,11 @@ _gentrx_miner_setup() {
             ;;
     esac
     echo
-    _step "Write credentials (gradient uploads — stays on this host)"
+    _step "Write token (1 of 2) — for gradient uploads, stays on this host"
     _prompt_secret GENTRX_AGENT_S3_ACCESS_KEY "Write access key ID"
     _prompt_secret GENTRX_AGENT_S3_SECRET_KEY "Write secret access key"
 
-    _step "Read credentials (committed on-chain — validators use these to score your gradients)"
+    _step "Read-only token (2 of 2) — committed on-chain so validators can score your gradients"
     _prompt_secret GENTRX_AGENT_S3_READ_ACCESS_KEY "Read-only access key ID"
     _prompt_secret GENTRX_AGENT_S3_READ_SECRET_KEY "Read-only secret access key"
     _ok "Miner S3 credentials saved to .env"

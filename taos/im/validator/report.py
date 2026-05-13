@@ -210,6 +210,10 @@ class ReportingService:
         self.prometheus_gentrx_gauges = Gauge('gentrx_gauges', 'GenTRX distributed-training validator metrics.', ['wallet', 'netuid', 'sim_id', 'gentrx_gauge_name'], registry=self.registry_gentrx)
         self.prometheus_gentrx_miner_scores = Gauge('gentrx_miner_scores', 'Per-miner GenTRX EMA score (validator-smoothed).', ['wallet', 'netuid', 'sim_id', 'uid'], registry=self.registry_gentrx)
         self.prometheus_gentrx_training = Gauge('gentrx_training', 'GenTRX model training statistics (loss, acceptance, timing).', ['wallet', 'netuid', 'sim_id', 'stat'], registry=self.registry_gentrx)
+        self.prometheus_gentrx_miner_score_own = Gauge('gentrx_miner_score_own', 'Per-miner GenTRX own-data score (last round, pre-EMA).', ['wallet', 'netuid', 'sim_id', 'uid'], registry=self.registry_gentrx)
+        self.prometheus_gentrx_miner_score_held = Gauge('gentrx_miner_score_held', 'Per-miner GenTRX held-out validation score (last round, pre-EMA).', ['wallet', 'netuid', 'sim_id', 'uid'], registry=self.registry_gentrx)
+        self.prometheus_gentrx_miner_score = Gauge('gentrx_miner_score', 'Per-miner GenTRX combined score (last round, pre-EMA).', ['wallet', 'netuid', 'sim_id', 'uid'], registry=self.registry_gentrx)
+        self.prometheus_gentrx_miner_accepted = Gauge('gentrx_miner_accepted', 'Per-miner GenTRX gradient accepted in last round (1=yes, 0=no).', ['wallet', 'netuid', 'sim_id', 'uid'], registry=self.registry_gentrx)
         self._start_metrics_server()
         self.prometheus_initialized = True
         
@@ -412,6 +416,7 @@ class ReportingService:
         self.gentrx_scores = data.get('gentrx_scores', {})
         self.gentrx_enabled = data.get('gentrx_enabled', False)
         self.gentrx_training = data.get('gentrx_training', {})
+        self.gentrx_scores_detailed = data.get('gentrx_scores_detailed', {})
         
         class SimpleState:
             pass
@@ -517,6 +522,21 @@ def publish_gentrx_gauges(self: ReportingService) -> None:
     ms = self.prometheus_gentrx_miner_scores
     for uid_str, score in gentrx_scores.items():
         ms.labels(wallet=wallet_addr, netuid=netuid, sim_id=simid, uid=str(uid_str)).set(float(score))
+
+    detailed = getattr(self, 'gentrx_scores_detailed', {}) or {}
+    for uid_key, entry in detailed.items():
+        if not isinstance(entry, dict):
+            continue
+        uid = str(uid_key)
+        lv = dict(wallet=wallet_addr, netuid=netuid, sim_id=simid, uid=uid)
+        s_own = entry.get('score_own')
+        s_held = entry.get('score_held')
+        if s_own is not None:
+            self.prometheus_gentrx_miner_score_own.labels(**lv).set(float(s_own))
+        if s_held is not None:
+            self.prometheus_gentrx_miner_score_held.labels(**lv).set(float(s_held))
+        self.prometheus_gentrx_miner_score.labels(**lv).set(float(entry.get('score', 0.0)))
+        self.prometheus_gentrx_miner_accepted.labels(**lv).set(1.0 if entry.get('accepted') else 0.0)
 
     # Training stats from last aggregation round
     tr = getattr(self, 'gentrx_training', {}) or {}

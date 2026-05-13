@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: 2025 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
+import json
+
 import bittensor as bt
-from pydantic import ConfigDict
+from pydantic import ConfigDict, model_validator
 
 
 class GenTRXAssignment(bt.Synapse):
@@ -15,6 +17,20 @@ class GenTRXAssignment(bt.Synapse):
     """
 
     model_config = ConfigDict(protected_namespaces=())
+
+    # bittensor 10.2's parent validator does `values["name"] = ...` and crashes
+    # when the dendrite ships the synapse as a raw-bytes body. Decode here.
+    @model_validator(mode="before")
+    @classmethod
+    def set_name_type(cls, values):
+        if isinstance(values, (bytes, bytearray)):
+            try:
+                values = json.loads(values)
+            except (json.JSONDecodeError, ValueError):
+                return values
+        if isinstance(values, dict):
+            values["name"] = cls.__name__
+        return values
 
     round: int = 0
     model_version: int = 0

@@ -242,23 +242,108 @@ def serialize(comp: CompressedGradient) -> bytes:
     return buf.getvalue()
 
 
-def deserialize(data: bytes) -> CompressedGradient:
-    """Deserialize bytes back to CompressedGradient."""
-    buf = io.BytesIO(data)
-    d = torch.load(buf, map_location="cpu", weights_only=False)
+# Safe-load + schema-gate pattern follows tplr/comms.py; see NOTICE.
+def safe_torch_load(buf_or_path: Any) -> Any:
+    return torch.load(buf_or_path, map_location="cpu", weights_only=True)
+
+
+def deserialize(
+    data: bytes,
+    *,
+    expected_shapes: dict[str, torch.Size],
+) -> CompressedGradient:
+    """Decode a gradient blob, validating against `expected_shapes`."""
+    d = safe_torch_load(io.BytesIO(data))
+    if not isinstance(d, dict) or set(d.keys()) != {"metadata", "sparse"}:
+        raise ValueError("malformed gradient payload")
 
     meta_d = d["metadata"]
+    if not isinstance(meta_d, dict):
+        raise ValueError("metadata must be a dict")
+    traj = meta_d.get("loss_trajectory", []) or []
+    if not isinstance(traj, list):
+        raise ValueError("loss_trajectory must be a list")
     metadata = GradientMetadata(
-        window_id=meta_d["window_id"],
-        miner_uid=meta_d["miner_uid"],
-        steps_trained=meta_d["steps_trained"],
-        loss_before=meta_d["loss_before"],
-        loss_after=meta_d["loss_after"],
-        loss_trajectory=meta_d.get("loss_trajectory", []),
+        window_id=int(meta_d.get("window_id", 0)),
+        miner_uid=int(meta_d.get("miner_uid", 0)),
+        steps_trained=int(meta_d.get("steps_trained", 0)),
+        loss_before=float(meta_d.get("loss_before", 0.0)),
+        loss_after=float(meta_d.get("loss_after", 0.0)),
+        loss_trajectory=[float(x) for x in traj],
     )
 
-    sparse = {}
-    for name, sd in d["sparse"].items():
-        sparse[name] = (sd["indices"], sd["values"], torch.Size(sd["shape"]))
+    sparse_d = d["sparse"]
+    if not isinstance(sparse_d, dict):
+        raise ValueError("sparse must be a dict")
+    unknown = set(sparse_d.keys()) - set(expected_shapes.keys())
+    if unknown:
+        raise ValueError(f"unknown param names: {sorted(unknown)[:5]}")
+
+    sparse: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Size]] = {}
+    for name, sd in sparse_d.items():
+        if not isinstance(sd, dict) or set(sd.keys()) != {"indices", "values", "shape"}:
+            raise ValueError(f"sparse[{name}] malformed")
+        idx = sd["indices"]
+        vals = sd["values"]
+        shape_list = sd["shape"]
+        if not isinstance(idx, torch.Tensor) or not isinstance(vals, torch.Tensor):
+            raise ValueError(f"sparse[{name}] indices/values must be tensors")
+        if not isinstance(shape_list, list) or not all(isinstance(x, int) for x in shape_list):
+            raise ValueError(f"sparse[{name}] shape must be list[int]")
+        shape = torch.Size(shape_list)
+        expected = expected_shapes[name]
+        if tuple(shape) != tuple(expected):
+            raise ValueError(
+                f"sparse[{name}] shape {tuple(shape)} != expected {tuple(expected)}"
+            )
+        if idx.dtype not in (torch.int32, torch.int64):
+            raise ValueError(f"sparse[{name}] indices dtype must be int")
+        if idx.numel() != vals.numel():
+            raise ValueError(f"sparse[{name}] indices/values size mismatch")
+        if not torch.isfinite(vals).all():
+            raise ValueError(f"sparse[{name}] non-finite values")
+        n_total = expected.numel()
+        if idx.numel() > 0 and (int(idx.min().item()) < 0 or int(idx.max().item()) >= n_total):
+            raise ValueError(f"sparse[{name}] indices out of range")
+        sparse[name] = (idx, vals, shape)
 
     return CompressedGradient(sparse=sparse, metadata=metadata)
+
+
+def load_checkpoint_safely(path: str) -> dict[str, Any]:
+    """Safe-load a .pt checkpoint; caller must follow up with `validate_state_dict`."""
+    ckpt = safe_torch_load(path)
+    if not isinstance(ckpt, dict):
+        raise ValueError("checkpoint must be a dict")
+
+    raw_cfg = ckpt.get("model_config", ckpt.get("config", {}))
+    if not isinstance(raw_cfg, dict):
+        raise ValueError("model_config must be a dict")
+
+    tok_dict = ckpt.get("tokenizer_config")
+    if tok_dict is not None and not isinstance(tok_dict, dict):
+        raise ValueError("tokenizer_config must be a dict")
+
+    state_dict = ckpt.get("model_state_dict")
+    if not isinstance(state_dict, dict):
+        raise ValueError("model_state_dict must be a dict")
+    return ckpt
+
+
+def validate_state_dict(
+    state_dict: dict[str, Any],
+    expected: dict[str, torch.Tensor],
+) -> None:
+    """Reject a state dict whose keys, shapes, or values don't match `expected`."""
+    unknown = set(state_dict.keys()) - set(expected.keys())
+    if unknown:
+        raise ValueError(f"state_dict has unknown params: {sorted(unknown)[:5]}")
+    for name, t in state_dict.items():
+        if not isinstance(t, torch.Tensor):
+            raise ValueError(f"state_dict[{name}] must be a tensor")
+        if tuple(t.shape) != tuple(expected[name].shape):
+            raise ValueError(
+                f"state_dict[{name}] shape {tuple(t.shape)} != expected {tuple(expected[name].shape)}"
+            )
+        if not torch.isfinite(t).all():
+            raise ValueError(f"state_dict[{name}] non-finite values")

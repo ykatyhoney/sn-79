@@ -173,10 +173,11 @@ if [ -z "$S3_BUCKET" ] || [ -z "$S3_WRITE_KEY" ] || [ -z "$S3_WRITE_SECRET" ]; t
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo " GenTRX Gradient Server — Credentials Setup"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    _step "Validator S3 bucket (write credentials)"
-    _info "The gradient server uploads checkpoints, training data, and proposals"
-    _info "to the validator S3 bucket using write credentials."
-    _info "These are the same credentials as GENTRX_VALIDATOR_S3_WRITE_* in .env"
+    _step "Validator S3 bucket"
+    _info "The gradient server needs WRITE credentials to upload checkpoints,"
+    _info "training data, and proposals to your validator S3 bucket."
+    _info "You will enter the write token first, then the read token."
+    _info "These match GENTRX_VALIDATOR_S3_WRITE_* / GENTRX_VALIDATOR_S3_READ_* in .env"
     _info "on the validator host — copy them here, or create new ones for this host."
     _info "From each R2 token, copy the Access Key ID and Secret Access Key"
     _info "(NOT the Token Value — that bearer string is for a different API)."
@@ -218,6 +219,7 @@ if [ -z "$S3_BUCKET" ] || [ -z "$S3_WRITE_KEY" ] || [ -z "$S3_WRITE_SECRET" ]; t
     esac
 
     echo
+    _step "Write token (1 of 2)"
     _prompt_secret GENTRX_VALIDATOR_S3_WRITE_ACCESS_KEY "Write access key ID"
     _prompt_secret GENTRX_VALIDATOR_S3_WRITE_SECRET_KEY "Write secret access key"
     S3_WRITE_KEY="${GENTRX_VALIDATOR_S3_WRITE_ACCESS_KEY}"
@@ -226,9 +228,8 @@ if [ -z "$S3_BUCKET" ] || [ -z "$S3_WRITE_KEY" ] || [ -z "$S3_WRITE_SECRET" ]; t
     _ok "Write credentials saved to .env"
 fi
 
-_step "Read credentials (committed on-chain — used by miners to find your bucket)"
+_step "Read-only token (2 of 2) — committed on-chain so miners can find your bucket"
 _info "A separate read-only API token on the same bucket."
-_info "Miners use these to discover where to upload gradients."
 _prompt_secret GENTRX_VALIDATOR_S3_READ_ACCESS_KEY "Read-only access key ID"
 _prompt_secret GENTRX_VALIDATOR_S3_READ_SECRET_KEY "Read-only secret access key"
 echo
@@ -343,6 +344,9 @@ else
     echo ""
 fi
 
+# nvitop — GPU monitor used in tmux pane; install silently if missing
+command -v nvitop > /dev/null 2>&1 || pip install nvitop -q || true
+
 # pm2 — install via npm if missing
 if ! command -v pm2 > /dev/null 2>&1; then
     if command -v npm > /dev/null 2>&1; then
@@ -396,7 +400,6 @@ echo "    Version: curl http://${GRAD_BIND}:${GRAD_PORT}/gentrx/version"
 echo ""
 
 if [ "$USE_TMUX" = "1" ]; then
-    command -v nvitop > /dev/null 2>&1 || pip install nvitop -q || true
     tmux kill-session -t gentrx 2>/dev/null || true
     tmux new-session -d -s gentrx -n 'gentrx' 'htop'
     tmux set-option -t gentrx mouse on

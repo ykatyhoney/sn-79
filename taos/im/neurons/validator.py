@@ -422,6 +422,10 @@ if __name__ != "__mp_main__":
             Returns:
                 bool: True if update steps completed successfully, False on error.
             """
+            endpoint = getattr(getattr(self.config, "subtensor", None), "chain_endpoint", "") or ""
+            if "localhost" in endpoint or "127.0.0.1" in endpoint:
+                # Auto-update assumes pm2 supervision; localnet runs raw python.
+                return True
             try:
                 validator_py_files_changed, simulator_config_changed, simulator_py_files_changed, simulator_cpp_files_changed = check_repo(self)
                 remote = self.repo.remotes[self.config.repo.remote]
@@ -626,7 +630,8 @@ if __name__ != "__mp_main__":
             self.benchmark_start_uid = self.subnet_info.max_uids
             if self.config.benchmark.agents:
                 self._load_benchmark_agents()
-            self.effective_max_uids = self.subnet_info.max_uids + len(self.benchmark_agents)
+            max_bm_uid = max((a['uid'] for a in self.benchmark_agents), default=self.subnet_info.max_uids - 1)
+            self.effective_max_uids = max(self.subnet_info.max_uids, max_bm_uid + 1)
             self.scores = torch.zeros(
                 self.effective_max_uids, dtype=torch.float32, device=self.device
             )
@@ -822,7 +827,7 @@ if __name__ != "__mp_main__":
                 with open(self.config.benchmark.agents, 'r') as f:
                     benchmark_config = json.load(f)                
                 for idx, agent in enumerate(benchmark_config['agents']):
-                    uid = self.benchmark_start_uid + idx
+                    uid = agent.get('uid', self.benchmark_start_uid + idx)
                     entry = {
                         'uid': uid,
                         'name': agent['name'],
@@ -2981,8 +2986,20 @@ if __name__ != "__mp_main__":
             previous_metagraph = copy.deepcopy(self.metagraph)
             bt.logging.debug("Syncing metagraph...")
             self.metagraph.sync(subtensor=self.subtensor)
-            if previous_metagraph.axons == self.metagraph.axons and len(self.hotkeys) == len(self.metagraph.hotkeys):            
+            if previous_metagraph.axons == self.metagraph.axons and len(self.hotkeys) == len(self.metagraph.hotkeys):
                 bt.logging.debug("No axon changes!")
+                # Re-register benchmark buckets even when the metagraph is unchanged,
+                # so a gradient server restart self-heals within one resync cycle.
+                _gtx = getattr(self, '_gentrx', None)
+                if _gtx is not None:
+                    for bm in self.benchmark_agents:
+                        bkt = bm.get('gentrx_bucket')
+                        if bkt:
+                            ok = _gtx.register_benchmark_bucket(bm['uid'], bkt)
+                            if ok:
+                                gtx_log.debug("re-registered benchmark bucket: uid=%d", bm['uid'])
+                            else:
+                                gtx_log.warning("failed to re-register benchmark bucket: uid=%d", bm['uid'])
                 return
 
             bt.logging.info(
@@ -2998,8 +3015,11 @@ if __name__ != "__mp_main__":
             if old_metagraph_size != new_metagraph_size:
                 bt.logging.info(f"Metagraph size changed: {old_metagraph_size} -> {new_metagraph_size}")
                 old_effective_max_uids = self.effective_max_uids
-                self.benchmark_start_uid = new_metagraph_size
-                self.effective_max_uids = new_metagraph_size + len(self.benchmark_agents)
+                # benchmark_start_uid stays at subnet_info.max_uids regardless of how many
+                # miners are currently registered — shifting it would move benchmark slots
+                # mid-simulation and mismatch the simulation's fixed account assignments.
+                max_bm_uid = max((a['uid'] for a in self.benchmark_agents), default=self.subnet_info.max_uids - 1)
+                self.effective_max_uids = max(self.subnet_info.max_uids, max_bm_uid + 1)
                 if old_effective_max_uids != self.effective_max_uids:
                     bt.logging.info(
                         f"Resizing scores tensor: {old_effective_max_uids} -> {self.effective_max_uids} "
@@ -3101,6 +3121,15 @@ if __name__ != "__mp_main__":
                 f"effective_max_uids={self.effective_max_uids}"
             )
 
+            # Re-register benchmark buckets after every resync so that a gradient
+            # server restart self-heals without requiring a validator restart.
+            _gtx = getattr(self, '_gentrx', None)
+            if _gtx is not None:
+                for bm in self.benchmark_agents:
+                    bkt = bm.get('gentrx_bucket')
+                    if bkt:
+                        _gtx.register_benchmark_bucket(bm['uid'], bkt)
+
         async def _maintain(self) -> None:
             """
             Executes metagraph sync and maintenance operations asynchronously.
@@ -3130,7 +3159,7 @@ if __name__ != "__mp_main__":
                 self.maintaining = False
 
         async def _deliver_gentrx_assignments(self, assignments: dict) -> None:
-            """Deliver GenTRX assignments to miners via dendrite."""
+            """Build delivery list from assignments and call deliver_gentrx."""
             try:
                 from taos.im.protocol.gentrx import GenTRXAssignment
 
@@ -3142,7 +3171,6 @@ if __name__ != "__mp_main__":
                 deliveries = []
                 for uid, assignment in assignments.items():
                     if uid >= len(self.metagraph.axons):
-                        # Benchmark miner — look up axon from config
                         bm_idx = uid - self.benchmark_start_uid
                         if bm_idx < 0 or bm_idx >= len(self.benchmark_agents):
                             continue
@@ -3150,9 +3178,9 @@ if __name__ != "__mp_main__":
                     else:
                         axon = self.metagraph.axons[uid]
                     if axon.hotkey == my_hotkey:
-                        continue  # skip self
+                        continue
                     if axon.ip == "0.0.0.0" or axon.port == 0:
-                        continue  # skip dead/unserved nodes
+                        continue
                     try:
                         deliveries.append((
                             uid,
@@ -3178,42 +3206,9 @@ if __name__ != "__mp_main__":
                 if not deliveries:
                     return
 
-                # Single round summary
                 round_id = next(iter(assignments.values())).get("round", "?")
                 gtx_log.info(f"round={round_id}: delivering to uids={[u for u,_,_ in deliveries]}")
-
-                # Use async-native dendrite call (matches taos/im/validator/query.py pattern).
-                # Reuse self.dendrite — creating a new one per call leaks aiohttp sessions
-                # and causes "attached to different loop" on subsequent cycles.
-                send_ok = 0
-                send_fail = 0
-
-                async def _send(uid, axon, synapse):
-                    nonlocal send_ok, send_fail
-                    t_start = time.time()
-                    try:
-                        resp = await self.dendrite(
-                            axons=axon, synapse=synapse, timeout=5, deserialize=False
-                        )
-                        t = time.time() - t_start
-                        status = getattr(getattr(resp, 'dendrite', None), 'status_code', None)
-                        msg = getattr(getattr(resp, 'dendrite', None), 'status_message', '')
-                        gtx_log.info(f"round={round_id} uid={uid} {axon.ip}:{axon.port} status={status} msg={msg} t={t:.2f}s")
-                        if status == 200:
-                            send_ok += 1
-                        else:
-                            send_fail += 1
-                    except Exception as exc:
-                        t = time.time() - t_start
-                        gtx_log.warning(f"round={round_id} uid={uid} send failed after {t:.2f}s: {exc}")
-                        send_fail += 1
-
-                t_deliver_start = time.time()
-                await asyncio.gather(*[_send(u, a, s) for u, a, s in deliveries])
-                t_deliver = time.time() - t_deliver_start
-                gtx_log.info(
-                    f"deliver round={round_id} n={len(deliveries)} ok={send_ok} fail={send_fail} t_total={t_deliver:.2f}s"
-                )
+                await deliver_gentrx(self, deliveries)
             except Exception as exc:
                 gtx_log.error(f"delivery failed: {exc}")
                 import traceback
@@ -3413,6 +3408,7 @@ if __name__ != "__mp_main__":
                 'gentrx_scores': {i: score.item() for i, score in enumerate(self.gentrx_scores)},
                 'gentrx_enabled': self._gentrx is not None,
                 'gentrx_training': self._gentrx.get_training_stats() if self._gentrx is not None else {},
+                'gentrx_scores_detailed': self._gentrx.get_scores() if self._gentrx is not None else {},
                 'miner_stats': self.miner_stats,
                 'initial_balances': self.initial_balances,
                 'initial_balances_published': self.initial_balances_published,
@@ -4201,13 +4197,16 @@ if __name__ != "__mp_main__":
             # Process deregistration notices
             self.process_resets(state)
 
-            # GenTRX: save state to S3 + poll/deliver assignments
+            # GenTRX: push state to gradient server before the mining query.
+            # push_state calls _http_post_sync — run in executor to avoid
+            # blocking the event loop while the HTTP connection is in flight.
             if self._gentrx is not None:
                 try:
-                    self._gentrx.push_state(state)
-                    await self._gentrx.poll_and_deliver()
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, self._gentrx.push_state, state
+                    )
                 except Exception as _gex:
-                    gtx_log.warning(f"handle_state error: {_gex}")
+                    gtx_log.warning(f"handle_state push_state error: {_gex}")
 
             # Forward state synapse to miners, populate response data to simulator object and serialize for returning to simulator.
             start = time.time()
@@ -4216,6 +4215,17 @@ if __name__ != "__mp_main__":
             start = time.time()
             response = response.serialize()
             bt.logging.debug(f"Serialized Response Batch ({time.time()-start}s)")
+
+            # GenTRX: poll for round advance and deliver assignments after the
+            # mining query completes. Awaited directly (not fire-and-forget) so
+            # it runs on the same IPC listen loop as forward() but cannot block
+            # the query — it uses the same request queue and pipe, so queries
+            # and deliveries are naturally serialized and never overlap.
+            if self._gentrx is not None:
+                try:
+                    await self._gentrx.poll_and_deliver()
+                except Exception as _gex:
+                    gtx_log.warning(f"handle_state poll_and_deliver error: {_gex}")
             # Log response data, start state serialization and reporting threads, and return miner instructions to the simulator
             if len(response['responses']) > 0:
                 bt.logging.trace(f"RESPONSE : {response}")
@@ -4764,7 +4774,7 @@ if __name__ != "__mp_main__":
 
 if __name__ == "__main__":
     from taos.im.validator.update import check_repo, update_validator, check_simulator, rebuild_simulator, restart_simulator
-    from taos.im.validator.forward import forward, notify
+    from taos.im.validator.forward import forward, notify, deliver_gentrx
     from taos.im.validator.reward import get_rewards
 
     if float(platform.freedesktop_os_release()['VERSION_ID']) < 22.04:

@@ -340,6 +340,23 @@ class QueryService:
             self.metagraph = MinimalMetagraph(axon_list, uid_list)
             deregistered_uids = set(request_data['deregistered_uids'])
 
+            if not uid_list:
+                bt.logging.warning(
+                    "No miners with reachable axons in metagraph — "
+                    "skipping forward (will retry next tick)"
+                )
+                return {
+                    'success': True,
+                    'responses': {},
+                    'validation_stats': {
+                        "total_responses": 0,
+                        "total_instructions": 0,
+                        "success": 0,
+                        "timeouts": 0,
+                        "failures": 0,
+                    },
+                }
+
             bt.logging.info(
                 f"Querying {len(self.metagraph.axons)} miners "
                 f"(UIDs: {min(uid_list)}-{max(uid_list)})"
@@ -548,6 +565,182 @@ class QueryService:
                 gc.enable()
 
 
+    async def deliver_gentrx_miners(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Deliver GenTRX assignments to miners via parallel raw HTTP posts.
+
+        Mirrors query_miners pattern: all expensive CPU work (header signing,
+        JSON serialization) is done synchronously before any tasks are created
+        so that tasks contain only async I/O and never block the event loop.
+
+        Args:
+            request_data (dict): Contains 'round' and 'deliveries' (list of
+                {uid, axon_data, assignment} dicts).
+
+        Returns:
+            dict: {'success': bool, 'ok': int, 'fail': int}
+        """
+        import json as _json
+        import aiohttp as _aio
+        from taos.im.protocol.gentrx import GenTRXAssignment
+
+        deliveries = request_data.get('deliveries', [])
+        round_id = request_data.get('round', '?')
+
+        if not deliveries:
+            return {'success': True, 'ok': 0, 'fail': 0}
+
+        gc_was_enabled = gc.isenabled()
+        old_dendrite = self.dendrite
+        send_ok = 0
+        send_fail = 0
+
+        try:
+            gc.disable()
+
+            self.dendrite = bt.Dendrite(wallet=self.wallet)
+            DendriteManager.configure_session(self)
+
+            version_as_int: int = sum(
+                int(p) * (1000 ** i)
+                for i, p in enumerate(reversed(bt.__version__.split(".")))
+            )
+
+            # Phase 1 (sync, before task creation): build body + headers.
+            # The axon's verify fn uses message=nonce.dendrite_key.MINER_KEY.uuid.body_hash
+            # so each miner needs its own signature.  We call preprocess once to get
+            # a valid nonce/uuid/body_hash/base-headers, then for each miner do only
+            # keypair.sign(per_miner_message) — no pydantic model construction, no
+            # to_headers(), no model_dump() — dropping per-miner cost to raw crypto.
+            prep_start = time.time()
+            first_d = deliveries[0]
+            first_adat = first_d['axon_data']
+            first_axon = bt.AxonInfo(
+                version=version_as_int,
+                hotkey=first_adat['hotkey'], coldkey=first_adat['coldkey'],
+                ip=first_adat['ip'], port=first_adat['port'],
+                ip_type=first_adat['ip_type'], protocol=first_adat['protocol'],
+                placeholder1=0, placeholder2=0,
+            )
+            base_synapse = GenTRXAssignment(**first_d['assignment'])
+            base_synapse = self.dendrite.preprocess_synapse_for_request(
+                first_axon, base_synapse, 5.0
+            )
+            base_headers = base_synapse.to_headers()
+            base_headers['Content-Type'] = 'application/json'
+            base_body = _json.dumps(base_synapse.model_dump()).encode('utf-8')
+            synapse_name = base_synapse.name
+
+            # Extract signing inputs from the preprocessed synapse — these are
+            # constant across all miners for this round.
+            dendrite_nonce  = base_synapse.dendrite.nonce
+            dendrite_uuid   = base_synapse.dendrite.uuid
+            dendrite_hotkey = base_synapse.dendrite.hotkey
+            body_hash       = base_synapse.body_hash  # property, matches what preprocess signs with
+            bt.logging.info(
+                f"[GTX] deliver round={round_id} base prep done in "
+                f"{time.time()-prep_start:.3f}s — signing {len(deliveries)} miners"
+            )
+
+            t_sign_start = time.time()
+            prepared = []
+            for d in deliveries:
+                uid = d['uid']
+                adat = d['axon_data']
+                miner_hotkey = adat['hotkey']
+                # Sign only — skips pydantic overhead that made per-miner cost ~86ms
+                message = (
+                    f"{dendrite_nonce}.{dendrite_hotkey}."
+                    f"{miner_hotkey}.{dendrite_uuid}.{body_hash}"
+                )
+                sig = f"0x{self.wallet.hotkey.sign(message).hex()}"
+                headers = dict(base_headers)
+                headers['bt_header_axon_ip']           = adat['ip']
+                headers['bt_header_axon_port']         = str(adat['port'])
+                headers['bt_header_axon_hotkey']       = miner_hotkey
+                headers['bt_header_dendrite_signature'] = sig
+                url = f"http://{adat['ip']}:{adat['port']}/{synapse_name}"
+                prepared.append((uid, adat['ip'], adat['port'], url, headers, base_body))
+            bt.logging.info(
+                f"[GTX] deliver round={round_id} signed {len(prepared)} miners in "
+                f"{time.time()-t_sign_start:.3f}s "
+                f"(total prep {time.time()-prep_start:.3f}s)"
+            )
+
+            # Phase 2 (async): fire all requests concurrently.  Tasks contain
+            # only a single session.post() yield — no bittensor overhead inside.
+            session = await self.dendrite.session
+            per_req_timeout = _aio.ClientTimeout(total=5, sock_connect=1.0)
+
+            async def _fire_one(uid, ip, port, url, headers, body):
+                nonlocal send_ok, send_fail
+                t0 = time.time()
+                try:
+                    err_body = ""
+                    async with session.post(
+                        url, headers=headers, data=body,
+                        timeout=per_req_timeout,
+                    ) as resp:
+                        status = resp.status
+                        if status != 200:
+                            try:
+                                err_body = (await resp.text())[:300]
+                            except Exception:
+                                pass
+                    elapsed = time.time() - t0
+                    if status == 200:
+                        bt.logging.debug(
+                            f"[GTX] deliver round={round_id} uid={uid} "
+                            f"{ip}:{port} status={status} t={elapsed:.2f}s"
+                        )
+                        send_ok += 1
+                    else:
+                        bt.logging.info(
+                            f"[GTX] deliver round={round_id} uid={uid} "
+                            f"{ip}:{port} status={status} t={elapsed:.2f}s"
+                            + (f" err={err_body!r}" if err_body else "")
+                        )
+                        send_fail += 1
+                except asyncio.CancelledError:
+                    bt.logging.warning(
+                        f"[GTX] deliver round={round_id} uid={uid} "
+                        f"cancelled after {time.time()-t0:.2f}s"
+                    )
+                    send_fail += 1
+                    raise
+                except Exception as exc:
+                    bt.logging.info(
+                        f"[GTX] deliver round={round_id} uid={uid} "
+                        f"{ip}:{port} {type(exc).__name__}: {exc} t={time.time()-t0:.2f}s"
+                    )
+                    send_fail += 1
+
+            tasks = [
+                asyncio.create_task(_fire_one(uid, ip, port, url, headers, body))
+                for uid, ip, port, url, headers, body in prepared
+            ]
+
+            t_start = time.time()
+            _, pending = await asyncio.wait(tasks, timeout=30)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            t_total = time.time() - t_start
+            bt.logging.info(
+                f"[GTX] deliver round={round_id} n={len(deliveries)} "
+                f"ok={send_ok} fail={send_fail} t={t_total:.2f}s"
+            )
+            return {'success': True, 'ok': send_ok, 'fail': send_fail}
+
+        except Exception as e:
+            bt.logging.error(f"[GTX] deliver_gentrx_miners error: {e}\n{traceback.format_exc()}")
+            return {'success': False, 'error': str(e), 'ok': send_ok, 'fail': send_fail}
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+            if old_dendrite:
+                del old_dendrite
+
     async def run(self):
         """
         Main event loop for the standalone query service.
@@ -555,7 +748,7 @@ class QueryService:
         Responsibilities:
         - Wait for commands from the validator via IPC
         - Read inbound requests from shared memory
-        - Execute miner queries
+        - Execute miner queries and GenTRX deliveries
         - Write results to response shared memory
         - Send acknowledgement signaling readiness
         - Handle shutdown command gracefully
@@ -623,6 +816,46 @@ class QueryService:
                     gc_start = time.time()
                     gc.collect(generation=2)
                     bt.logging.info(f"Query GC completed in {time.time()-gc_start:.4f}s")
+                elif command == 'deliver_gentrx':
+                    read_start = time.time()
+                    self.request_mem.seek(0)
+                    size_bytes = self.request_mem.read(8)
+                    data_size = struct.unpack('Q', size_bytes)[0]
+                    request_bytes = self.request_mem.read(data_size)
+                    request_data = pickle.loads(request_bytes)
+                    bt.logging.info(
+                        f"[GTX] deliver_gentrx: read {data_size} bytes "
+                        f"({time.time()-read_start:.4f}s)"
+                    )
+
+                    result = await self.deliver_gentrx_miners(request_data)
+                    del request_data
+
+                    write_start = time.time()
+                    result_bytes = pickle.dumps(result, protocol=5)
+                    del result
+                    self.response_mem.seek(0)
+                    self.response_mem.write(struct.pack('Q', len(result_bytes)))
+                    self.response_mem.write(result_bytes)
+                    self.response_mem.flush()
+                    del result_bytes
+                    bt.logging.info(
+                        f"[GTX] deliver_gentrx: wrote response ({time.time()-write_start:.4f}s)"
+                    )
+
+                    if self.notify_fd is not None:
+                        try:
+                            os.write(self.notify_fd, b'G')
+                            bt.logging.info("[GTX] Sent deliver_gentrx completion notification")
+                        except Exception as e:
+                            bt.logging.error(
+                                f"[GTX] Failed to send delivery notification: {e}\n"
+                                f"{traceback.format_exc()}"
+                            )
+                    else:
+                        bt.logging.error("[GTX] Cannot send notification - notify_fd is None!")
+
+                    gc.collect(generation=2)
                 elif command == 'shutdown':
                     bt.logging.info("Shutdown command received")
                     self.running = False

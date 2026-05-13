@@ -167,7 +167,18 @@ if __name__ != "__mp_main__":
             module_spec.loader.exec_module(agent_module)
             agent_class = getattr(agent_module, self.config.agent.name)
             self.agent = agent_class(self.uid, self.config.agent.params, self.config.neuron.full_path)
-        
+
+            # Wire chain access onto the agent for GenTRX chain discovery.
+            self.agent.subtensor = self.subtensor
+            self.agent.metagraph = self.metagraph
+            self.agent.config.netuid = self.config.netuid
+
+            # Re-run model bootstrap now that chain is available.
+            # initialize() already attempted this but subtensor wasn't wired yet.
+            _gtx = getattr(self.agent, "_gtx", None)
+            if _gtx is not None and _gtx.model is None:
+                self.agent._ensure_model_version()
+
         def check_registered(self):
             """
             Override registration check - benchmark miners don't need registration.

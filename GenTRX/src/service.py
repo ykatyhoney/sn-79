@@ -22,12 +22,124 @@ All HTTP calls use the GENTRX_API_KEY shared secret (via X-API-Key header).
 
 from __future__ import annotations
 
+import atexit
 import hashlib
+import os
+import queue
 import random
+import signal
+import struct
+import threading
 import time
 from typing import Any
 
+import msgpack
+
 from GenTRX.src.bt_log import gtx_log
+
+
+class _TxSpool:
+    """Append-only WAL for outbound state packets; survives validator restart."""
+
+    def __init__(self, path: str, max_bytes: int = 50_000_000) -> None:
+        self.path = path
+        self.offset_path = path + ".offset"
+        self.max_bytes = max_bytes
+        self._lock = threading.Lock()
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        self._ack_offset = self._read_offset()
+        self._f = open(path, "a+b")
+        self.evictions_total = 0
+
+    def append(self, data: bytes) -> int:
+        evicted = 0
+        with self._lock:
+            self._f.seek(0, os.SEEK_END)
+            self._f.write(struct.pack(">I", len(data)))
+            self._f.write(data)
+            self._f.flush()
+            if self._f.tell() > self.max_bytes:
+                evicted = self._evict_locked(self.max_bytes // 2)
+        return evicted
+
+    def replay_unacked(self) -> list[bytes]:
+        with self._lock:
+            self._f.seek(self._ack_offset)
+            records: list[bytes] = []
+            while True:
+                header = self._f.read(4)
+                if len(header) < 4:
+                    break
+                length = struct.unpack(">I", header)[0]
+                data = self._f.read(length)
+                if len(data) < length:
+                    break
+                records.append(data)
+            self._f.seek(0, os.SEEK_END)
+            return records
+
+    def ack_one(self) -> None:
+        with self._lock:
+            saved = self._f.tell()
+            self._f.seek(self._ack_offset)
+            header = self._f.read(4)
+            if len(header) >= 4:
+                length = struct.unpack(">I", header)[0]
+                self._ack_offset += 4 + length
+                self._write_offset_locked()
+            self._f.seek(saved)
+
+    def close(self) -> None:
+        with self._lock:
+            if not self._f.closed:
+                self._f.close()
+
+    def _read_offset(self) -> int:
+        try:
+            with open(self.offset_path, "rb") as f:
+                buf = f.read(8)
+                if len(buf) < 8:
+                    return 0
+                return struct.unpack(">Q", buf)[0]
+        except FileNotFoundError:
+            return 0
+
+    def _write_offset_locked(self) -> None:
+        tmp = self.offset_path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(struct.pack(">Q", self._ack_offset))
+        os.replace(tmp, self.offset_path)
+
+    def _evict_locked(self, bytes_to_drop: int) -> int:
+        self._f.seek(self._ack_offset)
+        dropped_bytes = 0
+        dropped_records = 0
+        while dropped_bytes < bytes_to_drop:
+            header = self._f.read(4)
+            if len(header) < 4:
+                break
+            length = struct.unpack(">I", header)[0]
+            self._f.seek(length, os.SEEK_CUR)
+            dropped_bytes += 4 + length
+            dropped_records += 1
+        self._ack_offset += dropped_bytes
+        self.evictions_total += dropped_records
+        self._compact_locked()
+        return dropped_records
+
+    def _compact_locked(self) -> None:
+        self._f.seek(self._ack_offset)
+        remaining = self._f.read()
+        self._f.close()
+        tmp = self.path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(remaining)
+        os.replace(tmp, self.path)
+        self._ack_offset = 0
+        self._write_offset_locked()
+        self._f = open(self.path, "a+b")
 
 # Bittensor mainnet block time (~12 s/block). Used only for human-readable
 # "next round in ~N min" log messages; not used for any scheduling logic.
@@ -66,6 +178,13 @@ class GenTRXService:
     DEFAULT_BETA_ALPHA = 1.0
     DEFAULT_BETA_BETA = 3.0
 
+    DEFAULT_TX_QUEUE_SIZE = 256
+    DEFAULT_TX_MAX_ATTEMPTS = 3
+    DEFAULT_TX_BACKOFF_BASE_S = 0.5
+    DEFAULT_TX_SPOOL_MAX_BYTES = 50_000_000
+    DEFAULT_TX_SUMMARY_INTERVAL_S = 60.0
+    DEFAULT_TX_DRAIN_TIMEOUT_S = 10.0
+
     def __init__(
         self,
         packager: Any,
@@ -85,6 +204,9 @@ class GenTRXService:
         val_fraction: float = 0.10,
         # Identity (used to scope data keys under data/<validator_uid>/)
         validator_uid: int | str = 0,
+        # WAL spool for at-least-once state push across restart. None disables.
+        tx_spool_path: str | None = None,
+        tx_spool_max_bytes: int = 0,
     ) -> None:
         if not gradient_server_url:
             raise ValueError(
@@ -134,6 +256,43 @@ class GenTRXService:
         # window (sim time < window_ns) before any parquet could exist.
         self._max_sim_ts_pushed: int = 0
         self._last_warmup_log: float = 0.0
+
+        spool_cap = tx_spool_max_bytes or self.DEFAULT_TX_SPOOL_MAX_BYTES
+        self._tx_spool: _TxSpool | None = None
+        if tx_spool_path:
+            try:
+                self._tx_spool = _TxSpool(tx_spool_path, max_bytes=spool_cap)
+            except Exception as exc:
+                gtx_log.warning("TX spool init failed, continuing without WAL: %s", exc)
+                self._tx_spool = None
+        # Spool is the durability bound, so memory queue can be unbounded
+        # when spool is active. Without spool fall back to drop-oldest.
+        qmax = 0 if self._tx_spool is not None else self.DEFAULT_TX_QUEUE_SIZE
+        self._tx_queue: queue.Queue = queue.Queue(maxsize=qmax)
+        self._tx_drops: int = 0
+        self._tx_retries_total: int = 0
+        self._tx_sends_total: int = 0
+        self._tx_stop = threading.Event()
+        if self._tx_spool is not None:
+            replayed = self._tx_spool.replay_unacked()
+            for data in replayed:
+                self._tx_queue.put_nowait(data)
+            if replayed:
+                gtx_log.info(
+                    "TX spool replay: re-enqueued %d packets from %s",
+                    len(replayed), tx_spool_path,
+                )
+        self._tx_thread = threading.Thread(
+            target=self._tx_worker, name="GenTRX-tx", daemon=True,
+        )
+        self._tx_thread.start()
+        atexit.register(self._drain_on_exit)
+        # SIGTERM (systemd, bare kill) bypasses atexit; SIGINT (pm2 default) does not.
+        if threading.current_thread() is threading.main_thread():
+            try:
+                signal.signal(signal.SIGTERM, self._handle_sigterm)
+            except (ValueError, OSError) as exc:
+                gtx_log.debug("SIGTERM handler not installed: %s", exc)
 
     @property
     def _miner_uids(self) -> list[int]:
@@ -186,6 +345,9 @@ class GenTRXService:
         interval = getattr(gentrx_cfg, "interval", 30)
         log_path = getattr(gentrx_cfg, "log_path", "data/gentrx/gentrx_service.log")
         blocks_per_round = getattr(gentrx_cfg, "blocks_per_round", 0) or 0
+        default_spool = f"data/gentrx/tx_spool_v{validator_uid}.bin"
+        tx_spool_path = getattr(gentrx_cfg, "tx_spool_path", default_spool)
+        tx_spool_max_bytes = int(getattr(gentrx_cfg, "tx_spool_max_bytes", 0) or 0)
 
         service = cls(
             packager=StatePackager(),
@@ -199,6 +361,8 @@ class GenTRXService:
             blocks_per_round=blocks_per_round,
             get_block_fn=get_block_fn,
             validator_uid=validator_uid,
+            tx_spool_path=tx_spool_path,
+            tx_spool_max_bytes=tx_spool_max_bytes,
         )
         gtx_log.info(
             "service init: server=%s, poll=%ds, blocks_per_round=%d",
@@ -230,32 +394,136 @@ class GenTRXService:
     # ------------------------------------------------------------------
 
     def push_state(self, state: Any) -> None:
-        """Extract a tick packet and POST it to the gradient server."""
+        """Extract a tick packet and hand it to the background TX worker."""
         if self._packager is None:
             return
         try:
             packet = self._packager.extract_state(state)
-            # Track max sim timestamp seen so poll_and_deliver can skip
-            # /data-status calls before the first full training window.
             ts = packet.get("ts") if isinstance(packet, dict) else None
             if ts is not None and ts > self._max_sim_ts_pushed:
                 self._max_sim_ts_pushed = int(ts)
-            self._post_state(packet)
+            data = msgpack.packb(packet, use_bin_type=True)
         except Exception as exc:
             gtx_log.warning("push_state failed: %s", exc)
+            return
+        self._enqueue_state(data)
 
-    def _post_state(self, packet: dict) -> None:
-        import msgpack
-        data = msgpack.packb(packet, use_bin_type=True)
-        t_start = time.time()
+    def _enqueue_state(self, data: bytes) -> None:
+        if self._tx_spool is not None:
+            try:
+                evicted = self._tx_spool.append(data)
+                if evicted:
+                    gtx_log.warning(
+                        "TX spool evicted %d oldest record(s); total=%d",
+                        evicted, self._tx_spool.evictions_total,
+                    )
+            except Exception as exc:
+                gtx_log.warning("TX spool append failed: %s", exc)
         try:
-            self._http_post_sync("/state", data)
-            t = time.time() - t_start
-            # Only log slow state pushes — they fire every tick, noise budget matters
-            if t > 0.2:
-                gtx_log.info("state POST slow t=%.2fs bytes=%d", t, len(data))
-        except Exception as exc:
-            gtx_log.debug("state POST failed after %.2fs: %s", time.time() - t_start, exc)
+            self._tx_queue.put_nowait(data)
+            return
+        except queue.Full:
+            pass
+        # No-spool mode only: drop oldest to make room.
+        try:
+            self._tx_queue.get_nowait()
+            self._tx_drops += 1
+            if self._tx_drops == 1 or self._tx_drops % 32 == 0:
+                gtx_log.warning(
+                    "state TX queue full (size=%d); dropped %d packets total",
+                    self.DEFAULT_TX_QUEUE_SIZE, self._tx_drops,
+                )
+        except queue.Empty:
+            pass
+        try:
+            self._tx_queue.put_nowait(data)
+        except queue.Full:
+            pass
+
+    def _tx_worker(self) -> None:
+        last_summary = time.time()
+        last_retries = 0
+        last_sends = 0
+        while not self._tx_stop.is_set():
+            now = time.time()
+            if now - last_summary >= self.DEFAULT_TX_SUMMARY_INTERVAL_S:
+                spool_evict = self._tx_spool.evictions_total if self._tx_spool else 0
+                gtx_log.info(
+                    "TX summary: queue=%d drops=%d spool_evict=%d "
+                    "retries=+%d sends=+%d (last %.0fs)",
+                    self._tx_queue.qsize(), self._tx_drops, spool_evict,
+                    self._tx_retries_total - last_retries,
+                    self._tx_sends_total - last_sends,
+                    now - last_summary,
+                )
+                last_retries = self._tx_retries_total
+                last_sends = self._tx_sends_total
+                last_summary = now
+            try:
+                data = self._tx_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            sent = False
+            try:
+                sent = self._post_state_with_retry(data)
+            finally:
+                if sent and self._tx_spool is not None:
+                    try:
+                        self._tx_spool.ack_one()
+                    except Exception as exc:
+                        gtx_log.warning("TX spool ack failed: %s", exc)
+                self._tx_queue.task_done()
+
+    def _post_state_with_retry(self, data: bytes) -> bool:
+        """Return True iff the server accepted (2xx-4xx); False on retry exhaustion."""
+        for attempt in range(self.DEFAULT_TX_MAX_ATTEMPTS):
+            if attempt > 0:
+                self._tx_retries_total += 1
+                time.sleep(self.DEFAULT_TX_BACKOFF_BASE_S * (2 ** (attempt - 1)))
+            t_start = time.time()
+            try:
+                resp = self._http_post_sync("/state", data)
+                t = time.time() - t_start
+                status = resp.status_code
+                if status < 400:
+                    self._tx_sends_total += 1
+                    if t > 0.2:
+                        gtx_log.info("state POST slow t=%.2fs bytes=%d", t, len(data))
+                    return True
+                if status < 500:
+                    gtx_log.warning(
+                        "state POST got %d (terminal): check API key / URL", status,
+                    )
+                    return True
+                gtx_log.debug(
+                    "state POST attempt %d/%d got %d after %.2fs",
+                    attempt + 1, self.DEFAULT_TX_MAX_ATTEMPTS, status, t,
+                )
+            except Exception as exc:
+                gtx_log.debug(
+                    "state POST attempt %d/%d failed after %.2fs: %s",
+                    attempt + 1, self.DEFAULT_TX_MAX_ATTEMPTS,
+                    time.time() - t_start, exc,
+                )
+        return False
+
+    def _drain_on_exit(self) -> None:
+        """Flush in-flight packets on clean shutdown. SIGKILL is not covered."""
+        if not self._tx_thread.is_alive():
+            return
+        deadline = time.time() + self.DEFAULT_TX_DRAIN_TIMEOUT_S
+        while time.time() < deadline and not self._tx_queue.empty():
+            time.sleep(0.1)
+        self._tx_stop.set()
+        self._tx_thread.join(timeout=2.0)
+        if self._tx_spool is not None:
+            self._tx_spool.close()
+
+    def _handle_sigterm(self, signum, frame) -> None:
+        gtx_log.info("SIGTERM received; draining TX worker")
+        self._drain_on_exit()
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTERM)
 
     # ------------------------------------------------------------------
     # Round scheduling + assignment creation (validator-driven)
@@ -297,7 +565,7 @@ class GenTRXService:
             gtx_log.debug("data-status fetch failed after %.2fs: %s", time.time() - t_start, exc)
             return None
 
-    def _create_assignments(self, data_status: dict) -> dict[int, dict]:
+    def _create_assignments(self, data_status: dict, round_id: int | None = None) -> dict[int, dict]:
         """Create assignments for all miners from available data.
 
         Uses the same beta-distribution time sampling as the old gradient
@@ -363,15 +631,24 @@ class GenTRXService:
                 for i in range(self._books_per_miner)
             ]
 
-            # Resolve data keys from available parquets
+            # Resolve data keys — only parquets that overlap [ts_start, ts_end].
+            # data-status returns [[fname, f_start, f_end], ...]; filter here so
+            # each miner's synapse carries only the handful of files it needs
+            # rather than every parquet ever written (hundreds of strings).
             data_keys = []
             for book_id in assigned_books:
                 book_info = books.get(book_id, {})
-                for fname in book_info.get("parquets", []):
+                for item in book_info.get("parquets", []):
+                    if isinstance(item, (list, tuple)) and len(item) == 3:
+                        fname, f_start, f_end = item
+                        if f_start >= ts_end or f_end <= ts_start:
+                            continue
+                    else:
+                        fname = item  # legacy string format
                     data_keys.append(f"data/{self._validator_uid}/{book_id}/intervals/{fname}")
 
             assignments[miner_uid] = {
-                "round": self._current_round,
+                "round": round_id if round_id is not None else self._current_round,
                 "model_version": model_version,
                 "books": assigned_books,
                 "ts_start": ts_start,
@@ -447,7 +724,7 @@ class GenTRXService:
         if new_round is not None:
             data_status = await self._fetch_data_status()
             if data_status is not None:
-                assignments = self._create_assignments(data_status)
+                assignments = self._create_assignments(data_status, round_id=new_round)
                 if assignments:
                     if await self._push_round(new_round, assignments):
                         # Advance only after a confirmed push so a simultaneous

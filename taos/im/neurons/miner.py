@@ -25,6 +25,7 @@ response to MarketSimulationStateUpdate queries from the validator.
 if __name__ != "__mp_main__":
     import time
     import typing
+    import traceback
     import bittensor as bt
 
     from taos.common.neurons.miner import BaseMinerNeuron
@@ -35,6 +36,20 @@ if __name__ != "__mp_main__":
 
         def __init__(self):
             super().__init__()
+            # GenTRX: wire chain access onto the agent so that
+            # _get_aggregator_store_for_assignment can do on-chain bucket
+            # discovery.  The base agent class receives no subtensor/metagraph
+            # at construction time, so we set them here after super().__init__()
+            # has established the chain connection.
+            self.agent.subtensor = self.subtensor
+            self.agent.metagraph = self.metagraph
+            self.agent.config.netuid = self.config.netuid
+
+            # Re-run model bootstrap now that chain is available.
+            _gtx = getattr(self.agent, "_gtx", None)
+            if _gtx is not None and _gtx.model is None:
+                self.agent._ensure_model_version()
+
             # GenTRX: attach assignment handler so validators can push training
             # assignments via dendrite.  Ignored silently by non-GenTRX agents
             # (forward checks for _pending_assignment attribute before setting).
@@ -77,18 +92,32 @@ if __name__ != "__mp_main__":
                     f"GenTRX bucket committed on-chain: account={bucket_info.account_id}"
                 )
             except Exception as exc:
-                bt.logging.error(f"GenTRX bucket commitment FAILED: {exc}")
-                raise RuntimeError(
-                    f"GenTRX bucket commit failed — miner cannot be discovered "
-                    f"by validator: {exc}"
+                # Don't crash the miner — chain commit failure (rate limit,
+                # invalid transaction, transient RPC) is recoverable. The
+                # validator will discover the bucket on a later resync once
+                # the commit eventually lands. Log and continue.
+                bt.logging.warning(
+                    f"GenTRX bucket commitment failed (will retry on next start): {exc}"
                 )
 
         async def forward_gentrx_assignment(
             self, synapse: GenTRXAssignment
         ) -> GenTRXAssignment:
             """Receive a GenTRX training assignment from the validator."""
-            gtx = getattr(self.agent, "_gtx", None)
-            if gtx is not None:
+            try:
+                bt.logging.info(
+                    f"[GTX] assignment received: round={synapse.round} "
+                    f"model_version={synapse.model_version} "
+                    f"books={synapse.books} "
+                    f"data={len(synapse.data)} files "
+                    f"ts={synapse.ts_start}..{synapse.ts_end} "
+                    f"validator_uid={synapse.validator_uid} "
+                    f"source={synapse.data_source}"
+                )
+                gtx = getattr(self.agent, "_gtx", None)
+                if gtx is None:
+                    bt.logging.debug("[GTX] agent has no _gtx — not a GenTRX agent, ignoring assignment")
+                    return synapse
                 gtx.pending_assignments.append({
                     "round":         synapse.round,
                     "model_version": synapse.model_version,
@@ -104,9 +133,12 @@ if __name__ != "__mp_main__":
                     "validator_uid": synapse.validator_uid,
                 })
                 bt.logging.info(
-                    f"GenTRX assignment received: round={synapse.round}, "
-                    f"books={synapse.books}, data={len(synapse.data)} files"
+                    f"[GTX] assignment queued: round={synapse.round} "
+                    f"pending={len(gtx.pending_assignments)}"
                 )
+            except Exception:
+                bt.logging.error(f"[GTX] forward_gentrx_assignment failed:\n{traceback.format_exc()}")
+                raise
             return synapse
 
         def blacklist_gentrx_assignment(

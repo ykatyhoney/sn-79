@@ -398,7 +398,9 @@ class GenTRXAgent(FinanceSimulationAgent):
         )
         gtx_log.info(
             f"GenTRXAgent | output={g.output_dir} "
-            f"| mode={'+'.join(mode_parts)}"
+            f"| mode={'+'.join(mode_parts) or 'idle'}"
+            f" | device={g.device}"
+            f" | write_store={'configured' if g.write_store else 'NOT SET (gradient upload disabled)'}"
             f"{'| gtx_collect_data=false (S3 only)' if not g.collect_data else ''}"
             f"{f' | {train_desc}' if train_desc else ''}"
         )
@@ -905,7 +907,12 @@ class GenTRXAgent(FinanceSimulationAgent):
             metagraph = getattr(self, "metagraph", None)
             netuid = getattr(getattr(self, "config", None), "netuid", None)
 
-            if subtensor is not None and metagraph is not None and netuid is not None:
+            if subtensor is None or metagraph is None or netuid is None:
+                self._gtx.tlog.info(
+                    f"chain discovery skipped — subtensor={subtensor is not None} "
+                    f"metagraph={metagraph is not None} netuid={netuid}"
+                )
+            else:
                 from GenTRX.src.chain import GenTRXChain
                 gtx_chain = GenTRXChain(subtensor, netuid, metagraph)
                 # Apply local endpoint override so MinIO buckets resolve correctly.
@@ -926,6 +933,10 @@ class GenTRXAgent(FinanceSimulationAgent):
                 except (TypeError, ValueError):
                     configured_uid = 0
 
+                self._gtx.tlog.info(
+                    f"chain discovery: netuid={netuid} aggregator_uid={configured_uid}"
+                )
+
                 # Step 1: configured uid via chain
                 try:
                     bucket_info = gtx_chain.get_bucket(configured_uid)
@@ -941,8 +952,16 @@ class GenTRXAgent(FinanceSimulationAgent):
                             self._gtx.discovered_aggregator_store = store
                             self._gtx.discovered_aggregator_uid = configured_uid
                             return store
+                        else:
+                            self._gtx.tlog.info(
+                                f"uid={configured_uid} bucket found "
+                                f"({bucket_info.endpoint_url}/{bucket_info.bucket_name}) "
+                                f"but no checkpoint yet (latest=0)"
+                            )
+                    else:
+                        self._gtx.tlog.info(f"uid={configured_uid} no chain commitment found")
                 except Exception as exc:
-                    self._gtx.tlog.debug(f"uid={configured_uid} bucket probe failed: {exc}")
+                    self._gtx.tlog.info(f"uid={configured_uid} bucket probe failed: {exc}")
 
                 # Step 2: env-var store
                 if self._gtx.store is not None:
@@ -956,7 +975,7 @@ class GenTRXAgent(FinanceSimulationAgent):
                             self._gtx.discovered_aggregator_uid = configured_uid
                             return self._gtx.store
                     except Exception as exc:
-                        self._gtx.tlog.debug(f"env-var store probe failed: {exc}")
+                        self._gtx.tlog.info(f"env-var store probe failed: {exc}")
 
                 # Steps 3+4: sender then remaining metagraph
                 scan_uids: list[int] = []
@@ -988,10 +1007,16 @@ class GenTRXAgent(FinanceSimulationAgent):
                             self._gtx.discovered_aggregator_uid = uid
                             return store
                     except Exception as exc:
-                        self._gtx.tlog.debug(f"uid={uid} bucket probe failed: {exc}")
+                        self._gtx.tlog.info(f"uid={uid} bucket probe failed: {exc}")
                         continue
+
+                self._gtx.tlog.info(
+                    f"chain discovery exhausted {len(scan_uids)} uids — no aggregator with checkpoint found"
+                )
         except Exception as exc:
             self._gtx.tlog.warning(f"Chain aggregator discovery failed: {exc}")
+            import traceback as _tb
+            self._gtx.tlog.warning(_tb.format_exc())
 
         # Final fallback: env-var store unchecked (caller's retry handles it)
         return self._gtx.store
@@ -1024,7 +1049,9 @@ class GenTRXAgent(FinanceSimulationAgent):
                 )
             except Exception as exc:
                 self._gtx.tlog.warning(f"Failed to build data store from assignment fields: {exc}")
-        return self._gtx.data_store
+        # env-var store first, then chain-discovered aggregator store (training
+        # data lives in the same validator bucket as the checkpoint).
+        return self._gtx.data_store or self._gtx.discovered_aggregator_store
 
     def _download_assignment_data(self, assignment: dict) -> list[Path]:
         """Download pre-resolved data files from the assignment.
@@ -1247,7 +1274,8 @@ class GenTRXAgent(FinanceSimulationAgent):
                 f"{len(parquet_files)} files from {len(assignments)} validator(s) | "
                 f"books={all_books} | "
                 f"{self._gtx.train_steps} steps | "
-                f"model_v={target_v}"
+                f"model_v={target_v} | "
+                f"device={self._gtx.device}"
             )
             # _train_background runs inline here (we're already on the
             # background thread); it handles compress + upload at the end.
@@ -1447,11 +1475,15 @@ class GenTRXAgent(FinanceSimulationAgent):
         Returns True if the local model is at the requested version after the
         call (already current or freshly downloaded). Returns False on failure.
         """
-        store = (
-            self._get_aggregator_store_for_assignment(assignment)
-            if assignment is not None
-            else self._gtx.store
-        )
+        if assignment is not None:
+            store = self._get_aggregator_store_for_assignment(assignment)
+        elif self._gtx.store is not None:
+            store = self._gtx.store
+        else:
+            # No env-var store and no assignment — try chain discovery anyway
+            # (subtensor may be available even at init time after benchmark/miner
+            # wires it in post-construction).
+            store = self._get_aggregator_store_for_assignment({})
         if store is None:
             self._gtx.tlog.warning(
                 "no aggregator store — GENTRX_AGGREGATOR_S3_* env vars missing or "
@@ -1548,10 +1580,11 @@ class GenTRXAgent(FinanceSimulationAgent):
 
     def _load_model(self, checkpoint: str) -> None:
         import torch
+        from GenTRX.src.gradient import load_checkpoint_safely, validate_state_dict
         from GenTRX.src.model import OrderModel, ModelConfig
         from GenTRX.src.tokenizer import OrderTokenizer, TokenizerConfig
 
-        ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        ckpt = load_checkpoint_safely(checkpoint)
         raw_cfg = ckpt.get("model_config", ckpt.get("config", {}))
         self._gtx.model_cfg = ModelConfig(
             **{
@@ -1564,8 +1597,8 @@ class GenTRXAgent(FinanceSimulationAgent):
         self._gtx.tokenizer_cfg = (
             TokenizerConfig.from_dict(tok_dict) if tok_dict else TokenizerConfig()
         )
-
         self._gtx.model = OrderModel(self._gtx.model_cfg)
+        validate_state_dict(ckpt["model_state_dict"], self._gtx.model.state_dict())
         self._gtx.model.load_state_dict(ckpt["model_state_dict"])
         self._gtx.model.eval()
         self._gtx.tokenizer = OrderTokenizer(self._gtx.tokenizer_cfg)

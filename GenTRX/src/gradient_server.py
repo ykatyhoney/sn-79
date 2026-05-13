@@ -62,6 +62,56 @@ def _ts_to_tag(ts_ns: int) -> str:
     return f"{days:02d}{hours:02d}{minutes:02d}{seconds:02d}"
 
 
+# Heavy fields (_gradient_data, _comp, _score*) are intentionally dropped;
+# they get re-fetched and recomputed on the next collection tick.
+_ASSIGNMENT_PERSIST_FIELDS = (
+    "round",
+    "books",
+    "data",
+    "ts_start",
+    "ts_end",
+    "model_version",
+)
+
+
+def _serialize_assignments(d: dict) -> dict:
+    out: dict[str, dict] = {}
+    for uid, a in d.items():
+        state = a.get("_state")
+        if state not in ("DELIVERED", "GRADIENT_IN", "SCORED"):
+            continue
+        skel: dict = {}
+        for k in _ASSIGNMENT_PERSIST_FIELDS:
+            if k in a:
+                skel[k] = a[k]
+        out[str(uid)] = skel
+    return out
+
+
+def _restore_assignment_dict(src: dict, target: dict) -> None:
+    now = time.time()
+    for uid_str, skel in src.items():
+        try:
+            uid = int(uid_str)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(skel, dict):
+            continue
+        target[uid] = {
+            "round": skel.get("round"),
+            "books": skel.get("books", []) or [],
+            "data": skel.get("data", []) or [],
+            "ts_start": int(skel.get("ts_start", 0) or 0),
+            "ts_end": int(skel.get("ts_end", 0) or 0),
+            "model_version": skel.get("model_version"),
+            "_state": "DELIVERED",
+            "_created_at": now,
+            "_delivered_at": now,
+            "_gradient_data": None,
+            "_score": None,
+        }
+
+
 def _filter_by_timestamp(
     files: list[Path],
     ts_start: int,
@@ -148,7 +198,9 @@ class GradientAggregator:
         # Default to "0" so unscoped invocations (proxy/localnet) write
         # proposals/scores under a stable path; multi-validator setups
         # must pass --validator-uid to avoid collisions in shared buckets.
-        self._validator_uid: str = str(validator_uid) if validator_uid not in (None, "") else "0"
+        self._validator_uid: str = (
+            str(validator_uid) if validator_uid not in (None, "") else "0"
+        )
         self._bucket_prefix: str = bucket_prefix
         self.checkpoint_path = Path(checkpoint_path)
         self.val_data_path = val_data_path
@@ -181,7 +233,7 @@ class GradientAggregator:
 
         # Single validator bucket: checkpoints/ + data/ + proposals/ all in one place.
         # Committed to chain so miners and the aggregator discover it without
-        # pre-configuration. 
+        # pre-configuration.
         self.validator_store = validator_store
         # When True (uid-0 aggregator): reads cross-validator scores from chain,
         # aggregates gradients, publishes checkpoint.
@@ -204,7 +256,9 @@ class GradientAggregator:
         self._version = 0
         self._agg_round = 0
         self._last_round_log_ts: float = 0.0
-        self._last_push_block: int | None = None  # block number from most recent POST /round
+        self._last_push_block: int | None = (
+            None  # block number from most recent POST /round
+        )
         self._lock = threading.Lock()
         self._running = False
         self._thread: threading.Thread | None = None
@@ -219,9 +273,31 @@ class GradientAggregator:
         self._sim_id: str | None = None
         self._sim_epoch: int = 0
         self._last_seen_sim_ts: int = 0
-        # Sim id from the pending-rows staging file. Cleared once the
-        # first config packet arrives and the sim-swap check has run.
+        self._dedup_drops_total: int = 0
+        self._pre_bind_drops: int = 0
+        # Reorder buffer for out-of-order state ticks. Ticks are held when
+        # they arrive with a sim-timestamp jump larger than _reorder_jump_ns
+        # (suggesting earlier ticks are still in flight). Held ticks are
+        # flushed in sim-timestamp order once either (a) a filling tick
+        # arrives that closes the gap, or (b) _reorder_timeout_s elapses.
+        # Fast path: if the buffer is empty and the tick is in order, it is
+        # passed directly to _process_tick without buffering overhead.
+        self._reorder_buf: list = []  # min-heap: (sim_ts, seq, wall_time, tick)
+        self._reorder_seq: int = 0
+        self._reorder_timeout_s: float = 30.0  # states arrive every 5-10 s wall-clock
+        # EMA of observed sim-timestamp increments between consecutive in-order
+        # ticks. Used as the "expected publish interval"; a new tick is held in
+        # the reorder buffer when its increment exceeds this value, giving
+        # earlier in-flight ticks time to arrive. Self-calibrates from the
+        # first few ticks; falls back to parquet_interval // 60 until then.
+        self._ts_increment_ema: float = 0.0
+        self._ts_ema_alpha: float = 0.2
+        self._ts_ema_samples: int = 0
+        self._ts_ema_fallback: int = parquet_interval_ns // 60  # 5 s sim time default
+        # Sim id from the pending-rows staging file.
         self._restored_sim_id: str | None = None
+        # Sim id from the bucket marker (data/<uid>/.sim_id).
+        self._bucket_sim_id: str | None = None
         # Sim transition handling. Set to True when an 'ESE' marker is seen
         # (or when the heuristic detects a restart without an explicit
         # marker). Picked up by the aggregation loop on its next tick,
@@ -276,6 +352,8 @@ class GradientAggregator:
 
         # S3: track processed gradient keys to avoid double-scoring
         self._processed_grad_keys: set[str] = set()
+        # Negative cache: keys that returned 404/error — skip until next round
+        self._failed_grad_keys: set[str] = set()
 
         # Price/volume scaling from simulator config (set from first state packet)
         self._price_scale: int | None = None
@@ -309,7 +387,9 @@ class GradientAggregator:
         # Local staging file for in-progress parquet buffer: persisted
         # periodically so a restart can continue filling the current window
         # rather than starting a fresh 5-min accumulation.
-        self._pending_staging_path: Path = self.checkpoint_path.parent / "pending_rows.msgpack"
+        self._pending_staging_path: Path = (
+            self.checkpoint_path.parent / "pending_rows.msgpack"
+        )
         self._last_pending_save_ts: float = 0.0
 
         # S3 data cache: downloaded parquets are cached locally to avoid
@@ -379,7 +459,8 @@ class GradientAggregator:
         data_path = Path(self.val_data_path)
         if data_path.exists():
             books = [
-                d.name for d in sorted(data_path.iterdir())
+                d.name
+                for d in sorted(data_path.iterdir())
                 if d.is_dir() and (d / "intervals").is_dir()
             ]
             if books:
@@ -441,7 +522,9 @@ class GradientAggregator:
             # Check data readiness immediately
             a = self._assignments.get(miner_uid)
             if a and a.get("_state") == "PENDING":
-                data_keys = self._resolve_data_keys(a["books"], a["ts_start"], a["ts_end"])
+                data_keys = self._resolve_data_keys(
+                    a["books"], a["ts_start"], a["ts_end"]
+                )
                 if data_keys:
                     a["data"] = data_keys
                     a["_state"] = "DATA_READY"
@@ -458,7 +541,10 @@ class GradientAggregator:
         a["_delivered_at"] = time.time()
         logger.debug(
             "Assignment delivered: miner=%d round=%d books=%s data=%d files",
-            miner_uid, a.get("round", 0), a.get("books", []), len(a.get("data", []))
+            miner_uid,
+            a.get("round", 0),
+            a.get("books", []),
+            len(a.get("data", [])),
         )
         return {k: v for k, v in a.items() if not k.startswith("_")}
 
@@ -485,7 +571,11 @@ class GradientAggregator:
                 )
                 self._warned_waiting_for_data = True
             else:
-                logger.debug("Not enough data yet (max_ts=%d < window=%d)", max_ts, self.window_ns)
+                logger.debug(
+                    "Not enough data yet (max_ts=%d < window=%d)",
+                    max_ts,
+                    self.window_ns,
+                )
             return
 
         max_start = max_ts - self.window_ns
@@ -508,7 +598,9 @@ class GradientAggregator:
 
         for miner_uid in range(n_miners):
             miner_rng = random.Random(
-                hashlib.sha256(f"{self._agg_round}:{miner_uid}:time".encode()).hexdigest()
+                hashlib.sha256(
+                    f"{self._agg_round}:{miner_uid}:time".encode()
+                ).hexdigest()
             )
             beta_sample = 1.0 - miner_rng.betavariate(self.beta_alpha, self.beta_beta)
             ts_start = int(beta_sample * max_start)
@@ -527,10 +619,18 @@ class GradientAggregator:
                 "ts_end": ts_end,
                 "data": [],  # resolved later by _check_data_readiness
                 "data_source": "s3" if self.validator_store else "local",
-                "data_endpoint": self.validator_store.endpoint_url if self.validator_store else "",
-                "data_bucket": self.validator_store.bucket if self.validator_store else "",
-                "data_access_key": self.validator_store.access_key if self.validator_store else "",
-                "data_secret_key": self.validator_store.secret_key if self.validator_store else "",
+                "data_endpoint": self.validator_store.endpoint_url
+                if self.validator_store
+                else "",
+                "data_bucket": self.validator_store.bucket
+                if self.validator_store
+                else "",
+                "data_access_key": self.validator_store.access_key
+                if self.validator_store
+                else "",
+                "data_secret_key": self.validator_store.secret_key
+                if self.validator_store
+                else "",
                 "_state": "PENDING",
                 "_created_at": time.time(),
                 "_delivered_at": None,
@@ -542,7 +642,9 @@ class GradientAggregator:
         self._last_assigned_version = self._version
         logger.info(
             "[GTX] round=%d: created %d assignments (books=%d, window=%ds%s)",
-            self._agg_round, n_miners, len(shuffled),
+            self._agg_round,
+            n_miners,
+            len(shuffled),
             self.window_ns // 1_000_000_000,
             ", model rollover" if rolled else "",
         )
@@ -576,7 +678,9 @@ class GradientAggregator:
         ts_end = ts_start + self.window_ns
 
         start = (miner_uid * self.books_per_miner) % len(shuffled)
-        assigned = [shuffled[(start + i) % len(shuffled)] for i in range(self.books_per_miner)]
+        assigned = [
+            shuffled[(start + i) % len(shuffled)] for i in range(self.books_per_miner)
+        ]
 
         self._assignments[miner_uid] = {
             "round": self._agg_round,
@@ -586,10 +690,16 @@ class GradientAggregator:
             "ts_end": ts_end,
             "data": [],
             "data_source": "s3" if self.validator_store else "local",
-            "data_endpoint": self.validator_store.endpoint_url if self.validator_store else "",
+            "data_endpoint": self.validator_store.endpoint_url
+            if self.validator_store
+            else "",
             "data_bucket": self.validator_store.bucket if self.validator_store else "",
-            "data_access_key": self.validator_store.access_key if self.validator_store else "",
-            "data_secret_key": self.validator_store.secret_key if self.validator_store else "",
+            "data_access_key": self.validator_store.access_key
+            if self.validator_store
+            else "",
+            "data_secret_key": self.validator_store.secret_key
+            if self.validator_store
+            else "",
             "_state": "PENDING",
             "_created_at": time.time(),
             "_delivered_at": None,
@@ -600,7 +710,12 @@ class GradientAggregator:
         # the round drives the rollover-bump check; on-demand creates
         # inherit the same value).
         self._last_assigned_version = max(self._last_assigned_version, self._version)
-        logger.debug("Assignment created on demand: miner=%d round=%d books=%s", miner_uid, self._agg_round, assigned)
+        logger.debug(
+            "Assignment created on demand: miner=%d round=%d books=%s",
+            miner_uid,
+            self._agg_round,
+            assigned,
+        )
 
     def _round_estimate_s(self) -> float:
         """Server-side estimate of how long a round should take.
@@ -628,7 +743,9 @@ class GradientAggregator:
                 a["_state"] = "DATA_READY"
                 logger.debug(
                     "Assignment data ready: miner=%d round=%d files=%d",
-                    uid, a["round"], len(data_keys),
+                    uid,
+                    a["round"],
+                    len(data_keys),
                 )
 
     def _resolve_data_keys(
@@ -838,8 +955,9 @@ class GradientAggregator:
         that overlap. Tests whether the aggregated gradient generalizes to
         unseen books in the same time periods.
         """
-        from GenTRX.src.dataloader import OrderDataset
         from torch.utils.data import DataLoader
+
+        from GenTRX.src.dataloader import OrderDataset
 
         if not ts_ranges:
             return None
@@ -904,17 +1022,30 @@ class GradientAggregator:
         # the validator-side Prometheus collector can read them off the
         # next /gentrx/scores payload.
         if event.get("type") == "aggregation":
-            self._last_aggregation.update({
-                k: v for k, v in event.items()
-                if k in ("round", "n_scored", "n_accepted", "loss_before",
-                         "loss_after", "rolled_back", "sibling_only", "version")
-            })
+            self._last_aggregation.update(
+                {
+                    k: v
+                    for k, v in event.items()
+                    if k
+                    in (
+                        "round",
+                        "n_scored",
+                        "n_accepted",
+                        "loss_before",
+                        "loss_after",
+                        "rolled_back",
+                        "sibling_only",
+                        "version",
+                    )
+                }
+            )
             if event.get("n_accepted", 0) > 0 and not event.get("rolled_back"):
                 self._rounds_aggregated_total += 1
             if event.get("rolled_back"):
                 self._rollbacks_total += 1
         try:
             from GenTRX.src import wandb_ops
+
             wandb_ops.log_event(event)
         except Exception:
             pass  # logging must never break the caller
@@ -933,8 +1064,8 @@ class GradientAggregator:
         if self.is_aggregator:
             return False  # we ARE uid 0 — we publish, not pull
         try:
-            from GenTRX.src.gradient_store import GradientStore
             from GenTRX.src.chain import BucketInfo
+            from GenTRX.src.gradient_store import GradientStore
 
             bucket_info = None
             if self._chain is not None:
@@ -976,14 +1107,20 @@ class GradientAggregator:
 
             logger.info(
                 "Syncing from uid-0 checkpoint v%d → v%d at %s/%s",
-                self._version, version,
-                bucket_info.endpoint_url, bucket_info.bucket_name,
+                self._version,
+                version,
+                bucket_info.endpoint_url,
+                bucket_info.bucket_name,
             )
             ckpt_bytes = store.get_checkpoint(0, version)
             self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
             self.checkpoint_path.write_bytes(ckpt_bytes)
             self._version = version
-            logger.info("Model sync complete: checkpoint v%d written to %s", version, self.checkpoint_path)
+            logger.info(
+                "Model sync complete: checkpoint v%d written to %s",
+                version,
+                self.checkpoint_path,
+            )
             return True
         except Exception as exc:
             logger.warning("uid-0 sync failed: %s", exc)
@@ -1008,9 +1145,11 @@ class GradientAggregator:
                 "No checkpoint at %s — initializing fresh model", self.checkpoint_path
             )
             try:
-                import torch
                 from dataclasses import asdict
-                from GenTRX.src.model import OrderModel, ModelConfig
+
+                import torch
+
+                from GenTRX.src.model import ModelConfig, OrderModel
                 from GenTRX.src.tokenizer import TokenizerConfig
 
                 model_cfg = ModelConfig()
@@ -1043,7 +1182,9 @@ class GradientAggregator:
         # latest.json pointing at a non-existent file).
         if self.validator_store is not None and self.checkpoint_path.exists():
             try:
-                existing_version = self.validator_store.get_latest_existing_version(self._validator_uid)
+                existing_version = self.validator_store.get_latest_existing_version(
+                    self._validator_uid
+                )
                 if existing_version > 0:
                     # Bucket already has checkpoints — resume from the highest.
                     # get_latest_existing_version() also repairs latest.json if stale.
@@ -1056,7 +1197,9 @@ class GradientAggregator:
                     # Fresh bucket — upload local checkpoint as v1.
                     data = self.checkpoint_path.read_bytes()
                     self._version = 1
-                    self.validator_store.put_checkpoint(self._validator_uid, self._version, data)
+                    self.validator_store.put_checkpoint(
+                        self._validator_uid, self._version, data
+                    )
                     logger.info(
                         "Initial checkpoint uploaded to aggregator (v%d, %.1f MB)",
                         self._version,
@@ -1085,27 +1228,29 @@ class GradientAggregator:
         self._log_event({"type": "server_start", "interval": self.interval})
 
     def _save_pending_rows(self) -> None:
-        """Atomically persist the in-progress parquet buffer to local disk.
-
-        Called from the aggregation loop every ~60s. On restart,
-        _restore_pending_rows() loads this file so the current parquet
-        window continues accumulating rather than starting over.
-        """
-        if not self._pending_rows:
+        """Persist staging state. Skipped when _sim_id is None so files stay identity-paired."""
+        if self._sim_id is None:
             return
         try:
             import msgpack as _mp
+
             payload = _mp.packb(
                 {
-                    "pending_rows": {str(bid): rows for bid, rows in self._pending_rows.items()},
+                    "pending_rows": {
+                        str(bid): rows for bid, rows in self._pending_rows.items()
+                    },
                     "interval_start": {
                         str(bid): ts for bid, ts in self._pending_interval_start.items()
                     },
                     "last_ts": {str(bid): ts for bid, ts in self._last_ts.items()},
                     "max_ts": self._max_timestamp_ns,
-                    # Lets a process restart tell whether the restored buffer
-                    # belongs to the current sim before consuming it.
                     "sim_id": self._sim_id,
+                    "last_seen_sim_ts": self._last_seen_sim_ts,
+                    "agg_round": self._agg_round,
+                    "assignments": _serialize_assignments(dict(self._assignments)),
+                    "prev_round_assignments": _serialize_assignments(
+                        dict(self._prev_round_assignments)
+                    ),
                 },
                 use_bin_type=True,
             )
@@ -1127,6 +1272,7 @@ class GradientAggregator:
             return
         try:
             import msgpack as _mp
+
             from GenTRX.src.orderbook import MatchingEngine
 
             raw = _mp.unpackb(
@@ -1137,6 +1283,7 @@ class GradientAggregator:
             last_ts = raw.get("last_ts", {})
             max_ts = int(raw.get("max_ts", 0))
             self._restored_sim_id = raw.get("sim_id")
+            self._last_seen_sim_ts = int(raw.get("last_seen_sim_ts", 0) or 0)
 
             for bid_str, rows in pending.items():
                 bid = int(bid_str)
@@ -1154,10 +1301,38 @@ class GradientAggregator:
             if max_ts > self._max_timestamp_ns:
                 self._max_timestamp_ns = max_ts
 
+            restored_round = raw.get("agg_round")
+            if isinstance(restored_round, int) and restored_round > 0:
+                self._agg_round = restored_round
+
+            _restore_assignment_dict(
+                raw.get("assignments") or {}, self._assignments
+            )
+            _restore_assignment_dict(
+                raw.get("prev_round_assignments") or {},
+                self._prev_round_assignments,
+            )
+            # Any prior-round assignments restored from disk are owed a
+            # scoring pass: the validator already closed that round and
+            # moved on, so we re-queue it for the drain path.
+            for a in self._prev_round_assignments.values():
+                rnd = a.get("round")
+                if isinstance(rnd, int):
+                    self._pending_aggregation_rounds.add(rnd)
+                    self._pending_aggregation_at.setdefault(rnd, time.time())
+
             total_rows = sum(len(r) for r in self._pending_rows.values())
             logger.info(
-                "Restored pending buffer: %d books, %d rows, max_ts=%d",
-                len(self._pending_rows), total_rows, max_ts,
+                "Restored pending buffer: %d books, %d rows, max_ts=%d, "
+                "agg_round=%d, assignments=%d, prev_round_assignments=%d, "
+                "restored_sim_id=%s",
+                len(self._pending_rows),
+                total_rows,
+                max_ts,
+                self._agg_round,
+                len(self._assignments),
+                len(self._prev_round_assignments),
+                self._restored_sim_id,
             )
         except Exception as exc:
             logger.warning("pending rows restore failed: %s", exc)
@@ -1199,10 +1374,15 @@ class GradientAggregator:
                         self._max_timestamp_ns = ts_max
                     restored += 1
 
+        marker = self._read_bucket_sim_marker()
+        if marker is not None:
+            self._bucket_sim_id = marker
         if restored:
             logger.info(
-                "Restored %d parquet(s) across %d book(s) from S3",
-                restored, len(self._written_parquets),
+                "Restored %d parquet(s) across %d book(s) from S3 (bucket_sim_id=%s)",
+                restored,
+                len(self._written_parquets),
+                self._bucket_sim_id,
             )
 
     def stop(self) -> None:
@@ -1246,7 +1426,8 @@ class GradientAggregator:
                         if (
                             _start > 0
                             and self._pending_rows[_bid]
-                            and (self._max_timestamp_ns - _start) >= self._parquet_interval_ns
+                            and (self._max_timestamp_ns - _start)
+                            >= self._parquet_interval_ns
                         ):
                             self._flush_book_parquet(_bid)
 
@@ -1277,7 +1458,8 @@ class GradientAggregator:
                     # right after POST /round.
                     _now = time.time()
                     ready = {
-                        rnd for rnd in self._pending_aggregation_rounds
+                        rnd
+                        for rnd in self._pending_aggregation_rounds
                         if self._is_round_ready_for_aggregation(rnd, _now)
                     }
 
@@ -1325,7 +1507,8 @@ class GradientAggregator:
                 _now = time.monotonic()
                 if _now - self._last_round_log_ts >= self.block_time_s:
                     cur_assignments = [
-                        a for a in self._assignments.values()
+                        a
+                        for a in self._assignments.values()
                         if a.get("round") == self._agg_round
                     ]
                     pending = sum(
@@ -1335,7 +1518,8 @@ class GradientAggregator:
                         1 for a in cur_assignments if a.get("_state") == "DATA_READY"
                     )
                     delivered = sum(
-                        1 for a in cur_assignments
+                        1
+                        for a in cur_assignments
                         if a.get("_state") in ("DELIVERED", "GRADIENT_IN")
                     )
                     gradient_in = sum(
@@ -1346,17 +1530,25 @@ class GradientAggregator:
                         # Active round: show countdown to next round
                         round_s = self._round_estimate_s()
                         delivered_times = [
-                            a["_delivered_at"] for a in cur_assignments
-                            if a.get("_delivered_at") and a.get("_state") in ("DELIVERED", "GRADIENT_IN")
+                            a["_delivered_at"]
+                            for a in cur_assignments
+                            if a.get("_delivered_at")
+                            and a.get("_state") in ("DELIVERED", "GRADIENT_IN")
                         ]
                         timing_suffix = ""
-                        if self._last_push_block is not None and self.blocks_per_round > 0 and delivered_times:
+                        if (
+                            self._last_push_block is not None
+                            and self.blocks_per_round > 0
+                            and delivered_times
+                        ):
                             elapsed_blocks = round(
                                 (time.time() - min(delivered_times)) / self.block_time_s
                             )
                             cur_block = self._last_push_block + elapsed_blocks
                             next_block = (self._agg_round + 1) * self.blocks_per_round
-                            secs = max(0.0, (next_block - cur_block) * self.block_time_s)
+                            secs = max(
+                                0.0, (next_block - cur_block) * self.block_time_s
+                            )
                             timing_suffix = (
                                 f"; next round at block ~{next_block} (~{secs:.0f}s)"
                             )
@@ -1378,22 +1570,38 @@ class GradientAggregator:
                                 # start = largest elapsed) so the display shows how
                                 # close we are to the NEXT parquet flush.
                                 min_start = min(
-                                    (self._pending_interval_start.get(bid, 0) for bid in self._pending_rows),
+                                    (
+                                        self._pending_interval_start.get(bid, 0)
+                                        for bid in self._pending_rows
+                                    ),
                                     default=0,
                                 )
                                 if min_start > 0:
                                     elapsed_ns = self._max_timestamp_ns - min_start
-                                    pct = min(100, int(100 * elapsed_ns / self._parquet_interval_ns))
+                                    pct = min(
+                                        100,
+                                        int(
+                                            100 * elapsed_ns / self._parquet_interval_ns
+                                        ),
+                                    )
                                     data_age_s += f", next window {pct}%"
                         elif self._max_timestamp_ns > 0:
                             min_start = min(
-                                (self._pending_interval_start.get(bid, 0) for bid in self._pending_rows),
+                                (
+                                    self._pending_interval_start.get(bid, 0)
+                                    for bid in self._pending_rows
+                                ),
                                 default=0,
                             )
                             if min_start > 0:
                                 elapsed_ns = self._max_timestamp_ns - min_start
-                                pct = min(100, int(100 * elapsed_ns / self._parquet_interval_ns))
-                                data_age_s = f", accumulating data ({pct}% to first window)"
+                                pct = min(
+                                    100,
+                                    int(100 * elapsed_ns / self._parquet_interval_ns),
+                                )
+                                data_age_s = (
+                                    f", accumulating data ({pct}% to first window)"
+                                )
                         states = f"pending={pending} data_ready={data_ready}"
                         logger.info(
                             f"[GTX] round={self._agg_round}: waiting for validator push "
@@ -1439,6 +1647,7 @@ class GradientAggregator:
             return
         try:
             import asyncio
+
             t_start = time.time()
             loop = asyncio.new_event_loop()
             try:
@@ -1456,13 +1665,17 @@ class GradientAggregator:
             self._miner_buckets_queried_at = now
             logger.info(
                 "[GTX] miner_buckets_refresh n=%d (static=%d) t=%.2fs",
-                len(self._miner_buckets), len(self._static_buckets), t_query,
+                len(self._miner_buckets),
+                len(self._static_buckets),
+                t_query,
             )
-            self._log_event({
-                "type": "miner_buckets_refresh",
-                "n_buckets": len(self._miner_buckets),
-                "t_query_s": t_query,
-            })
+            self._log_event(
+                {
+                    "type": "miner_buckets_refresh",
+                    "n_buckets": len(self._miner_buckets),
+                    "t_query_s": t_query,
+                }
+            )
         except Exception as exc:
             logger.debug("Failed to refresh miner buckets: %s", exc)
 
@@ -1490,14 +1703,18 @@ class GradientAggregator:
                     a["_state"] = "GRADIENT_IN"
                     logger.info(
                         "[GTX] round=%d gradient received: uid=%d (%.1f KB)",
-                        a["round"], uid, len(grad_data) / 1024,
+                        a["round"],
+                        uid,
+                        len(grad_data) / 1024,
                     )
-                    self._log_event({
-                        "type": "gradient_received",
-                        "round": a["round"],
-                        "miner": uid,
-                        "bytes": len(grad_data),
-                    })
+                    self._log_event(
+                        {
+                            "type": "gradient_received",
+                            "round": a["round"],
+                            "miner": uid,
+                            "bytes": len(grad_data),
+                        }
+                    )
                     # Score eagerly so the round can drain the moment all
                     # expected gradients are in. Failure here is fine —
                     # the drain pass re-attempts via _score_round.
@@ -1507,6 +1724,8 @@ class GradientAggregator:
         """Try to read a gradient from a miner's S3 bucket. Returns None if not found."""
         dedup_key = f"miner_{uid}/round_{round_id}"
         if dedup_key in self._processed_grad_keys:
+            return None
+        if dedup_key in self._failed_grad_keys:
             return None
 
         # Per-miner buckets (production + localnet)
@@ -1530,6 +1749,13 @@ class GradientAggregator:
                     config=BotoConfig(connect_timeout=5, read_timeout=10),
                 )
                 key = f"{self._bucket_prefix}gradients/{uid}/{round_id:08d}.grad"
+                logger.debug(
+                    "[GTX] gradient_get uid=%d round=%d bucket=%s key=%s",
+                    uid,
+                    round_id,
+                    bucket_info.bucket_name,
+                    key,
+                )
                 try:
                     t_start = time.time()
                     resp = client.get_object(Bucket=bucket_info.bucket_name, Key=key)
@@ -1538,13 +1764,37 @@ class GradientAggregator:
                     self._processed_grad_keys.add(dedup_key)
                     logger.info(
                         "[GTX] gradient_get uid=%d round=%d bytes=%d t=%.2fs",
-                        uid, round_id, len(data), t_get,
+                        uid,
+                        round_id,
+                        len(data),
+                        t_get,
                     )
                     return data
-                except ClientError:
+                except ClientError as exc:
+                    error_code = exc.response.get("Error", {}).get("Code", "")
+                    if error_code == "NoSuchKey":
+                        logger.debug(
+                            "[GTX] gradient_get uid=%d round=%d not yet uploaded (NoSuchKey)",
+                            uid,
+                            round_id,
+                        )
+                    else:
+                        logger.warning(
+                            "[GTX] gradient_get uid=%d round=%d S3 error: %s",
+                            uid,
+                            round_id,
+                            exc,
+                        )
+                        self._failed_grad_keys.add(dedup_key)
                     return None
-            except Exception:
-                return None
+            except Exception as exc:
+                logger.warning(
+                    "[GTX] gradient_get uid=%d round=%d unexpected error: %s",
+                    uid,
+                    round_id,
+                    exc,
+                )
+                self._failed_grad_keys.add(dedup_key)
 
         return None
 
@@ -1586,7 +1836,8 @@ class GradientAggregator:
         so scoring does not stall indefinitely.
         """
         delivered = [
-            a for a in self._assignments.values()
+            a
+            for a in self._assignments.values()
             if a.get("_state") in ("DELIVERED", "GRADIENT_IN")
             and a.get("round") == self._agg_round
         ]
@@ -1597,7 +1848,8 @@ class GradientAggregator:
         if all_in:
             logger.info(
                 "[GTX] round=%d complete: all %d gradients received",
-                self._agg_round, len(delivered),
+                self._agg_round,
+                len(delivered),
             )
             return True
 
@@ -1617,8 +1869,12 @@ class GradientAggregator:
             n_missing = len(delivered) - n_in
             logger.info(
                 "[GTX] round=%d heartbeat-loss force-close (%.0fs > %.0fs): %d/%d gradients received, %d missing",
-                self._agg_round, elapsed, expected_round_s + self._round_grace_s,
-                n_in, len(delivered), n_missing,
+                self._agg_round,
+                elapsed,
+                expected_round_s + self._round_grace_s,
+                n_in,
+                len(delivered),
+                n_missing,
             )
             return True
 
@@ -1639,9 +1895,10 @@ class GradientAggregator:
         round_assignments = []
         for source in (dict(self._assignments), dict(self._prev_round_assignments)):
             for uid, a in source.items():
-                if (
-                    a.get("round") == self._agg_round
-                    and a.get("_state") in ("GRADIENT_IN", "DELIVERED", "SCORED")
+                if a.get("round") == self._agg_round and a.get("_state") in (
+                    "GRADIENT_IN",
+                    "DELIVERED",
+                    "SCORED",
                 ):
                     round_assignments.append((uid, a))
 
@@ -1656,32 +1913,39 @@ class GradientAggregator:
             if grad_data is not None and state in ("GRADIENT_IN", "SCORED"):
                 pending.append((uid, self._agg_round, a, grad_data))
             elif state == "DELIVERED":
-                # No gradient submitted by round close, score 0
                 a["_state"] = "SCORED"
                 a["_score"] = 0.0
-                logger.info("Miner %d: no gradient for round %d (score=0)", uid, self._agg_round)
+                logger.info(
+                    "Miner %d: no gradient for round %d (score=0)", uid, self._agg_round
+                )
 
         if not pending:
             logger.info("[GTX] round=%d: no gradients to aggregate", self._agg_round)
-            self._log_event({
-                "type": "aggregation",
-                "round": self._agg_round,
-                "n_scored": 0,
-                "n_accepted": 0,
-                "version": self._version,
-            })
+            # Empty publish; without this /scores keeps the prior round's payload.
+            self._deliver_scores(
+                [], [], [], self._effective_min_score, round_assignments
+            )
+            self._log_event(
+                {
+                    "type": "aggregation",
+                    "round": self._agg_round,
+                    "n_scored": 0,
+                    "n_accepted": 0,
+                    "version": self._version,
+                }
+            )
             return
 
-        logger.info("[GTX] round=%d: aggregating %d gradients", self._agg_round, len(pending))
+        logger.info(
+            "[GTX] round=%d: aggregating %d gradients", self._agg_round, len(pending)
+        )
 
-        # Reuse existing scoring + aggregation logic
-        self._score_and_aggregate(pending)
+        self._score_and_aggregate(pending, round_assignments)
 
-        # Mark all as SCORED
         for uid, a in round_assignments:
             a["_state"] = "SCORED"
 
-    def _score_and_aggregate(self, pending: list) -> None:
+    def _score_and_aggregate(self, pending: list, round_assignments: list) -> None:
         """Orchestrator: reuse the eager-scoring cache when present, else load.
 
         Most rounds will arrive here with the model already loaded (the
@@ -1690,6 +1954,10 @@ class GradientAggregator:
         scored gradients. Aggregation then runs once on the assembled
         scored list, and the cache is dropped so the next round loads
         the freshly-published checkpoint.
+
+        round_assignments is the full (uid, assignment) set for the round
+        including non-submitters; it flows to _deliver_scores so the
+        payload always covers every assigned miner.
         """
         t_total_start = time.time()
 
@@ -1713,7 +1981,15 @@ class GradientAggregator:
         t_score = time.time() - t_score_start
 
         t_agg_start = time.time()
-        self._aggregate_accepted(scored, model, model_cfg, tokenizer_cfg, tokenizer, device)
+        self._aggregate_accepted(
+            scored,
+            model,
+            model_cfg,
+            tokenizer_cfg,
+            tokenizer,
+            device,
+            round_assignments,
+        )
         t_agg = time.time() - t_agg_start
 
         # Drop the cache so the next round picks up the freshly-published
@@ -1724,19 +2000,26 @@ class GradientAggregator:
         t_total = time.time() - t_total_start
         logger.info(
             "[GTX] aggregate_round=%d: n_pending=%d t_load=%.2fs t_score=%.2fs t_aggregate=%.2fs t_total=%.2fs",
-            self._agg_round, len(pending), t_load, t_score, t_agg, t_total,
+            self._agg_round,
+            len(pending),
+            t_load,
+            t_score,
+            t_agg,
+            t_total,
         )
         # Stash timings on the aggregator — _aggregate_accepted below will
         # also set loss_before/loss_after/rolled_back on this same dict.
-        self._last_aggregation.update({
-            "round": self._agg_round,
-            "n_pending": len(pending),
-            "t_load_s": t_load,
-            "t_score_s": t_score,
-            "t_aggregate_s": t_agg,
-            "t_total_s": t_total,
-            "timestamp": time.time(),
-        })
+        self._last_aggregation.update(
+            {
+                "round": self._agg_round,
+                "n_pending": len(pending),
+                "t_load_s": t_load,
+                "t_score_s": t_score,
+                "t_aggregate_s": t_agg,
+                "t_total_s": t_total,
+                "timestamp": time.time(),
+            }
+        )
 
     def _get_scoring_cache(self, rnd: int) -> dict | None:
         """Load (or reuse) the scoring model+tokenizer for round `rnd`.
@@ -1746,17 +2029,15 @@ class GradientAggregator:
         boundaries (`_clear_scoring_cache`) because aggregation mutates
         the model in place.
         """
-        if (
-            self._scoring_cache is not None
-            and self._scoring_cache.get("round") == rnd
-        ):
+        if self._scoring_cache is not None and self._scoring_cache.get("round") == rnd:
             return self._scoring_cache
 
         try:
-            from GenTRX.src.model import OrderModel, ModelConfig
+            import torch
+
+            from GenTRX.src.model import ModelConfig, OrderModel
             from GenTRX.src.tokenizer import OrderTokenizer, TokenizerConfig
             from GenTRX.src.train import load_checkpoint
-            import torch
 
             device = "cuda" if torch.cuda.is_available() else "cpu"
             with self._lock:
@@ -1771,7 +2052,9 @@ class GradientAggregator:
                 )
                 tok_dict = ckpt.get("tokenizer_config")
                 tokenizer_cfg = (
-                    TokenizerConfig.from_dict(tok_dict) if tok_dict else TokenizerConfig()
+                    TokenizerConfig.from_dict(tok_dict)
+                    if tok_dict
+                    else TokenizerConfig()
                 )
                 model = OrderModel(model_cfg).to(device)
                 model.load_state_dict(ckpt["model_state_dict"])
@@ -1793,7 +2076,9 @@ class GradientAggregator:
         """Drop the cached scoring model. Called after aggregation."""
         self._scoring_cache = None
 
-    def _score_eagerly(self, miner_uid: int, assignment: dict, grad_bytes: bytes) -> bool:
+    def _score_eagerly(
+        self, miner_uid: int, assignment: dict, grad_bytes: bytes
+    ) -> bool:
         """Score a freshly-collected gradient on the same loop tick it arrived.
 
         Returns True if scoring succeeded (assignment now stamped + state →
@@ -1808,8 +2093,12 @@ class GradientAggregator:
         if cache is None:
             return False
         result = self._score_one_gradient(
-            miner_uid, assignment, grad_bytes,
-            cache["model"], cache["tokenizer"], cache["device"],
+            miner_uid,
+            assignment,
+            grad_bytes,
+            cache["model"],
+            cache["tokenizer"],
+            cache["device"],
         )
         if result is None:
             return False
@@ -1817,8 +2106,13 @@ class GradientAggregator:
         return True
 
     def _score_one_gradient(
-        self, miner_uid: int, assignment: dict, grad_bytes: bytes,
-        model, tokenizer, device: str,
+        self,
+        miner_uid: int,
+        assignment: dict,
+        grad_bytes: bytes,
+        model,
+        tokenizer,
+        device: str,
     ):
         """Evaluate one miner's gradient. Returns (score, comp) or None on failure.
 
@@ -1828,8 +2122,8 @@ class GradientAggregator:
         the GPU work, so we cleanly tolerate the inevitable race where a
         gradient is read on one loop tick and aggregation runs on the next.
         """
-        from GenTRX.src.gradient import deserialize
         from GenTRX.src.distributed import evaluate_gradient
+        from GenTRX.src.gradient import deserialize
 
         cached_comp = assignment.get("_comp")
         cached_score = assignment.get("_score")
@@ -1841,16 +2135,15 @@ class GradientAggregator:
             if len(grad_bytes) > self._max_gradient_bytes:
                 logger.warning(
                     "  miner %d: gradient too large (%.1f MB)",
-                    miner_uid, len(grad_bytes) / 1e6,
+                    miner_uid,
+                    len(grad_bytes) / 1e6,
                 )
                 return None
-            comp = deserialize(grad_bytes)
-            model_param_names = set(name for name, _ in model.named_parameters())
-            unknown = set(comp.sparse.keys()) - model_param_names
-            if unknown:
-                logger.warning(
-                    "  miner %d: %d unknown param names", miner_uid, len(unknown)
-                )
+            expected_shapes = {name: p.shape for name, p in model.named_parameters()}
+            try:
+                comp = deserialize(grad_bytes, expected_shapes=expected_shapes)
+            except ValueError as exc:
+                logger.warning("  miner %d: gradient rejected: %s", miner_uid, exc)
                 return None
             miner_loader = self._build_miner_loader(assignment, tokenizer, device)
             if miner_loader is None:
@@ -1863,7 +2156,9 @@ class GradientAggregator:
             )
             t_own = time.time() - t_own_start
 
-            miner_ranges = [(assignment.get("ts_start", 0), assignment.get("ts_end", 0))]
+            miner_ranges = [
+                (assignment.get("ts_start", 0), assignment.get("ts_end", 0))
+            ]
             held_loader = self._build_val_loader_for_ranges(
                 miner_ranges, tokenizer, device
             )
@@ -1890,10 +2185,14 @@ class GradientAggregator:
             t_total = time.time() - t_start
             logger.info(
                 "[GTX] score_miner=%d: score_own=%+.4f score_held=%s%s combined=%+.4f t_own=%.2fs t_held=%.2fs t_total=%.2fs",
-                miner_uid, score_own,
+                miner_uid,
+                score_own,
                 f"{score_held:+.4f}" if score_held is not None else "n/a",
                 " [OVERFIT]" if overfitting else "",
-                score, t_own, t_held, t_total,
+                score,
+                t_own,
+                t_held,
+                t_total,
             )
             return score, comp
         except Exception as exc:
@@ -1914,7 +2213,12 @@ class GradientAggregator:
         scored = []
         for miner_uid, window_id, assignment, grad_bytes in pending:
             result = self._score_one_gradient(
-                miner_uid, assignment, grad_bytes, model, tokenizer, device,
+                miner_uid,
+                assignment,
+                grad_bytes,
+                model,
+                tokenizer,
+                device,
             )
             if result is None:
                 continue
@@ -1930,6 +2234,7 @@ class GradientAggregator:
         tokenizer_cfg,
         tokenizer,
         device: str,
+        round_assignments: list,
     ) -> None:
         """Aggregate accepted gradients and publish result.
 
@@ -1944,9 +2249,10 @@ class GradientAggregator:
 
         Sibling validators never publish checkpoints — only proposals + scores.
         """
-        from GenTRX.src.gradient import aggregate, decompress, apply_gradient, serialize
-        from GenTRX.src.distributed import _eval_loss
         import torch
+
+        from GenTRX.src.distributed import _eval_loss
+        from GenTRX.src.gradient import aggregate, apply_gradient, decompress, serialize
 
         threshold = self._effective_min_score
 
@@ -1954,29 +2260,42 @@ class GradientAggregator:
         rejected = [(m, w, s, a) for m, w, s, _, a in scored if s <= threshold]
 
         if self._fresh_start and self._agg_round < self.warmup_rounds:
-            logger.info("  Warmup round %d/%d — min_score disabled, rollback disabled", self._agg_round + 1, self.warmup_rounds)
+            logger.info(
+                "  Warmup round %d/%d — min_score disabled, rollback disabled",
+                self._agg_round + 1,
+                self.warmup_rounds,
+            )
 
         # Log + deliver scores (all validators)
         for m, w, s, _, a in scored:
-            self._log_event({
-                "type": "gradient_score",
-                "miner": m, "window": w, "score": s,
-                "score_own": a.get("_score_own"),
-                "score_held": a.get("_score_held"),
-                "overfitting": a.get("_overfitting", False),
-                "accepted": s > threshold,
-                "books": a.get("books", []),
-                "version": self._version,
-            })
+            self._log_event(
+                {
+                    "type": "gradient_score",
+                    "miner": m,
+                    "window": w,
+                    "score": s,
+                    "score_own": a.get("_score_own"),
+                    "score_held": a.get("_score_held"),
+                    "overfitting": a.get("_overfitting", False),
+                    "accepted": s > threshold,
+                    "books": a.get("books", []),
+                    "version": self._version,
+                }
+            )
 
-        self._deliver_scores(scored, accepted, rejected, threshold)
+        self._deliver_scores(scored, accepted, rejected, threshold, round_assignments)
 
         if not accepted:
             logger.info("  No accepted gradients — model unchanged")
-            self._log_event({
-                "type": "aggregation", "round": self._agg_round,
-                "n_scored": len(scored), "n_accepted": 0, "version": self._version,
-            })
+            self._log_event(
+                {
+                    "type": "aggregation",
+                    "round": self._agg_round,
+                    "n_scored": len(scored),
+                    "n_accepted": 0,
+                    "version": self._version,
+                }
+            )
             return
 
         # --- Phase 1: Local aggregation (all validators) ---
@@ -1994,7 +2313,8 @@ class GradientAggregator:
                 )
                 logger.info(
                     "  Published proposal for round %d (%.1f KB)",
-                    self._agg_round, len(proposal_bytes) / 1024,
+                    self._agg_round,
+                    len(proposal_bytes) / 1024,
                 )
                 self._prune_proposals()
             except Exception as exc:
@@ -2006,9 +2326,12 @@ class GradientAggregator:
         # aggregation if no sibling proposals are available.
         trained_ranges = [
             (a.get("ts_start", 0), a.get("ts_end", 0))
-            for _, _, _, _, a in accepted if a.get("ts_start")
+            for _, _, _, _, a in accepted
+            if a.get("ts_start")
         ]
-        val_loader = self._build_val_loader_for_ranges(trained_ranges, tokenizer, device)
+        val_loader = self._build_val_loader_for_ranges(
+            trained_ranges, tokenizer, device
+        )
         if val_loader is None:
             val_loader = self._global_val_loader
 
@@ -2022,7 +2345,10 @@ class GradientAggregator:
 
             if self.is_aggregator:
                 # Evaluate all proposals (local + sibling) and pick the best
-                proposals = self._fetch_validator_proposals(self._agg_round)
+                expected_shapes = {n: p.shape for n, p in model.named_parameters()}
+                proposals = self._fetch_validator_proposals(
+                    self._agg_round, expected_shapes
+                )
                 # Always include our own local delta in the candidate set
                 candidates = [("local", local_agg)]
                 candidates.extend(proposals)
@@ -2032,7 +2358,12 @@ class GradientAggregator:
                     delta = decompress(comp)
                     apply_gradient(model, delta)
                     loss = _eval_loss(model, val_loader, device, self.max_val_batches)
-                    logger.info("  Proposal %s: val loss %.4f (baseline %.4f)", label, loss, baseline_loss)
+                    logger.info(
+                        "  Proposal %s: val loss %.4f (baseline %.4f)",
+                        label,
+                        loss,
+                        baseline_loss,
+                    )
                     if loss < best_loss:
                         best_loss = loss
                         best_delta = delta
@@ -2042,28 +2373,45 @@ class GradientAggregator:
 
             # Apply the chosen delta and check rollback
             apply_gradient(model, best_delta)
-            new_loss = _eval_loss(model, val_loader, device, self.max_val_batches) if self.is_aggregator else best_loss
+            new_loss = (
+                _eval_loss(model, val_loader, device, self.max_val_batches)
+                if self.is_aggregator
+                else best_loss
+            )
 
             if self._effective_rollback and new_loss > baseline_loss:
                 model.load_state_dict(original_state)
-                logger.warning("  Rollback: val %.4f → %.4f (worse)", baseline_loss, new_loss)
-                self._log_event({
-                    "type": "aggregation", "round": self._agg_round,
-                    "n_scored": len(scored), "n_accepted": len(accepted),
-                    "loss_before": baseline_loss, "loss_after": new_loss,
-                    "rolled_back": True, "version": self._version,
-                })
+                logger.warning(
+                    "  Rollback: val %.4f → %.4f (worse)", baseline_loss, new_loss
+                )
+                self._log_event(
+                    {
+                        "type": "aggregation",
+                        "round": self._agg_round,
+                        "n_scored": len(scored),
+                        "n_accepted": len(accepted),
+                        "loss_before": baseline_loss,
+                        "loss_after": new_loss,
+                        "rolled_back": True,
+                        "version": self._version,
+                    }
+                )
                 return
         else:
             new_loss = 0.0
             if not self.is_aggregator:
                 # Sibling without val data: we published the proposal, nothing more to do
                 logger.info("  Sibling: proposal published, no val check")
-                self._log_event({
-                    "type": "aggregation", "round": self._agg_round,
-                    "n_scored": len(scored), "n_accepted": len(accepted),
-                    "version": self._version, "sibling_only": True,
-                })
+                self._log_event(
+                    {
+                        "type": "aggregation",
+                        "round": self._agg_round,
+                        "n_scored": len(scored),
+                        "n_accepted": len(accepted),
+                        "version": self._version,
+                        "sibling_only": True,
+                    }
+                )
                 return
             logger.warning("  No val data — applying local delta without check")
             apply_gradient(model, best_delta)
@@ -2071,8 +2419,8 @@ class GradientAggregator:
         # --- Phase 3: Save checkpoint (aggregator publishes canonical) ---
         t_save_start = time.time()
         with self._lock:
-            from dataclasses import asdict
             import io as _io
+            from dataclasses import asdict
 
             ckpt_dict = {
                 "model_state_dict": model.state_dict(),
@@ -2106,67 +2454,87 @@ class GradientAggregator:
                     logger.error("Failed to upload checkpoint to S3: %s", exc)
             logger.info(
                 "[GTX] checkpoint_save v=%d t_local=%.2fs t_s3=%.2fs bytes=%d",
-                self._version, t_local_save, t_s3_put, ckpt_bytes,
+                self._version,
+                t_local_save,
+                t_s3_put,
+                ckpt_bytes,
             )
 
-        self._log_event({
-            "type": "aggregation", "round": self._agg_round,
-            "n_scored": len(scored), "n_accepted": len(accepted),
-            "loss_before": baseline_loss, "loss_after": new_loss,
-            "rolled_back": False, "version": self._version,
-        })
+        self._log_event(
+            {
+                "type": "aggregation",
+                "round": self._agg_round,
+                "n_scored": len(scored),
+                "n_accepted": len(accepted),
+                "loss_before": baseline_loss,
+                "loss_after": new_loss,
+                "rolled_back": False,
+                "version": self._version,
+            }
+        )
         logger.info(
             "[GTX] round=%d aggregated %d/%d: loss %.4f → %.4f, new_version=%d",
-            self._agg_round, len(accepted), len(scored), baseline_loss, new_loss, self._version,
+            self._agg_round,
+            len(accepted),
+            len(scored),
+            baseline_loss,
+            new_loss,
+            self._version,
         )
 
-    def _deliver_scores(self, scored, accepted, rejected, threshold) -> None:
-        """Stash scores in memory and publish to validator bucket.
-
-        Memory: served via GET /gentrx/scores for the local validator.
-        S3: written to scores/{round:08d}.json so the aggregator (uid 0) and
-        other validators can read cross-validator scores via chain discovery.
-        """
-        if not scored:
-            return
-        if (self._latest_scores is not None and
-                self._agg_round < self._latest_scores.get("round", -1)):
+    def _deliver_scores(
+        self,
+        scored,
+        accepted,
+        rejected,
+        threshold,
+        round_assignments,
+    ) -> None:
+        """Stash scores for GET /gentrx/scores; non-submitters in round_assignments appear at 0."""
+        if (
+            self._latest_scores is not None
+            and self._agg_round < self._latest_scores.get("round", -1)
+        ):
             logger.debug(
                 "[GTX] _deliver_scores: dropping out-of-order round %d (latest=%d)",
-                self._agg_round, self._latest_scores["round"],
+                self._agg_round,
+                self._latest_scores["round"],
             )
             return
+        scored_uids = {m for m, _, _, _, _ in scored}
+        scores_dict: dict[str, dict] = {}
+        for uid, a in round_assignments:
+            score = a.get("_score")
+            if score is None:
+                score = 0.0
+            is_submitter = uid in scored_uids
+            scores_dict[str(uid)] = {
+                "score": score,
+                "score_own": a.get("_score_own"),
+                "score_held": a.get("_score_held"),
+                "overfitting": a.get("_overfitting", False),
+                "accepted": is_submitter and score > threshold,
+                "books": a.get("books", []),
+            }
         self._latest_scores = {
             "round": self._agg_round,
             "model_version": self._version,
-            "scores": {
-                str(m): {
-                    "score": s,
-                    "score_own": a.get("_score_own"),
-                    "score_held": a.get("_score_held"),
-                    "overfitting": a.get("_overfitting", False),
-                    "accepted": s > threshold,
-                    "books": a.get("books", []),
-                }
-                for m, w, s, _, a in scored
-            },
+            "scores": scores_dict,
             "n_scored": len(scored),
             "n_accepted": len(accepted),
             "n_rejected": len(rejected),
-            # Snapshot of the last aggregation + counters for the validator-side
-            # Prometheus collector. Included on the same polling path as scores
-            # so no extra HTTP round-trip is needed.
             "aggregation": dict(self._last_aggregation),
             "counters": {
                 "rounds_aggregated_total": self._rounds_aggregated_total,
                 "rollbacks_total": self._rollbacks_total,
             },
         }
-        # Scores are served in-memory via GET /gentrx/scores only.
-        # No S3 publish — proposals (not raw scores) are the cross-validator
-        # proof-of-work mechanism. See _fetch_validator_proposals().
 
-    def _fetch_validator_proposals(self, round_id: int) -> list[tuple[str, Any]]:
+    def _fetch_validator_proposals(
+        self,
+        round_id: int,
+        expected_shapes: dict,
+    ) -> list[tuple[str, Any]]:
         """Fetch proposals/{round:08d}.grad from sibling validator buckets.
 
         Returns [(label, CompressedGradient), ...] — one per validator that
@@ -2180,8 +2548,9 @@ class GradientAggregator:
 
         try:
             import asyncio
-            from GenTRX.src.gradient_store import GradientStore
+
             from GenTRX.src.gradient import deserialize
+            from GenTRX.src.gradient_store import GradientStore
 
             loop = asyncio.new_event_loop()
             try:
@@ -2214,16 +2583,23 @@ class GradientAggregator:
                     raw = store.get_proposal(uid, round_id)
                     if raw is None:
                         continue
-                    comp = deserialize(raw)
+                    comp = deserialize(raw, expected_shapes=expected_shapes)
                     proposals.append((f"validator-{uid}", comp))
-                    logger.debug("  Fetched proposal from validator uid-%d (%.1f KB)", uid, len(raw) / 1024)
+                    logger.debug(
+                        "  Fetched proposal from validator uid-%d (%.1f KB)",
+                        uid,
+                        len(raw) / 1024,
+                    )
+                except ValueError as exc:
+                    logger.warning("Proposal from uid-%d rejected: %s", uid, exc)
                 except Exception as exc:
                     logger.debug("Failed to read proposal from uid-%d: %s", uid, exc)
 
             if proposals:
                 logger.info(
                     "  Fetched %d sibling proposals for round %d",
-                    len(proposals), round_id,
+                    len(proposals),
+                    round_id,
                 )
             return proposals
 
@@ -2241,8 +2617,9 @@ class GradientAggregator:
 
         Reads from S3 when store is set, otherwise from local filesystem.
         """
-        from GenTRX.src.dataloader import OrderDataset
         from torch.utils.data import DataLoader
+
+        from GenTRX.src.dataloader import OrderDataset
 
         books = assignment.get("books", [])
         if not books:
@@ -2270,11 +2647,90 @@ class GradientAggregator:
         import msgpack as _msgpack
 
         try:
-            tick = _msgpack.unpackb(data, raw=False, use_list=True, strict_map_key=False)
+            tick = _msgpack.unpackb(
+                data, raw=False, use_list=True, strict_map_key=False
+            )
         except Exception as exc:
             logger.warning("Failed to unpack state: %s", exc)
             return
-        self._process_tick(tick)
+        self._enqueue_tick(tick)
+
+    def _enqueue_tick(self, tick: dict) -> None:
+        """Route a state tick through the reorder buffer.
+
+        Fast path: if the buffer is empty and the tick is in order (ts >=
+        last_seen or no ts), process immediately with no overhead.
+
+        Slow path: if the tick arrives with a sim-time jump larger than
+        _reorder_jump_ns, or while the buffer already holds earlier ticks,
+        push onto the min-heap and drain whatever is ready.
+        """
+        import heapq as _heapq
+
+        tick_ts = int(tick.get("ts", 0) or 0)
+        wall_now = time.monotonic()
+
+        in_order = not tick_ts or tick_ts >= self._last_seen_sim_ts
+
+        # Update EMA from in-order positive increments only
+        if tick_ts and self._last_seen_sim_ts and tick_ts > self._last_seen_sim_ts:
+            increment = tick_ts - self._last_seen_sim_ts
+            if self._ts_ema_samples == 0:
+                self._ts_increment_ema = float(increment)
+            else:
+                self._ts_increment_ema = (
+                    self._ts_ema_alpha * increment
+                    + (1 - self._ts_ema_alpha) * self._ts_increment_ema
+                )
+            self._ts_ema_samples += 1
+
+        expected_ns = (
+            self._ts_increment_ema
+            if self._ts_ema_samples >= 5
+            else self._ts_ema_fallback
+        )
+        large_jump = (
+            tick_ts
+            and self._last_seen_sim_ts
+            and (tick_ts - self._last_seen_sim_ts) > expected_ns
+        )
+
+        if not large_jump and not self._reorder_buf and in_order:
+            self._process_tick(tick)
+            return
+
+        self._reorder_seq += 1
+        _heapq.heappush(
+            self._reorder_buf, (tick_ts or 0, self._reorder_seq, wall_now, tick)
+        )
+        self._drain_reorder_buf(wall_now)
+
+    def _drain_reorder_buf(self, wall_now: float | None = None) -> None:
+        """Process buffered ticks that are ready.
+
+        A tick is ready when:
+          - its sim-ts gap to last_seen_sim_ts is within _reorder_jump_ns
+            (a filling tick has arrived, closing the gap), OR
+          - it has waited at least _reorder_timeout_s wall-clock seconds.
+        """
+        import heapq as _heapq
+
+        if wall_now is None:
+            wall_now = time.monotonic()
+        expected_ns = (
+            self._ts_increment_ema
+            if self._ts_ema_samples >= 5
+            else self._ts_ema_fallback
+        )
+        while self._reorder_buf:
+            sim_ts, _seq, enqueued_at, tick = self._reorder_buf[0]
+            gap = sim_ts - self._last_seen_sim_ts if self._last_seen_sim_ts else 0
+            timed_out = (wall_now - enqueued_at) >= self._reorder_timeout_s
+            if timed_out or gap <= expected_ns:
+                _heapq.heappop(self._reorder_buf)
+                self._process_tick(tick)
+            else:
+                break
 
     def _reset_sim_buffers(self) -> None:
         """Drop every in-memory tick buffer so the next sim starts clean.
@@ -2288,10 +2744,15 @@ class GradientAggregator:
         self._pending_interval_start = {}
         self._written_parquets = {}
         self._last_seen_sim_ts = 0
+        self._reorder_buf = []
+        self._reorder_seq = 0
+        self._ts_increment_ema = 0.0
+        self._ts_ema_samples = 0
         # Without this, the backwards-time check in _process_tick would
         # re-fire for every new-sim tick whose ts < old_max.
         self._max_timestamp_ns = 0
         self._restored_sim_id = None
+        self._bucket_sim_id = None
         # Engines are per-book; drop them so the next sim replays events
         # against a fresh matching engine instead of stale depth.
         self._engines = {}
@@ -2321,10 +2782,27 @@ class GradientAggregator:
             if n:
                 logger.info(
                     "[GTX] pruned %d old checkpoint(s), keeping latest %d",
-                    n, self.keep_checkpoints,
+                    n,
+                    self.keep_checkpoints,
                 )
         except Exception as exc:
             logger.debug("checkpoint prune failed: %s", exc)
+
+    def _read_bucket_sim_marker(self) -> str | None:
+        if self.validator_store is None:
+            return None
+        try:
+            return self.validator_store.get_sim_marker(self._validator_uid)
+        except Exception:
+            return None
+
+    def _write_bucket_sim_marker(self, sim_id: str) -> None:
+        if self.validator_store is None or not sim_id:
+            return
+        try:
+            self.validator_store.put_sim_marker(self._validator_uid, sim_id)
+        except Exception as exc:
+            logger.warning("bucket sim_id marker write failed: %s", exc)
 
     def _prune_proposals(self) -> None:
         """Trim this validator's proposals/<uid>/ to keep_proposals newest .grad files."""
@@ -2339,7 +2817,8 @@ class GradientAggregator:
             if n:
                 logger.info(
                     "[GTX] pruned %d old proposal(s), keeping latest %d",
-                    n, self.keep_proposals,
+                    n,
+                    self.keep_proposals,
                 )
         except Exception as exc:
             logger.debug("proposal prune failed: %s", exc)
@@ -2372,11 +2851,11 @@ class GradientAggregator:
 
         Replays events through MatchingEngine, accumulates rows per book,
         flushes to parquet when sim time crosses an interval boundary.
-        Bumps `_sim_epoch` if the tick's timestamp is older than the last
-        seen one — that's a sim restart inside this gradient server's lifetime.
+        Sim restarts are detected via sim_id change or ESE/ESS markers only —
+        timestamp decreases are ignored as states may arrive out of order.
         """
         from GenTRX.src.orderbook import MatchingEngine
-        from GenTRX.src.util.schema import BID, ASK, CANCEL, LOB_DEPTH
+        from GenTRX.src.util.schema import ASK, BID, CANCEL, LOB_DEPTH
 
         # Sim lifecycle markers from state.notices. 'ESE' flags a sim end:
         # clear in-memory buffers so no sim-A tail contaminates sim-B ticks,
@@ -2393,35 +2872,76 @@ class GradientAggregator:
                 "S3 data/ cleanup queued for next aggregation-loop tick"
             )
             return
-        if "ESS" in sim_events and self._data_cleanup_pending:
-            # ESE was missed or arrived late — cleanup flag still set when
-            # the new sim is already announcing itself. Treat as safety net.
-            logger.info(
-                "[GTX] Sim start received with cleanup still pending; "
-                "running cleanup now before new sim data flushes"
-            )
-            self._run_data_cleanup()
+        if "ESS" in sim_events:
+            cfg = tick.get("config") or {}
+            incoming_sim_id = cfg.get("simulation_id") if cfg else None
+            # Idempotent for spool-replay/duplicate ESS: only reset when the
+            # incoming sim_id actually differs from the current binding.
+            if self._sim_id is not None and (
+                incoming_sim_id is None or incoming_sim_id != self._sim_id
+            ):
+                self._sim_epoch += 1
+                self._reset_sim_buffers()
+                self._data_cleanup_pending = True
+                self._sim_id = None
+            if self._data_cleanup_pending:
+                logger.info(
+                    "[GTX] Sim start received with cleanup still pending; "
+                    "running cleanup now before new sim data flushes"
+                )
+                self._run_data_cleanup()
 
-        tick_ts = int(tick.get("ts", 0) or 0)
-        # Two reference points: _last_seen_sim_ts catches an in-process sim
-        # restart; _max_timestamp_ns catches a cross-process restart (it's
-        # restored from the staging file, _last_seen_sim_ts is not).
-        if tick_ts and (
-            (self._last_seen_sim_ts and tick_ts < self._last_seen_sim_ts)
-            or (self._max_timestamp_ns and tick_ts < self._max_timestamp_ns)
+        # Identity guard: drop ticks that can't be tied to a sim_id.
+        incoming_sim_id = tick.get("sim_id") or (tick.get("config") or {}).get("simulation_id")
+        if self._sim_id is None and not incoming_sim_id:
+            self._pre_bind_drops += 1
+            if self._pre_bind_drops <= 3 or self._pre_bind_drops % 64 == 0:
+                logger.info(
+                    "[GTX] dropping pre-bind tick (no sim_id yet); drops=%d",
+                    self._pre_bind_drops,
+                )
+            return
+        if (
+            self._sim_id is not None
+            and incoming_sim_id
+            and incoming_sim_id != self._sim_id
         ):
-            prior = self._last_seen_sim_ts or self._max_timestamp_ns
+            # Sim transition without an ESS marker; rebind below.
             self._sim_epoch += 1
-            # Heuristic fallback — an ESE should normally have landed before
-            # this, but if the simulator didn't emit one we still want a
-            # clean break.
             self._reset_sim_buffers()
             self._data_cleanup_pending = True
             logger.info(
-                "Sim restart detected (ts %d → %d), advancing sim_epoch to %d "
-                "and queueing data/ cleanup (no ESE marker seen)",
-                prior, tick_ts, self._sim_epoch,
+                "sim_id changed via tick (%s → %s), advancing sim_epoch to %d",
+                self._sim_id,
+                incoming_sim_id,
+                self._sim_epoch,
             )
+            self._sim_id = None
+
+        tick_ts = int(tick.get("ts", 0) or 0)
+
+        # Drop exact retry duplicates (sim_ts == last_seen). Strictly stale
+        # arrivals (sim_ts < last_seen) are legitimate reorder-buffer drains
+        # and must still process. The sim-swap path below handles sim_id changes.
+        pkt_sim_id = incoming_sim_id
+        same_sim = (
+            pkt_sim_id is None or self._sim_id is None or pkt_sim_id == self._sim_id
+        )
+        if (
+            tick_ts
+            and self._last_seen_sim_ts
+            and same_sim
+            and tick_ts == self._last_seen_sim_ts
+        ):
+            self._dedup_drops_total += 1
+            if self._dedup_drops_total == 1 or self._dedup_drops_total % 64 == 0:
+                logger.info(
+                    "Dedup: dropped %d duplicate ticks (tick_ts=%d == last_seen)",
+                    self._dedup_drops_total,
+                    tick_ts,
+                )
+            return
+
         if tick_ts:
             self._last_seen_sim_ts = tick_ts
 
@@ -2435,46 +2955,37 @@ class GradientAggregator:
             self._price_scale = 10**pd
             self._vol_scale = 10**vd
 
-        # Bind sim_id from any packet that carries a config block — not just
-        # the first. state_packager keeps resending config until sim_id is
-        # non-None, so the second packet will have the real id even if the
-        # first arrived before the simulator set its logDir.
-        cfg = tick.get("config") or {}
-        if cfg:
-            new_sim_id = cfg.get("simulation_id")
-            if new_sim_id and new_sim_id != self._sim_id:
-                # Cross-process sim swap: restored staging buffer is from a
-                # different sim than the one now pushing. Wipe before bind.
-                if (
-                    self._sim_id is None
-                    and self._restored_sim_id is not None
-                    and self._restored_sim_id != new_sim_id
-                ):
-                    self._sim_epoch += 1
-                    self._reset_sim_buffers()
-                    self._data_cleanup_pending = True
-                    logger.info(
-                        "sim_id mismatch on restart (staged=%s → live=%s), "
-                        "advancing sim_epoch to %d and queueing data/ cleanup",
-                        self._restored_sim_id, new_sim_id, self._sim_epoch,
-                    )
-                elif self._sim_id is not None:
-                    # Different sim_id arriving without sim time going backwards
-                    # — simulator was reseeded with a fresh id. Bump epoch so the
-                    # dashboard treats it as a separate run within this process,
-                    # and queue data/ cleanup in case the ESE path missed it.
-                    self._sim_epoch += 1
-                    self._reset_sim_buffers()
-                    self._data_cleanup_pending = True
-                    logger.info(
-                        "sim_id changed (%s → %s), advancing sim_epoch to %d "
-                        "and queueing data/ cleanup",
-                        self._sim_id, new_sim_id, self._sim_epoch,
-                    )
-                self._restored_sim_id = None
-                self._sim_id = new_sim_id
-                logger.info("Bound to sim_id=%s (sim_epoch=%d)", self._sim_id, self._sim_epoch)
-                self._log_event({"type": "sim_bind"})
+        # Bind sim_id from any packet that carries one.
+        new_sim_id = incoming_sim_id
+        if new_sim_id and new_sim_id != self._sim_id:
+            staged_mismatch = (
+                self._restored_sim_id is not None
+                and self._restored_sim_id != new_sim_id
+            )
+            bucket_mismatch = (
+                self._bucket_sim_id is not None
+                and self._bucket_sim_id != new_sim_id
+            )
+            if self._sim_id is None and (staged_mismatch or bucket_mismatch):
+                self._sim_epoch += 1
+                self._reset_sim_buffers()
+                self._data_cleanup_pending = True
+                logger.info(
+                    "sim_id mismatch on restart (staged=%s, bucket=%s → live=%s), "
+                    "advancing sim_epoch to %d and queueing data/ cleanup",
+                    self._restored_sim_id,
+                    self._bucket_sim_id,
+                    new_sim_id,
+                    self._sim_epoch,
+                )
+            self._restored_sim_id = None
+            self._sim_id = new_sim_id
+            self._bucket_sim_id = new_sim_id
+            self._write_bucket_sim_marker(new_sim_id)
+            logger.info(
+                "Bound to sim_id=%s (sim_epoch=%d)", self._sim_id, self._sim_epoch
+            )
+            self._log_event({"type": "sim_bind"})
 
         books = tick.get("books", {})
 
@@ -2563,12 +3074,8 @@ class GradientAggregator:
                     ),
                 }
                 for i in range(LOB_DEPTH):
-                    row[f"lob_ask_vol_{i + 1}"] = (
-                        float(ask_vols[i]) / self._price_scale
-                    )
-                    row[f"lob_bid_vol_{i + 1}"] = (
-                        float(bid_vols[i]) / self._price_scale
-                    )
+                    row[f"lob_ask_vol_{i + 1}"] = float(ask_vols[i]) / self._price_scale
+                    row[f"lob_bid_vol_{i + 1}"] = float(bid_vols[i]) / self._price_scale
 
                 self._pending_rows[book_id].append(row)
                 engine.process_order(order_type, price_ticks, vol_ticks, is_buy)
@@ -2588,16 +3095,18 @@ class GradientAggregator:
 
     def _flush_book_parquet(self, book_id: int) -> None:
         """Flush accumulated rows for a book to a parquet file on S3."""
+        import io as _io
+
         import numpy as np
         import pyarrow as pa
         import pyarrow.parquet as pq
-        import io as _io
 
         from GenTRX.src.util.schema import LOB_DEPTH, order_stream_schema
 
-        rows = self._pending_rows.get(book_id, [])
+        rows = list(self._pending_rows.get(book_id, []))
         if not rows:
             return
+        rows.sort(key=lambda r: r["timestamp"])
 
         ts_min = rows[0]["timestamp"]
         ts_max = rows[-1]["timestamp"]
@@ -2610,24 +3119,16 @@ class GradientAggregator:
                 "timestamp": pa.array(
                     [r["timestamp"] for r in rows], type=pa.timestamp("ns")
                 ),
-                "order_type": np.array(
-                    [r["order_type"] for r in rows], dtype=np.int8
-                ),
-                "rel_price": np.array(
-                    [r["rel_price"] for r in rows], dtype=np.int64
-                ),
-                "volume_int": np.array(
-                    [r["volume_int"] for r in rows], dtype=np.int32
-                ),
+                "order_type": np.array([r["order_type"] for r in rows], dtype=np.int8),
+                "rel_price": np.array([r["rel_price"] for r in rows], dtype=np.int64),
+                "volume_int": np.array([r["volume_int"] for r in rows], dtype=np.int32),
                 "volume_dec": np.array(
                     [r["volume_dec"] for r in rows], dtype=np.float32
                 ),
                 "interval_ns": np.array(
                     [r["interval_ns"] for r in rows], dtype=np.int64
                 ),
-                "mid_price": np.array(
-                    [r["mid_price"] for r in rows], dtype=np.int64
-                ),
+                "mid_price": np.array([r["mid_price"] for r in rows], dtype=np.int64),
                 "time_of_day_s": np.array(
                     [r["time_of_day_s"] for r in rows], dtype=np.int32
                 ),
@@ -2638,12 +3139,8 @@ class GradientAggregator:
             for i in range(LOB_DEPTH):
                 k_ask = f"lob_ask_vol_{i + 1}"
                 k_bid = f"lob_bid_vol_{i + 1}"
-                columns[k_ask] = np.array(
-                    [r[k_ask] for r in rows], dtype=np.float64
-                )
-                columns[k_bid] = np.array(
-                    [r[k_bid] for r in rows], dtype=np.float64
-                )
+                columns[k_ask] = np.array([r[k_ask] for r in rows], dtype=np.float64)
+                columns[k_bid] = np.array([r[k_bid] for r in rows], dtype=np.float64)
 
             table = pa.table(columns, schema=order_stream_schema())
             buf = _io.BytesIO()
@@ -2666,12 +3163,18 @@ class GradientAggregator:
             if book_id not in self._written_parquets:
                 self._written_parquets[book_id] = []
             self._written_parquets[book_id].append((pq_filename, ts_min, ts_max))
-            self._pending_rows[book_id] = []
-            self._pending_interval_start[book_id] = 0
+            del self._pending_rows[book_id][: len(rows)]
+            if self._pending_rows[book_id]:
+                self._pending_interval_start[book_id] = self._pending_rows[book_id][0][
+                    "timestamp"
+                ]
+            else:
+                self._pending_interval_start[book_id] = 0
         except Exception as exc:
             logger.error(
                 "Failed to write parquet for book %d: %s — rows retained for next flush",
-                book_id, exc,
+                book_id,
+                exc,
             )
 
 
@@ -2725,12 +3228,14 @@ def create_gradient_router(
 
     @router.post("/state")
     async def receive_state(request: Request):
-        """Receive a state tick from the validator (msgpack bytes).
+        from fastapi import HTTPException
+        from starlette.requests import ClientDisconnect
 
-        Replaces S3-based state transfer — validator POSTs state directly,
-        gradient server processes in-memory. No validator bucket needed.
-        """
-        body = await request.body()
+        try:
+            body = await request.body()
+        except ClientDisconnect:
+            # 503 triggers client retry; sim_ts dedup absorbs duplicates.
+            raise HTTPException(status_code=503, detail="client_disconnect_during_read")
         aggregator.receive_state(body)
         return {"status": "ok"}
 
@@ -2769,44 +3274,95 @@ def create_gradient_router(
             http://<host>:<port>/gentrx/metrics
         """
         from fastapi.responses import Response as _Resp
+
         try:
-            from prometheus_client import CollectorRegistry, Gauge, Counter, generate_latest, CONTENT_TYPE_LATEST
+            from prometheus_client import (
+                CONTENT_TYPE_LATEST,
+                CollectorRegistry,
+                Counter,
+                Gauge,
+                generate_latest,
+            )
         except ImportError:
             return _Resp(status_code=503, content="prometheus_client not installed")
 
         reg = CollectorRegistry()
         labels = ["netuid", "validator_uid"]
-        lv = [str(aggregator._chain.netuid if aggregator._chain else ""), aggregator._validator_uid]
+        lv = [
+            str(aggregator._chain.netuid if aggregator._chain else ""),
+            aggregator._validator_uid,
+        ]
 
         def _g(name, doc, extra_labels=()):
             return Gauge(name, doc, labels + list(extra_labels), registry=reg)
 
         # Round / version
-        g_round   = _g("gentrx_agg_round",            "Current aggregation round")
-        g_version = _g("gentrx_checkpoint_version",   "Model checkpoint version (increments on accepted round)")
-        g_rounds_total = _g("gentrx_rounds_aggregated_total", "Cumulative rounds aggregated")
-        g_rollbacks    = _g("gentrx_rollbacks_total",         "Cumulative aggregations rolled back (no improvement)")
+        g_round = _g("gentrx_agg_round", "Current aggregation round")
+        g_version = _g(
+            "gentrx_checkpoint_version",
+            "Model checkpoint version (increments on accepted round)",
+        )
+        g_rounds_total = _g(
+            "gentrx_rounds_aggregated_total", "Cumulative rounds aggregated"
+        )
+        g_rollbacks = _g(
+            "gentrx_rollbacks_total",
+            "Cumulative aggregations rolled back (no improvement)",
+        )
 
         # Last aggregation
-        g_n_scored   = _g("gentrx_last_n_scored",   "Gradients scored in last round")
+        g_n_scored = _g("gentrx_last_n_scored", "Gradients scored in last round")
         g_n_accepted = _g("gentrx_last_n_accepted", "Gradients accepted in last round")
-        g_loss_before = _g("gentrx_last_loss_before", "Model loss before last aggregation")
-        g_loss_after  = _g("gentrx_last_loss_after",  "Model loss after last aggregation")
-        g_loss_delta  = _g("gentrx_last_loss_improvement", "Loss reduction in last round (before − after)")
-        g_t_score = _g("gentrx_last_score_duration_s",     "Gradient scoring duration (s) in last round")
-        g_t_agg   = _g("gentrx_last_aggregate_duration_s", "Aggregation duration (s) in last round")
-        g_t_total = _g("gentrx_last_total_duration_s",     "Total round duration (s) in last round")
+        g_loss_before = _g(
+            "gentrx_last_loss_before", "Model loss before last aggregation"
+        )
+        g_loss_after = _g("gentrx_last_loss_after", "Model loss after last aggregation")
+        g_loss_delta = _g(
+            "gentrx_last_loss_improvement",
+            "Loss reduction in last round (before − after)",
+        )
+        g_t_score = _g(
+            "gentrx_last_score_duration_s",
+            "Gradient scoring duration (s) in last round",
+        )
+        g_t_agg = _g(
+            "gentrx_last_aggregate_duration_s", "Aggregation duration (s) in last round"
+        )
+        g_t_total = _g(
+            "gentrx_last_total_duration_s", "Total round duration (s) in last round"
+        )
 
         # Active miners
-        g_active    = _g("gentrx_active_miners",    "Miners with non-zero gradient score this round")
-        g_benchmark = _g("gentrx_benchmark_miners", "Benchmark (off-chain) miners registered with gradient server")
+        g_active = _g(
+            "gentrx_active_miners", "Miners with non-zero gradient score this round"
+        )
+        g_benchmark = _g(
+            "gentrx_benchmark_miners",
+            "Benchmark (off-chain) miners registered with gradient server",
+        )
 
         # Per-miner scores — is_benchmark=1 for UIDs registered via /register_bucket
         # (benchmark agents tracked for scoring but excluded from on-chain rewards)
-        g_score_own  = _g("gentrx_miner_score_own",  "Miner own-data score last round",  ("miner_uid", "is_benchmark"))
-        g_score_held = _g("gentrx_miner_score_held", "Miner held-out score last round",  ("miner_uid", "is_benchmark"))
-        g_score      = _g("gentrx_miner_score",      "Miner combined score last round",   ("miner_uid", "is_benchmark"))
-        g_accepted   = _g("gentrx_miner_accepted",   "1 if miner gradient accepted last round", ("miner_uid", "is_benchmark"))
+        g_score_own = _g(
+            "gentrx_miner_score_own",
+            "Miner own-data score last round",
+            ("miner_uid", "is_benchmark"),
+        )
+        g_score_held = _g(
+            "gentrx_miner_score_held",
+            "Miner held-out score last round",
+            ("miner_uid", "is_benchmark"),
+        )
+        g_score = _g(
+            "gentrx_miner_score",
+            "Miner combined score last round",
+            ("miner_uid", "is_benchmark"),
+        )
+        g_accepted = _g(
+            "gentrx_miner_accepted",
+            "1 if miner gradient accepted last round",
+            ("miner_uid", "is_benchmark"),
+        )
 
         g_round.labels(*lv).set(aggregator._agg_round)
         g_version.labels(*lv).set(aggregator._version)
@@ -2834,13 +3390,15 @@ def create_gradient_router(
         scores = aggregator._latest_scores
         if scores:
             per_miner = scores.get("scores", {})
-            g_active.labels(*lv).set(sum(1 for v in per_miner.values() if v.get("accepted")))
+            g_active.labels(*lv).set(
+                sum(1 for v in per_miner.values() if v.get("accepted"))
+            )
             for uid_str, info in per_miner.items():
                 is_bm = "1" if int(uid_str) in benchmark_uids else "0"
                 mlv = lv + [uid_str, is_bm]
-                s_own  = info.get("score_own")
+                s_own = info.get("score_own")
                 s_held = info.get("score_held")
-                s      = info.get("score", 0.0)
+                s = info.get("score", 0.0)
                 if s_own is not None:
                     g_score_own.labels(*mlv).set(s_own)
                 if s_held is not None:
@@ -2867,6 +3425,7 @@ def create_gradient_router(
         the chain returns a non-empty result, but the merge happens after.
         """
         from GenTRX.src.chain import BucketInfo
+
         data = await request.json()
         bi = BucketInfo(
             account_id=data.get("account_id", data.get("bucket_name", "")),
@@ -2877,7 +3436,9 @@ def create_gradient_router(
         )
         aggregator._miner_buckets[uid] = bi
         aggregator._static_buckets[uid] = bi
-        logger.info("[GTX] registered static bucket for uid=%d bucket=%s", uid, bi.bucket_name)
+        logger.info(
+            "[GTX] registered static bucket for uid=%d bucket=%s", uid, bi.bucket_name
+        )
         return {"status": "ok", "uid": uid, "bucket": bi.bucket_name}
 
     @router.get("/data-status")
@@ -2898,9 +3459,15 @@ def create_gradient_router(
         """
         books = {}
         for bid, plist in aggregator._written_parquets.items():
-            fnames = [fname for fname, _, _ in plist]
             bmax = max((end for _, _, end in plist), default=0)
-            books[str(bid)] = {"parquets": fnames, "max_ts": bmax}
+            # Include f_start/f_end so the validator can filter to each miner's
+            # training window instead of sending every parquet key.
+            books[str(bid)] = {
+                "parquets": [
+                    [fname, f_start, f_end] for fname, f_start, f_end in plist
+                ],
+                "max_ts": bmax,
+            }
         return {
             "max_ts": aggregator._max_timestamp_ns,
             "version": aggregator._version,
@@ -2927,6 +3494,7 @@ def create_gradient_router(
             }
         """
         import json as _json_mod
+
         body = await request.body()
         payload = _json_mod.loads(body)
 
@@ -2936,9 +3504,6 @@ def create_gradient_router(
         if push_block is not None:
             aggregator._last_push_block = int(push_block)
 
-        # Pure accounting — no heavy work on the event loop.
-        # Aggregation of the closing round is handled by _aggregation_loop,
-        # which picks up _pending_aggregation_rounds on its next iteration.
         if round_id > aggregator._agg_round:
             prior_round = aggregator._agg_round
             # Preserve the closing round's assignments in _prev_round_assignments
@@ -2946,7 +3511,8 @@ def create_gradient_router(
             # Without this, the new round's installation below overwrites
             # them and round N's gradients never get scored.
             closing = {
-                uid: a for uid, a in aggregator._assignments.items()
+                uid: a
+                for uid, a in aggregator._assignments.items()
                 if a.get("round") == prior_round
             }
             if closing:
@@ -2960,20 +3526,24 @@ def create_gradient_router(
             gap = round_id - aggregator._agg_round
             if gap > 1:
                 stale_live = [
-                    uid for uid, a in aggregator._assignments.items()
+                    uid
+                    for uid, a in aggregator._assignments.items()
                     if a.get("round", -1) < prior_round
                 ]
                 for uid in stale_live:
                     aggregator._assignments.pop(uid, None)
                 stale_prev = [
-                    uid for uid, a in aggregator._prev_round_assignments.items()
+                    uid
+                    for uid, a in aggregator._prev_round_assignments.items()
                     if a.get("round", -1) < prior_round
                 ]
                 for uid in stale_prev:
                     aggregator._prev_round_assignments.pop(uid, None)
                 logger.warning(
                     "[GTX] round jump %d -> %d: dropped %d stale assignments",
-                    prior_round, round_id, len(stale_live) + len(stale_prev),
+                    prior_round,
+                    round_id,
+                    len(stale_live) + len(stale_prev),
                 )
             if closing:
                 aggregator._pending_aggregation_rounds.add(prior_round)
@@ -2996,13 +3566,16 @@ def create_gradient_router(
         aggregator._last_round_log_ts = 0.0  # emit status on next loop tick
         logger.info(
             "[GTX] round=%d accepted from validator: %d assignments",
-            round_id, len(assignments),
+            round_id,
+            len(assignments),
         )
-        aggregator._log_event({
-            "type": "round_delivered",
-            "round": round_id,
-            "n_assignments": len(assignments),
-        })
+        aggregator._log_event(
+            {
+                "type": "round_delivered",
+                "round": round_id,
+                "n_assignments": len(assignments),
+            }
+        )
         return {"status": "ok", "round": round_id, "n_assignments": len(assignments)}
 
     return router, aggregator
@@ -3022,6 +3595,7 @@ def _resolve_validator_uid(args, chain, validator_store) -> str:
     or pre-commit bootstrap).
     """
     import bittensor as bt
+
     if args.validator_uid:
         return str(args.validator_uid)
     if chain is None or validator_store is None:
@@ -3032,6 +3606,7 @@ def _resolve_validator_uid(args, chain, validator_store) -> str:
         return "0"
     try:
         import asyncio
+
         loop = asyncio.new_event_loop()
         try:
             buckets = loop.run_until_complete(chain.get_miner_buckets())
@@ -3056,6 +3631,7 @@ def _resolve_validator_uid(args, chain, validator_store) -> str:
 
 if __name__ == "__main__":
     import argparse
+
     import uvicorn
     from fastapi import FastAPI
 
@@ -3075,14 +3651,14 @@ if __name__ == "__main__":
         "--bind",
         default="127.0.0.1",
         help="Bind address (default: 127.0.0.1 = localhost only. "
-             "Use 0.0.0.0 for remote access, but set --api-key for security).",
+        "Use 0.0.0.0 for remote access, but set --api-key for security).",
     )
     parser.add_argument(
         "--api-key",
         default=os.environ.get("GENTRX_API_KEY", ""),
         help="Shared secret for validator↔gradient server auth. "
-             "When set, all requests must include X-API-Key header. "
-             "Also reads from GENTRX_API_KEY env var.",
+        "When set, all requests must include X-API-Key header. "
+        "Also reads from GENTRX_API_KEY env var.",
     )
     parser.add_argument(
         "--interval",
@@ -3130,24 +3706,24 @@ if __name__ == "__main__":
         type=int,
         default=25,
         help="Server-side estimate of how many blocks make up one round. "
-             "Used only by the heartbeat-loss fallback in _round_complete. "
-             "Should match the validator's --gentrx.blocks_per_round.",
+        "Used only by the heartbeat-loss fallback in _round_complete. "
+        "Should match the validator's --gentrx.blocks_per_round.",
     )
     parser.add_argument(
         "--block-time-s",
         type=float,
         default=12.0,
         help="Assumed seconds per block on the target chain (default: 12s, "
-             "finney). Combined with --blocks-per-round to estimate the "
-             "round duration for the heartbeat-loss fallback.",
+        "finney). Combined with --blocks-per-round to estimate the "
+        "round duration for the heartbeat-loss fallback.",
     )
     parser.add_argument(
         "--round-grace-s",
         type=float,
         default=30.0,
         help="Grace seconds added to the heartbeat-loss fallback estimate "
-             "before force-closing a round (default: 30s). Only fires if "
-             "the validator stops pushing POST /gentrx/round.",
+        "before force-closing a round (default: 30s). Only fires if "
+        "the validator stops pushing POST /gentrx/round.",
     )
     parser.add_argument(
         "--max-gradient-bytes",
@@ -3160,17 +3736,17 @@ if __name__ == "__main__":
         type=int,
         default=10,
         help="Keep newest N checkpoints in the validator bucket (default: 10). "
-             "Older checkpoints are deleted after a new one is published. "
-             "Set 0 to disable pruning (you handle cleanup yourself — "
-             "consider this if you mirror checkpoints to cold storage).",
+        "Older checkpoints are deleted after a new one is published. "
+        "Set 0 to disable pruning (you handle cleanup yourself — "
+        "consider this if you mirror checkpoints to cold storage).",
     )
     parser.add_argument(
         "--keep-proposals",
         type=int,
         default=10,
         help="Keep newest N proposals in the validator bucket (default: 10). "
-             "Older proposals are deleted after a new one is published. "
-             "Set 0 to disable pruning.",
+        "Older proposals are deleted after a new one is published. "
+        "Set 0 to disable pruning.",
     )
     parser.add_argument(
         "--window-ns",
@@ -3210,10 +3786,10 @@ if __name__ == "__main__":
         default=None,
         choices=["mainnet", "testnet"],
         help="Explicit network shard for bucket keys (mainnet or testnet). "
-             "Overrides the heuristic derived from --subtensor-network. "
-             "Required when connecting via a custom wss:// endpoint to finney "
-             "that is not automatically recognised. "
-             "Equivalent to setting GENTRX_NETWORK in the environment.",
+        "Overrides the heuristic derived from --subtensor-network. "
+        "Required when connecting via a custom wss:// endpoint to finney "
+        "that is not automatically recognised. "
+        "Equivalent to setting GENTRX_NETWORK in the environment.",
     )
     parser.add_argument(
         "--endpoint-override",
@@ -3271,6 +3847,7 @@ if __name__ == "__main__":
     _grad_cores_count = int(os.environ.get("GRAD_CORES_COUNT", "0"))
     if _grad_cores_count > 0:
         import multiprocessing as _mp
+
         _total_cpu = _mp.cpu_count()
         if _total_cpu > _grad_cores_count:
             _grad_cores = list(range(_total_cpu - _grad_cores_count, _total_cpu))
@@ -3279,9 +3856,11 @@ if __name__ == "__main__":
             except (AttributeError, OSError):
                 pass  # not available on macOS / non-Linux
             import torch as _torch
+
             _torch.set_num_threads(_grad_cores_count)
 
     import bittensor as bt
+
     # Configure bt.logging before bt.Subtensor() so bt never defaults to
     # Warning level and suppresses our INFO messages.
     if args.log_level == "debug":
@@ -3307,8 +3886,7 @@ if __name__ == "__main__":
     network = network_from_subtensor(args.subtensor_network)
     bucket_prefix = gentrx_prefix(network, args.mode)
     bt.logging.info(
-        f"Bucket prefix: {bucket_prefix} "
-        f"(network={network}, mode={args.mode})"
+        f"Bucket prefix: {bucket_prefix} (network={network}, mode={args.mode})"
     )
 
     # Single validator bucket: checkpoints/ + data/ + proposals/ all live
@@ -3318,7 +3896,9 @@ if __name__ == "__main__":
         mode="write", prefix=bucket_prefix
     )
     if validator_store:
-        bt.logging.info(f"S3 validator store (write): {validator_store.endpoint_url}/{validator_store.bucket}")
+        bt.logging.info(
+            f"S3 validator store (write): {validator_store.endpoint_url}/{validator_store.bucket}"
+        )
     else:
         parser.error("GENTRX_VALIDATOR_S3_* env vars required for gradient server")
 
@@ -3341,7 +3921,9 @@ if __name__ == "__main__":
         from GenTRX.src.chain import LocalBucketConfig
 
         chain = LocalBucketConfig(args.miner_buckets)
-        bt.logging.info(f"Miner buckets loaded from {args.miner_buckets} (proxy test mode)")
+        bt.logging.info(
+            f"Miner buckets loaded from {args.miner_buckets} (proxy test mode)"
+        )
 
     args.validator_uid = _resolve_validator_uid(args, chain, validator_store)
 
@@ -3396,6 +3978,7 @@ if __name__ == "__main__":
     # or WANDB_PROJECT / --wandb-project isn't set.
     try:
         from GenTRX.src import wandb_ops
+
         wandb_ops.init_wandb(
             project=args.wandb_project,
             run_name=args.wandb_run_name or None,
@@ -3411,6 +3994,7 @@ if __name__ == "__main__":
             tags=["aggregator" if args.is_aggregator else "sibling"],
         )
         import atexit
+
         atexit.register(wandb_ops.finish_wandb)
     except Exception:
         pass
@@ -3422,6 +4006,7 @@ if __name__ == "__main__":
     # versions even though the Python pin is now open-ended (>=3.10).
     try:
         from GenTRX.src.service import _log_runtime_versions
+
         _log_runtime_versions()
     except Exception:
         pass

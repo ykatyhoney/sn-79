@@ -5,7 +5,7 @@
 #   - 128-char commitment format (account_id 32 + access_key_id 32 + secret_access_key 64)
 #   - BucketInfo field layout (account_id, access_key_id, secret_access_key)
 #   - from_commitment() / to_commitment() field slicing and padding logic
-#   - get_miner_buckets(): query_map(module="Commitments"), decode_account_id(),
+#   - get_miner_buckets(): query_map(module="Commitments"), ss58_encode(),
 #     hotkey_to_uid dict construction, and commitment bytes decoding
 #   - commit_bucket(): existing-commitment check before writing + v9.4 API shim
 # See NOTICE or README for full attribution.
@@ -357,7 +357,7 @@ class GenTRXChain:
         128-char commitments.
         """
         try:
-            from bittensor.core.chain_data import decode_account_id
+            from bittensor.utils import SS58_FORMAT, ss58_encode
 
             substrate = self.subtensor.substrate
             query_result = substrate.query_map(
@@ -372,7 +372,7 @@ class GenTRXChain:
 
             for key, value in query_result:
                 try:
-                    decoded_ss58 = decode_account_id(key[0])
+                    decoded_ss58 = ss58_encode(bytes(key[0]), SS58_FORMAT)
                     commitment_data = value.value["info"]["fields"][0][0]
                     bytes_key = next(iter(commitment_data.keys()))
                     raw = bytes(commitment_data[bytes_key][0]).decode()
