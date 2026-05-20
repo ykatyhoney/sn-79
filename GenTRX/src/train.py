@@ -128,6 +128,39 @@ def load_checkpoint(
     return ckpt
 
 
+def build_model_from_checkpoint(
+    ckpt: dict,
+    device: str = "cpu",
+) -> tuple[OrderModel, "OrderTokenizer", ModelConfig, "TokenizerConfig"]:
+    """Reconstruct (model, tokenizer, model_cfg, tokenizer_cfg) from a
+    checkpoint dict. Used by `train.train()` for the resume path and
+    by gentrx-serve's ModelHolder."""
+    from GenTRX.src.tokenizer import OrderTokenizer, TokenizerConfig
+
+    saved_model_cfg = ckpt.get("model_config", {}) or {}
+    model_cfg = ModelConfig(
+        **{
+            k: v
+            for k, v in saved_model_cfg.items()
+            if k in ModelConfig.__dataclass_fields__
+        }
+    )
+
+    saved_tok_cfg = ckpt.get("tokenizer_config", {}) or {}
+    if saved_tok_cfg:
+        tokenizer_cfg = TokenizerConfig.from_dict(saved_tok_cfg)
+    else:
+        tokenizer_cfg = TokenizerConfig()
+    tokenizer = OrderTokenizer(tokenizer_cfg)
+
+    model = OrderModel(model_cfg).to(device)
+    state_dict = ckpt.get("model_state_dict", ckpt)
+    model.load_state_dict(state_dict)
+    model.eval()
+
+    return model, tokenizer, model_cfg, tokenizer_cfg
+
+
 def train(
     train_cfg: TrainConfig | None = None,
     model_cfg: ModelConfig | None = None,

@@ -20,7 +20,7 @@ Input: Each order at position t is represented by 8 embedding components (summed
         lob_proj       : Linear(20, d) + LN    — 10 ask + 10 bid volume levels
 
 Backbone: HuggingFace LlamaForCausalLM (causal attention, RoPE).
-    - lm_head removed — we use per-field output heads instead.
+    - Per-field output heads instead of a single lm_head.
     - Defaults: d_model=288, 8 layers, 8 heads, d_ff=1152.
 
 FiLM conditioning: At layers 2, 5, 7, time-of-day + LOB features are injected
@@ -266,25 +266,29 @@ class OrderModel(nn.Module):
         self,
         embeds: torch.Tensor,
         film_cond: torch.Tensor | None,
+        past_key_values=None,
+        position_offset: int = 0,
     ) -> torch.Tensor:
-        """Run LLaMA backbone with FiLM conditioning injected at target layers.
+        """Run LLaMA backbone with FiLM injected at target layers.
 
-        Replicates LlamaModel.forward but injects FiLM scale+shift after
-        target decoder layers. This is the only way to condition mid-backbone
-        without monkey-patching HF internals.
+        Replicates LlamaModel.forward to inject FiLM scale+shift after target
+        decoder layers without monkey-patching HF internals. Pass
+        `past_key_values` + `position_offset` for cached decoding;
+        past_key_values=None runs full-context.
         """
         backbone = self.backbone.model
         hidden = embeds
-        T = embeds.shape[1]
+        T_new = embeds.shape[1]
         device = embeds.device
 
-        # Build position IDs and RoPE embeddings (same as LlamaModel.forward)
-        cache_position = torch.arange(T, device=device)
+        cache_position = torch.arange(
+            position_offset, position_offset + T_new, device=device,
+        )
         position_ids = cache_position.unsqueeze(0)
         position_embeddings = backbone.rotary_emb(hidden, position_ids=position_ids)
 
-        # No explicit causal mask needed — SDPA applies is_causal=True internally
-        # when attention_mask is None (faster than materializing a T×T mask tensor).
+        # SDPA applies is_causal=True when attention_mask is None: skip the T×T mask.
+        use_cache = past_key_values is not None
 
         for i, layer in enumerate(backbone.layers):
             out = layer(
@@ -292,11 +296,11 @@ class OrderModel(nn.Module):
                 attention_mask=None,
                 position_embeddings=position_embeddings,
                 position_ids=position_ids,
-                use_cache=False,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
             )
-            # LlamaDecoderLayer returns a tensor directly (not a tuple)
             hidden = out if isinstance(out, torch.Tensor) else out[0]
-            # Apply FiLM after target layers
             if film_cond is not None and i in self.film_layers_idx:
                 hidden = self.film[str(i)](hidden, film_cond)
 
@@ -327,6 +331,31 @@ class OrderModel(nn.Module):
         )
         hidden = self._run_backbone(embeds, film_cond)
 
+        return {name: head(hidden) for name, head in self.heads.items()}
+
+    def forward_cached(
+        self,
+        order_types: torch.Tensor,
+        price_bins: torch.Tensor,
+        vol_int_bins: torch.Tensor,
+        vol_dec_bins: torch.Tensor,
+        interval_bins: torch.Tensor,
+        lob_volumes: torch.Tensor | None = None,
+        time_of_day: torch.Tensor | None = None,
+        mid_deltas: torch.Tensor | None = None,
+        past_key_values=None,
+        position_offset: int = 0,
+    ) -> dict[str, torch.Tensor]:
+        """Cache-aware forward. Pass DynamicCache + current length; cache is mutated in place."""
+        embeds, film_cond = self._embed(
+            order_types, price_bins, vol_int_bins, vol_dec_bins,
+            interval_bins, lob_volumes, time_of_day, mid_deltas,
+        )
+        hidden = self._run_backbone(
+            embeds, film_cond,
+            past_key_values=past_key_values,
+            position_offset=position_offset,
+        )
         return {name: head(hidden) for name, head in self.heads.items()}
 
     @torch.no_grad()

@@ -549,6 +549,11 @@ def publish_gentrx_gauges(self: ReportingService) -> None:
             ("loss_delta",            (tr["loss_before"] - tr["loss_after"])
                                       if tr.get("loss_before") is not None and tr.get("loss_after") is not None
                                       else None),
+            ("loss_improvement_pct",  tr.get("loss_improvement_pct")),
+            ("n_assigned",            tr.get("n_assigned")),
+            ("n_delivered",           tr.get("n_delivered")),
+            ("n_collected",           tr.get("n_collected")),
+            ("n_version_mismatched",  tr.get("n_version_mismatched")),
             ("n_scored",              tr.get("n_scored")),
             ("n_accepted",            tr.get("n_accepted")),
             ("acceptance_rate",       (tr["n_accepted"] / tr["n_scored"])
@@ -556,11 +561,38 @@ def publish_gentrx_gauges(self: ReportingService) -> None:
             ("version",               tr.get("version")),
             ("agg_round",             tr.get("round")),
             ("rolled_back",           1 if tr.get("rolled_back") else 0),
+            ("rollback_rate_10w",     tr.get("rollback_rate_10w")),
+            ("rollback_rate_50w",     tr.get("rollback_rate_50w")),
             ("rounds_aggregated_total", tr.get("rounds_aggregated_total")),
             ("rollbacks_total",       tr.get("rollbacks_total")),
             ("t_score_s",             tr.get("t_score_s")),
             ("t_aggregate_s",         tr.get("t_aggregate_s")),
             ("t_total_s",             tr.get("t_total_s")),
+            ("t_proposal_eval_s",     tr.get("t_proposal_eval_s")),
+            ("t_save_ckpt_s",         tr.get("t_save_ckpt_s")),
+            ("t_loader_build_s",      tr.get("t_loader_build_s")),
+            ("grad_norm_mean",        tr.get("grad_norm_mean")),
+            ("grad_norm_min",         tr.get("grad_norm_min")),
+            ("grad_norm_max",         tr.get("grad_norm_max")),
+            ("grad_norm_median",      tr.get("grad_norm_median")),
+            ("grad_norm_std",         tr.get("grad_norm_std")),
+            ("overlap_pairs_checked", tr.get("overlap_pairs_checked")),
+            ("overlap_pairs_high",    tr.get("overlap_pairs_high")),
+            ("overlap_mean",          tr.get("overlap_mean")),
+            ("overlap_max",           tr.get("overlap_max")),
+            ("loader_cache_hits",     tr.get("loader_cache_hits")),
+            ("loader_cache_misses",   tr.get("loader_cache_misses")),
+            ("loader_cache_hit_rate", tr.get("loader_cache_hit_rate")),
+            ("proposals_evaluated",   tr.get("proposals_evaluated")),
+            ("proposals_skipped",     tr.get("proposals_skipped")),
+            *(
+                (f"per_field_loss_before_{f}", tr.get(f"per_field_loss_before_{f}"))
+                for f in ("order_type", "price", "vol_int", "vol_dec", "interval")
+            ),
+            *(
+                (f"per_field_loss_after_{f}", tr.get(f"per_field_loss_after_{f}"))
+                for f in ("order_type", "price", "vol_int", "vol_dec", "interval")
+            ),
         ):
             if val is not None:
                 t.labels(**lv, stat=stat).set(float(val))

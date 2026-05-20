@@ -41,6 +41,32 @@ class BinConfig:
     def digitize(self, values: np.ndarray) -> np.ndarray:
         return np.clip(np.digitize(values, self.edges()), 0, self.n_bins - 1)
 
+    def center(self, bin_idx: int) -> float:
+        """Return a representative natural value for a given bin id.
+
+        Inverse of digitize for inference reconstruction. Respects
+        log_scale / symmetric_log so the reconstructed value matches
+        the magnitude the model trained on (a linear midpoint mis-
+        reads log bins by orders of magnitude).
+        """
+        import math
+        idx = max(0, min(self.n_bins - 1, int(bin_idx)))
+        if self.symmetric_log:
+            half = self.n_bins // 2
+            log_hi = math.log10(max(1.0, self.hi))
+            if idx < half:
+                t = (idx + 0.5) / half
+                return -(10.0 ** (log_hi * (1.0 - t)))
+            t = (idx - half + 0.5) / half
+            return 10.0 ** (log_hi * t)
+        if self.log_scale:
+            lo = max(self.lo, 1.0)
+            log_lo = math.log10(lo)
+            log_hi = math.log10(max(self.hi, lo + 1.0))
+            t = (idx + 0.5) / self.n_bins
+            return 10.0 ** (log_lo + t * (log_hi - log_lo))
+        return self.lo + (idx + 0.5) / self.n_bins * (self.hi - self.lo)
+
 
 def _symmetric_log_edges(n_bins: int, hi: float) -> np.ndarray:
     """Symmetric log bin edges for signed values in [-hi, +hi].

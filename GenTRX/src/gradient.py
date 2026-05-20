@@ -47,6 +47,9 @@ class GradientMetadata:
     loss_after: float = 0.0
     # Per-step loss trajectory (for proof-of-training verification)
     loss_trajectory: list[float] = field(default_factory=list)
+    # Model version the miner actually trained against. 0 = unstamped (legacy
+    # miners) and is treated as "unknown" by the validator's match check.
+    model_v_trained: int = 0
 
 
 @dataclass
@@ -184,6 +187,7 @@ def aggregate(gradients: list[CompressedGradient]) -> CompressedGradient:
     meta = GradientMetadata(
         window_id=gradients[0].metadata.window_id,
         steps_trained=sum(g.metadata.steps_trained for g in gradients),
+        model_v_trained=gradients[0].metadata.model_v_trained,
     )
 
     # Return as "fully dense" CompressedGradient (every index kept)
@@ -228,6 +232,7 @@ def serialize(comp: CompressedGradient) -> bytes:
             "loss_before": comp.metadata.loss_before,
             "loss_after": comp.metadata.loss_after,
             "loss_trajectory": comp.metadata.loss_trajectory,
+            "model_v_trained": comp.metadata.model_v_trained,
         },
         "sparse": {
             name: {
@@ -270,6 +275,7 @@ def deserialize(
         loss_before=float(meta_d.get("loss_before", 0.0)),
         loss_after=float(meta_d.get("loss_after", 0.0)),
         loss_trajectory=[float(x) for x in traj],
+        model_v_trained=int(meta_d.get("model_v_trained", 0)),
     )
 
     sparse_d = d["sparse"]

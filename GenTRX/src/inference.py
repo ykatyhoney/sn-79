@@ -9,10 +9,20 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 import torch.nn.functional as F
+from transformers import DynamicCache
 
 from GenTRX.src.model import OrderModel
 from GenTRX.src.orderbook import MatchingEngine, LobSnapshot
 from GenTRX.src.tokenizer import OrderTokenizer
+
+
+def _sample_last(logits: dict, temperature: float) -> dict:
+    """Sample (B, 1) tokens per field from last-position logits."""
+    out = {}
+    for name, fl in logits.items():
+        probs = F.softmax(fl[:, -1, :] / temperature, dim=-1)
+        out[name] = torch.multinomial(probs, 1)
+    return out
 
 
 @dataclass
@@ -24,6 +34,8 @@ class GeneratedOrder:
     interval_bin: int
     mid_price: int
     lob_snapshot: LobSnapshot
+    is_buy: bool = True
+    price: int = 0
 
 
 def generate_with_engine(
@@ -34,6 +46,8 @@ def generate_with_engine(
     n_orders: int = 100,
     temperature: float = 1.0,
     device: str = "cuda",
+    vol_scale: float = 1.0,
+    horizon_ns: int | None = None,
 ) -> list[GeneratedOrder]:
     """
     Generate orders autoregressively with matching engine feedback.
@@ -62,65 +76,67 @@ def generate_with_engine(
     mcfg = model.config
     max_ctx = mcfg.max_seq_len
 
-    # Move to device
     seqs = {k: v.to(device) for k, v in prompt.items()}
-
-    # Track state for conditioning updates
+    T_prompt = seqs["order_types"].shape[1]
     last_tod = int(seqs["time_of_day"][0, -1].item())
     snap = engine.snapshot()
     session_open_mid = snap.mid_price if snap.mid_price > 0 else None
 
     generated: list[GeneratedOrder] = []
+    cum_ns: int = 0
 
+    cache = DynamicCache()
     with torch.no_grad():
+        logits = model.forward_cached(
+            seqs["order_types"], seqs["price_bins"], seqs["vol_int_bins"],
+            seqs["vol_dec_bins"], seqs["interval_bins"],
+            seqs["lob_volumes"], seqs["time_of_day"], seqs["mid_deltas"],
+            past_key_values=cache, position_offset=0,
+        )
+        position = T_prompt
+
         for _ in range(n_orders):
-            T = max_ctx
-            logits = model(
-                seqs["order_types"][:, -T:],
-                seqs["price_bins"][:, -T:],
-                seqs["vol_int_bins"][:, -T:],
-                seqs["vol_dec_bins"][:, -T:],
-                seqs["interval_bins"][:, -T:],
-                seqs["lob_volumes"][:, -T:],
-                seqs["time_of_day"][:, -T:],
-                seqs["mid_deltas"][:, -T:],
-            )
+            if horizon_ns is not None and cum_ns >= horizon_ns:
+                break
+            if position >= max_ctx:
+                break
 
-            # Sample each field
-            sampled = {}
-            for name, field_logits in logits.items():
-                probs = F.softmax(field_logits[:, -1, :] / temperature, dim=-1)
-                sampled[name] = torch.multinomial(probs, 1)
-
+            sampled = _sample_last(logits, temperature)
             otype = sampled["order_type"].item()
             p_bin = sampled["price"].item()
             vi_bin = sampled["vol_int"].item()
             vd_bin = sampled["vol_dec"].item()
             i_bin = sampled["interval"].item()
 
-            # Convert to values for engine
             snap = engine.snapshot()
             mid = snap.mid_price
-            price = _bin_to_price(p_bin, cfg.price, mid)
-            volume = _bins_to_volume(vi_bin, vd_bin, cfg.vol_int, cfg.vol_dec)
+            price = bin_to_price(p_bin, cfg.price, mid)
+            volume = bins_to_volume(
+                vi_bin, vd_bin, cfg.vol_int, cfg.vol_dec, scale=vol_scale,
+            )
             is_buy = otype == 0
-
-            if volume > 0:
+            apply_engine = True
+            if otype == 2:
+                resolved_side, snapped_price, ok = _resolve_cancel_target(engine, price)
+                if ok:
+                    is_buy = resolved_side
+                    price = snapped_price
+                else:
+                    # FIXME: model emitted a cancel against an empty book side; dropped
+                    # for now. Proper fix is at sampling time (constrain CANCEL token to
+                    # books with resting levels).
+                    apply_engine = False
+            if volume > 0 and apply_engine:
                 engine.process_order(otype, price, volume, is_buy)
 
-            # Updated LOB state
             new_snap = engine.snapshot()
-            new_lob = _snap_to_tensor(new_snap, cfg.lob_depth, device)
+            new_lob = _snap_to_tensor(new_snap, cfg.lob_depth, device).unsqueeze(0)
 
-            # Update time-of-day
-            interval_edges = np.linspace(
-                cfg.interval.lo, cfg.interval.hi, cfg.interval.n_bins + 1
-            )
-            interval_ns = (interval_edges[i_bin] + interval_edges[i_bin + 1]) / 2
+            interval_ns = bin_to_interval_ns(i_bin, cfg.interval)
+            cum_ns += interval_ns
             last_tod = (last_tod + int(interval_ns / 1e9)) % 86400
             new_tod = torch.tensor([[last_tod // cfg.time_bin_seconds]], device=device)
 
-            # Update mid delta
             new_mid = new_snap.mid_price
             if session_open_mid is None and new_mid > 0:
                 session_open_mid = new_mid
@@ -128,56 +144,513 @@ def generate_with_engine(
             delta_clipped = max(-cfg.max_mid_delta, min(cfg.max_mid_delta, delta))
             new_md = torch.tensor([[delta_clipped + cfg.max_mid_delta]], device=device)
 
-            # Append to sequences
-            seqs["order_types"] = torch.cat(
-                [seqs["order_types"], sampled["order_type"]], dim=1
-            )
-            seqs["price_bins"] = torch.cat(
-                [seqs["price_bins"], sampled["price"]], dim=1
-            )
-            seqs["vol_int_bins"] = torch.cat(
-                [seqs["vol_int_bins"], sampled["vol_int"]], dim=1
-            )
-            seqs["vol_dec_bins"] = torch.cat(
-                [seqs["vol_dec_bins"], sampled["vol_dec"]], dim=1
-            )
-            seqs["interval_bins"] = torch.cat(
-                [seqs["interval_bins"], sampled["interval"]], dim=1
-            )
-            seqs["lob_volumes"] = torch.cat(
-                [seqs["lob_volumes"], new_lob.unsqueeze(0)], dim=1
-            )
-            seqs["time_of_day"] = torch.cat([seqs["time_of_day"], new_tod], dim=1)
-            seqs["mid_deltas"] = torch.cat([seqs["mid_deltas"], new_md], dim=1)
-
-            generated.append(
-                GeneratedOrder(
-                    order_type=otype,
-                    price_bin=p_bin,
-                    vol_int_bin=vi_bin,
-                    vol_dec_bin=vd_bin,
-                    interval_bin=i_bin,
-                    mid_price=new_snap.mid_price,
-                    lob_snapshot=new_snap,
+            if apply_engine:
+                generated.append(
+                    GeneratedOrder(
+                        order_type=otype, price_bin=p_bin, vol_int_bin=vi_bin,
+                        vol_dec_bin=vd_bin, interval_bin=i_bin,
+                        mid_price=new_snap.mid_price, lob_snapshot=new_snap,
+                        is_buy=is_buy, price=price,
+                    )
                 )
+
+            logits = model.forward_cached(
+                sampled["order_type"], sampled["price"],
+                sampled["vol_int"], sampled["vol_dec"], sampled["interval"],
+                new_lob, new_tod, new_md,
+                past_key_values=cache, position_offset=position,
             )
+            position += 1
 
     return generated
 
 
-def _bin_to_price(bin_idx: int, cfg, mid_price: int) -> int:
-    edges = np.linspace(cfg.lo, cfg.hi, cfg.n_bins + 1)
-    center = (edges[bin_idx] + edges[bin_idx + 1]) / 2
-    return mid_price + int(center)
+def _resolve_cancel_target(engine, price_ticks: int) -> tuple[bool, int, bool]:
+    """Infer cancel side from price vs touch, snap price to nearest level. ok=False if no levels exist."""
+    snap = engine.snapshot()
+    best_bid = snap.bid_prices[0] if snap.bid_prices else None
+    best_ask = snap.ask_prices[0] if snap.ask_prices else None
+    if best_bid is None and best_ask is None:
+        return False, price_ticks, False
+    if best_bid is None:
+        is_buy = False
+    elif best_ask is None:
+        is_buy = True
+    elif price_ticks <= best_bid:
+        is_buy = True
+    elif price_ticks >= best_ask:
+        is_buy = False
+    else:
+        bid_dist = abs(price_ticks - best_bid)
+        ask_dist = abs(price_ticks - best_ask)
+        is_buy = bid_dist <= ask_dist
+    levels = engine.bids if is_buy else engine.asks
+    if not levels:
+        return is_buy, price_ticks, False
+    nearest = min(levels, key=lambda lvl: abs(lvl.price - price_ticks))
+    return is_buy, nearest.price, True
 
 
-def _bins_to_volume(vi_bin: int, vd_bin: int, vi_cfg, vd_cfg) -> int:
-    """Reconstruct volume from int + dec bins for the matching engine (needs int ticks)."""
-    vi_edges = np.linspace(vi_cfg.lo, vi_cfg.hi, vi_cfg.n_bins + 1)
-    vi_center = (vi_edges[vi_bin] + vi_edges[vi_bin + 1]) / 2
-    vd_edges = np.linspace(vd_cfg.lo, vd_cfg.hi, vd_cfg.n_bins + 1)
-    vd_center = (vd_edges[vd_bin] + vd_edges[vd_bin + 1]) / 2
-    return max(1, int(vi_center + vd_center))
+def bin_to_price(bin_idx: int, cfg, mid_price: int) -> int:
+    """Inverse of digitize for price bins. Uses cfg.center so the
+    reconstruction respects symmetric_log spacing (dense around mid)."""
+    return mid_price + int(round(cfg.center(bin_idx)))
+
+
+def bins_to_volume(
+    vi_bin: int,
+    vd_bin: int,
+    vi_cfg,
+    vd_cfg,
+    scale: float = 1.0,
+) -> int:
+    """Reconstruct volume from int + dec bins. scale=1.0 for natural-
+    unit engines (offline path), 10**volumeDecimals when the engine
+    is in tick units (live state-stream path)."""
+    natural = vi_cfg.center(vi_bin) + vd_cfg.center(vd_bin)
+    return max(1, int(round(natural * scale)))
+
+
+def bin_to_interval_ns(i_bin: int, interval_cfg) -> int:
+    """Reconstruct an interval in ns from a sampled bin id. Interval
+    bins are log_scale so cfg.center returns the correct magnitude
+    (linear-spaced midpoints mis-read by orders of magnitude)."""
+    return max(0, int(round(interval_cfg.center(i_bin))))
+
+
+# Legacy private aliases kept for in-tree callers.
+_bin_to_price = bin_to_price
+_bins_to_volume = bins_to_volume
+
+
+def generate_trajectory(
+    model: OrderModel,
+    tokenizer: OrderTokenizer,
+    engine: MatchingEngine,
+    prompt: dict[str, torch.Tensor],
+    n_orders: int = 100,
+    temperature: float = 1.0,
+    device: str = "cpu",
+    seed: int | None = None,
+    vol_scale: float = 1.0,
+    mode: str = "closed",
+    horizon_ns: int | None = None,
+    block_size: int = 8,
+) -> list[dict]:
+    """Generate one trajectory as list of dicts. mode: closed | open | hybrid (block_size for hybrid)."""
+    if seed is not None:
+        torch.manual_seed(int(seed))
+
+    if mode == "open":
+        raw = generate_with_engine_open_loop(
+            model=model, tokenizer=tokenizer, engine=engine, prompt=prompt,
+            n_orders=n_orders, temperature=temperature, device=device,
+            vol_scale=vol_scale, horizon_ns=horizon_ns,
+        )
+    elif mode == "hybrid":
+        raw = generate_with_engine_hybrid(
+            model=model, tokenizer=tokenizer, engine=engine, prompt=prompt,
+            n_orders=n_orders, temperature=temperature, device=device,
+            vol_scale=vol_scale, horizon_ns=horizon_ns, block_size=block_size,
+        )
+    else:
+        raw = generate_with_engine(
+            model=model, tokenizer=tokenizer, engine=engine, prompt=prompt,
+            n_orders=n_orders, temperature=temperature, device=device,
+            vol_scale=vol_scale, horizon_ns=horizon_ns,
+        )
+
+    cfg = tokenizer.config
+    out: list[dict] = []
+    for o in raw:
+        volume = bins_to_volume(
+            o.vol_int_bin, o.vol_dec_bin, cfg.vol_int, cfg.vol_dec,
+            scale=vol_scale,
+        )
+        interval_ns = bin_to_interval_ns(o.interval_bin, cfg.interval)
+        out.append({
+            "order_type": int(o.order_type),
+            "is_buy": bool(o.is_buy),
+            "price": int(o.price),
+            "volume": int(volume),
+            "interval_ns": interval_ns,
+            "mid_price": int(o.mid_price),
+        })
+    return out
+
+
+def generate_with_engine_open_loop(
+    model: OrderModel,
+    tokenizer: OrderTokenizer,
+    engine: MatchingEngine,
+    prompt: dict[str, torch.Tensor],
+    n_orders: int = 100,
+    temperature: float = 1.0,
+    device: str = "cpu",
+    vol_scale: float = 1.0,
+    horizon_ns: int | None = None,
+) -> list[GeneratedOrder]:
+    """Sample N orders with frozen initial conditioning, then apply to engine at the end."""
+    model.eval()
+    cfg = tokenizer.config
+    mcfg = model.config
+    max_ctx = mcfg.max_seq_len
+
+    seqs = {k: v.to(device) for k, v in prompt.items()}
+    T_prompt = seqs["order_types"].shape[1]
+    init_snap = engine.snapshot()
+    session_open_mid = init_snap.mid_price if init_snap.mid_price > 0 else None
+    fixed_lob = seqs["lob_volumes"][:, -1:, :]
+    fixed_tod = seqs["time_of_day"][:, -1:]
+    fixed_md = seqs["mid_deltas"][:, -1:]
+
+    sampled_bins: list[tuple[int, int, int, int, int]] = []
+    cum_ns_sample: int = 0
+
+    cache = DynamicCache()
+    with torch.no_grad():
+        logits = model.forward_cached(
+            seqs["order_types"], seqs["price_bins"], seqs["vol_int_bins"],
+            seqs["vol_dec_bins"], seqs["interval_bins"],
+            seqs["lob_volumes"], seqs["time_of_day"], seqs["mid_deltas"],
+            past_key_values=cache, position_offset=0,
+        )
+        position = T_prompt
+
+        for _ in range(n_orders):
+            if horizon_ns is not None and cum_ns_sample >= horizon_ns:
+                break
+            if position >= max_ctx:
+                break
+
+            sampled = _sample_last(logits, temperature)
+            otype = sampled["order_type"].item()
+            p_bin = sampled["price"].item()
+            vi_bin = sampled["vol_int"].item()
+            vd_bin = sampled["vol_dec"].item()
+            i_bin = sampled["interval"].item()
+            sampled_bins.append((otype, p_bin, vi_bin, vd_bin, i_bin))
+            cum_ns_sample += bin_to_interval_ns(i_bin, cfg.interval)
+
+            logits = model.forward_cached(
+                sampled["order_type"], sampled["price"],
+                sampled["vol_int"], sampled["vol_dec"], sampled["interval"],
+                fixed_lob, fixed_tod, fixed_md,
+                past_key_values=cache, position_offset=position,
+            )
+            position += 1
+
+    # Apply in order to the engine so the final state is consistent.
+    generated: list[GeneratedOrder] = []
+    for (otype, p_bin, vi_bin, vd_bin, i_bin) in sampled_bins:
+        snap = engine.snapshot()
+        mid = snap.mid_price
+        price = bin_to_price(p_bin, cfg.price, mid)
+        volume = bins_to_volume(vi_bin, vd_bin, cfg.vol_int, cfg.vol_dec, scale=vol_scale)
+        is_buy = otype == 0
+        apply_engine = True
+        if otype == 2:
+            resolved_side, snapped_price, ok = _resolve_cancel_target(engine, price)
+            if ok:
+                is_buy = resolved_side
+                price = snapped_price
+            else:
+                apply_engine = False  # see FIXME in generate_with_engine
+        if volume > 0 and apply_engine:
+            engine.process_order(otype, price, volume, is_buy)
+        new_snap = engine.snapshot()
+        if apply_engine:
+            generated.append(GeneratedOrder(
+                order_type=otype, price_bin=p_bin, vol_int_bin=vi_bin,
+                vol_dec_bin=vd_bin, interval_bin=i_bin,
+                mid_price=new_snap.mid_price, lob_snapshot=new_snap,
+                is_buy=is_buy, price=price,
+            ))
+    return generated
+
+
+def generate_with_engine_hybrid(
+    model: OrderModel,
+    tokenizer: OrderTokenizer,
+    engine: MatchingEngine,
+    prompt: dict[str, torch.Tensor],
+    n_orders: int = 100,
+    temperature: float = 1.0,
+    device: str = "cpu",
+    vol_scale: float = 1.0,
+    horizon_ns: int | None = None,
+    block_size: int = 8,
+) -> list[GeneratedOrder]:
+    """Sample `block_size` orders with frozen conditioning, apply to engine, refresh. block_size=1 = closed-loop."""
+    model.eval()
+    cfg = tokenizer.config
+    mcfg = model.config
+    max_ctx = mcfg.max_seq_len
+
+    seqs = {k: v.to(device) for k, v in prompt.items()}
+    last_tod = int(seqs["time_of_day"][0, -1].item())
+    init_snap = engine.snapshot()
+    session_open_mid = init_snap.mid_price if init_snap.mid_price > 0 else None
+
+    generated: list[GeneratedOrder] = []
+    cum_ns: int = 0
+    order_idx = 0
+
+    cache: DynamicCache | None = None
+    position: int = 0
+
+    def _prefill_from_seqs() -> tuple[DynamicCache, int, dict]:
+        c = DynamicCache()
+        T = seqs["order_types"].shape[1]
+        out = model.forward_cached(
+            seqs["order_types"], seqs["price_bins"], seqs["vol_int_bins"],
+            seqs["vol_dec_bins"], seqs["interval_bins"],
+            seqs["lob_volumes"], seqs["time_of_day"], seqs["mid_deltas"],
+            past_key_values=c, position_offset=0,
+        )
+        return c, T, out
+
+    with torch.no_grad():
+        cache, position, logits = _prefill_from_seqs()
+
+        while order_idx < n_orders:
+            if horizon_ns is not None and cum_ns >= horizon_ns:
+                break
+            if position >= max_ctx:
+                break
+            this_block = min(block_size, n_orders - order_idx)
+
+            fixed_lob = seqs["lob_volumes"][:, -1:, :]
+            fixed_tod = seqs["time_of_day"][:, -1:]
+            fixed_md = seqs["mid_deltas"][:, -1:]
+            block_samples: list[tuple[int, int, int, int, int]] = []
+
+            for _ in range(this_block):
+                if position >= max_ctx:
+                    break
+                sampled = _sample_last(logits, temperature)
+                otype = sampled["order_type"].item()
+                p_bin = sampled["price"].item()
+                vi_bin = sampled["vol_int"].item()
+                vd_bin = sampled["vol_dec"].item()
+                i_bin = sampled["interval"].item()
+                block_samples.append((otype, p_bin, vi_bin, vd_bin, i_bin))
+
+                seqs["order_types"] = torch.cat([seqs["order_types"], sampled["order_type"]], dim=1)
+                seqs["price_bins"] = torch.cat([seqs["price_bins"], sampled["price"]], dim=1)
+                seqs["vol_int_bins"] = torch.cat([seqs["vol_int_bins"], sampled["vol_int"]], dim=1)
+                seqs["vol_dec_bins"] = torch.cat([seqs["vol_dec_bins"], sampled["vol_dec"]], dim=1)
+                seqs["interval_bins"] = torch.cat([seqs["interval_bins"], sampled["interval"]], dim=1)
+                seqs["lob_volumes"] = torch.cat([seqs["lob_volumes"], fixed_lob], dim=1)
+                seqs["time_of_day"] = torch.cat([seqs["time_of_day"], fixed_tod], dim=1)
+                seqs["mid_deltas"] = torch.cat([seqs["mid_deltas"], fixed_md], dim=1)
+
+                logits = model.forward_cached(
+                    sampled["order_type"], sampled["price"],
+                    sampled["vol_int"], sampled["vol_dec"], sampled["interval"],
+                    fixed_lob, fixed_tod, fixed_md,
+                    past_key_values=cache, position_offset=position,
+                )
+                position += 1
+
+            stop_after_block = False
+            for (otype, p_bin, vi_bin, vd_bin, i_bin) in block_samples:
+                snap = engine.snapshot()
+                mid = snap.mid_price
+                price = bin_to_price(p_bin, cfg.price, mid)
+                volume = bins_to_volume(vi_bin, vd_bin, cfg.vol_int, cfg.vol_dec, scale=vol_scale)
+                is_buy = otype == 0
+                apply_engine = True
+                if otype == 2:
+                    resolved_side, snapped_price, ok = _resolve_cancel_target(engine, price)
+                    if ok:
+                        is_buy = resolved_side
+                        price = snapped_price
+                    else:
+                        apply_engine = False  # see FIXME in generate_with_engine
+                if volume > 0 and apply_engine:
+                    engine.process_order(otype, price, volume, is_buy)
+                new_snap = engine.snapshot()
+                interval_ns = bin_to_interval_ns(i_bin, cfg.interval)
+                cum_ns += interval_ns
+                last_tod = (last_tod + int(interval_ns / 1e9)) % 86400
+                if apply_engine:
+                    generated.append(GeneratedOrder(
+                        order_type=otype, price_bin=p_bin, vol_int_bin=vi_bin,
+                        vol_dec_bin=vd_bin, interval_bin=i_bin,
+                        mid_price=new_snap.mid_price, lob_snapshot=new_snap,
+                        is_buy=is_buy, price=price,
+                    ))
+                order_idx += 1
+                if horizon_ns is not None and cum_ns >= horizon_ns:
+                    stop_after_block = True
+                    break
+
+            if stop_after_block or order_idx >= n_orders:
+                break
+
+            # Overwrite the latest seq position so the next block sees post-block state.
+            new_snap = engine.snapshot()
+            new_lob_2d = _snap_to_tensor(new_snap, cfg.lob_depth, device)
+            new_lob_3d = new_lob_2d.unsqueeze(0)
+            new_tod = torch.tensor([[last_tod // cfg.time_bin_seconds]], device=device)
+            new_mid = new_snap.mid_price
+            if session_open_mid is None and new_mid > 0:
+                session_open_mid = new_mid
+            delta = (new_mid - session_open_mid) if session_open_mid else 0
+            delta_clipped = max(-cfg.max_mid_delta, min(cfg.max_mid_delta, delta))
+            new_md = torch.tensor([[delta_clipped + cfg.max_mid_delta]], device=device)
+
+            seqs["lob_volumes"][:, -1:, :] = new_lob_3d
+            seqs["time_of_day"][:, -1:] = new_tod
+            seqs["mid_deltas"][:, -1:] = new_md
+
+            # Tail K/V is stale after the overwrite: rebuild cache.
+            cache, position, logits = _prefill_from_seqs()
+
+    return generated
+
+
+def generate_trajectories_batched(
+    model: OrderModel,
+    tokenizer: OrderTokenizer,
+    engines: list[MatchingEngine],
+    prompts: list[dict[str, torch.Tensor]],
+    n_orders: int = 100,
+    temperature: float = 1.0,
+    device: str = "cpu",
+    seed: int | None = None,
+    vol_scale: float = 1.0,
+    horizon_ns: int | None = None,
+) -> list[list[dict]]:
+    """K-rollout closed-loop generation. One model forward at
+    batch_dim=K per autoregressive step instead of K sequential calls.
+    Returns K trajectory lists with the same dict shape as
+    generate_trajectory."""
+    K = len(engines)
+    if K == 0:
+        return []
+    if K != len(prompts):
+        raise ValueError("engines and prompts must have the same length")
+    if seed is not None:
+        torch.manual_seed(int(seed))
+
+    model.eval()
+    cfg = tokenizer.config
+    mcfg = model.config
+    max_ctx = mcfg.max_seq_len
+
+    # All K prompts must share T_prompt for the batch stack.
+    seqs: dict[str, torch.Tensor] = {
+        key: torch.cat([p[key].to(device) for p in prompts], dim=0)
+        for key in (
+            "order_types", "price_bins", "vol_int_bins", "vol_dec_bins",
+            "interval_bins", "lob_volumes", "time_of_day", "mid_deltas",
+        )
+    }
+    T_prompt = seqs["order_types"].shape[1]
+
+    last_tod = [int(prompts[k]["time_of_day"][0, -1].item()) for k in range(K)]
+    initial_snaps = [e.snapshot() for e in engines]
+    session_open_mid: list[int | None] = [
+        s.mid_price if s.mid_price > 0 else None for s in initial_snaps
+    ]
+    generated: list[list[dict]] = [[] for _ in range(K)]
+    cum_ns: list[int] = [0] * K
+
+    cache = DynamicCache()
+    with torch.no_grad():
+        logits = model.forward_cached(
+            seqs["order_types"], seqs["price_bins"], seqs["vol_int_bins"],
+            seqs["vol_dec_bins"], seqs["interval_bins"],
+            seqs["lob_volumes"], seqs["time_of_day"], seqs["mid_deltas"],
+            past_key_values=cache, position_offset=0,
+        )
+        position = T_prompt
+
+        for _ in range(n_orders):
+            if horizon_ns is not None and all(c >= horizon_ns for c in cum_ns):
+                break
+            if position >= max_ctx:
+                break
+
+            sampled = _sample_last(logits, temperature)
+            otype_b = sampled["order_type"].view(-1).tolist()
+            p_bin_b = sampled["price"].view(-1).tolist()
+            vi_bin_b = sampled["vol_int"].view(-1).tolist()
+            vd_bin_b = sampled["vol_dec"].view(-1).tolist()
+            i_bin_b = sampled["interval"].view(-1).tolist()
+
+            new_lob_rows: list[torch.Tensor] = []
+            new_tod_rows: list[torch.Tensor] = []
+            new_md_rows: list[torch.Tensor] = []
+            for k in range(K):
+                otype = int(otype_b[k]); p_bin = int(p_bin_b[k])
+                vi_bin = int(vi_bin_b[k]); vd_bin = int(vd_bin_b[k])
+                i_bin = int(i_bin_b[k])
+
+                snap = engines[k].snapshot()
+                mid = snap.mid_price
+                price = bin_to_price(p_bin, cfg.price, mid) if mid > 0 else 0
+                volume = bins_to_volume(
+                    vi_bin, vd_bin, cfg.vol_int, cfg.vol_dec, scale=vol_scale,
+                )
+                is_buy = otype == 0
+                apply_engine = True
+                if otype == 2:
+                    resolved_side, snapped_price, ok = _resolve_cancel_target(
+                        engines[k], price,
+                    )
+                    if ok:
+                        is_buy = resolved_side
+                        price = snapped_price
+                    else:
+                        apply_engine = False  # see FIXME in generate_with_engine
+                if volume > 0 and apply_engine:
+                    engines[k].process_order(otype, price, volume, is_buy)
+
+                new_snap = engines[k].snapshot()
+                new_lob_rows.append(_snap_to_tensor(new_snap, cfg.lob_depth, device))
+
+                interval_ns = bin_to_interval_ns(i_bin, cfg.interval)
+                last_tod[k] = (last_tod[k] + int(interval_ns / 1e9)) % 86400
+                new_tod_rows.append(
+                    torch.tensor([[last_tod[k] // cfg.time_bin_seconds]], device=device)
+                )
+
+                new_mid = new_snap.mid_price
+                if session_open_mid[k] is None and new_mid > 0:
+                    session_open_mid[k] = new_mid
+                delta = (new_mid - session_open_mid[k]) if session_open_mid[k] else 0
+                delta_clipped = max(-cfg.max_mid_delta, min(cfg.max_mid_delta, delta))
+                new_md_rows.append(
+                    torch.tensor([[delta_clipped + cfg.max_mid_delta]], device=device)
+                )
+
+                if apply_engine and (horizon_ns is None or cum_ns[k] < horizon_ns):
+                    generated[k].append({
+                        "order_type": int(otype),
+                        "is_buy": bool(is_buy),
+                        "price": int(price),
+                        "volume": int(volume),
+                        "interval_ns": int(interval_ns),
+                        "mid_price": int(new_snap.mid_price),
+                    })
+                cum_ns[k] += interval_ns
+
+            new_lob_K = torch.cat(new_lob_rows, dim=0).unsqueeze(1)
+            new_tod_K = torch.cat(new_tod_rows, dim=0)
+            new_md_K = torch.cat(new_md_rows, dim=0)
+
+            logits = model.forward_cached(
+                sampled["order_type"], sampled["price"],
+                sampled["vol_int"], sampled["vol_dec"], sampled["interval"],
+                new_lob_K, new_tod_K, new_md_K,
+                past_key_values=cache, position_offset=position,
+            )
+            position += 1
+
+    return generated
 
 
 def _snap_to_tensor(snap: LobSnapshot, depth: int, device: str) -> torch.Tensor:

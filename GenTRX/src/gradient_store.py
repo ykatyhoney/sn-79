@@ -211,7 +211,11 @@ class GradientStore:
                 aws_secret_access_key=self.secret_key,
                 region_name=self.region,
                 config=Config(
+                    signature_version="s3v4",
+                    s3={"addressing_style": "path"},
                     retries={"max_attempts": 3, "mode": "adaptive"},
+                    request_checksum_calculation="when_required",
+                    response_checksum_validation="when_required",
                 ),
             )
         return self._sync_client
@@ -602,9 +606,13 @@ def collect_miner_gradients(
                 aws_secret_access_key=bucket_info.secret_access_key,
                 region_name=region,
                 config=Config(
+                    signature_version="s3v4",
+                    s3={"addressing_style": "path"},
                     retries={"max_attempts": 2, "mode": "adaptive"},
                     connect_timeout=5,
                     read_timeout=10,
+                    request_checksum_calculation="when_required",
+                    response_checksum_validation="when_required",
                 ),
             )
             bucket_name = bucket_info.bucket_name

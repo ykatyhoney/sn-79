@@ -27,10 +27,13 @@ import os
 import random
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Request
+
+from GenTRX.src.gradient_store import GradientStore
 
 logger = logging.getLogger("GenTRX.src.gradient_server")
 
@@ -180,7 +183,7 @@ class GradientAggregator:
         seed: int = 42,
         window_ns: int | None = None,
         chain: Any | None = None,
-        validator_store: Any | None = None,
+        validator_store: GradientStore | None = None,
         is_aggregator: bool = True,
         parquet_interval_ns: int = 300_000_000_000,  # 5 min, matches training window
         loop_sleep_s: float = 5.0,
@@ -188,6 +191,7 @@ class GradientAggregator:
         max_gradient_bytes: int = 10 * 1024 * 1024,
         overfit_ratio: float = 3.0,
         overfit_penalty: float = 0.1,
+        proposal_norm_ratio: float = 10.0,
         keep_checkpoints: int = 10,
         keep_proposals: int = 10,
         blocks_per_round: int = 25,
@@ -320,7 +324,50 @@ class GradientAggregator:
         # track training progress without needing a second HTTP call.
         self._rounds_aggregated_total: int = 0
         self._rollbacks_total: int = 0
-        self._last_aggregation: dict = {}
+        # Stable-shape defaults so every gentrx_training{stat=X} series exists
+        # from the first scrape, even before any round has aggregated. Dashboard
+        # panels see 0 instead of "no data" until real values overwrite.
+        self._last_aggregation: dict = {
+            "round": 0,
+            "version": 0,
+            "n_assigned": 0,
+            "n_delivered": 0,
+            "n_collected": 0,
+            "n_version_mismatched": 0,
+            "n_scored": 0,
+            "n_accepted": 0,
+            "loss_before": 0.0,
+            "loss_after": 0.0,
+            "loss_improvement_pct": 0.0,
+            "t_score_s": 0.0,
+            "t_aggregate_s": 0.0,
+            "t_total_s": 0.0,
+            "t_load_s": 0.0,
+            "t_proposal_eval_s": 0.0,
+            "t_save_ckpt_s": 0.0,
+            "t_loader_build_s": 0.0,
+            "rolled_back": 0,
+            "rollback_rate_10w": 0.0,
+            "rollback_rate_50w": 0.0,
+            "grad_norm_mean": 0.0,
+            "grad_norm_min": 0.0,
+            "grad_norm_max": 0.0,
+            "grad_norm_median": 0.0,
+            "grad_norm_std": 0.0,
+            "overlap_pairs_checked": 0,
+            "overlap_pairs_high": 0,
+            "overlap_mean": 0.0,
+            "overlap_max": 0.0,
+            "loader_cache_hits": 0,
+            "loader_cache_misses": 0,
+            "loader_cache_hit_rate": 0.0,
+            "proposals_evaluated": 0,
+            "proposals_skipped": 0,
+        }
+        for field in ("order_type", "price", "vol_int", "vol_dec", "interval"):
+            self._last_aggregation[f"per_field_loss_before_{field}"] = 0.0
+            self._last_aggregation[f"per_field_loss_after_{field}"] = 0.0
+        self._rollback_history: deque[bool] = deque(maxlen=50)
 
         # ---- Assignment lifecycle tracking ----
         # States: PENDING → DATA_READY → DELIVERED → GRADIENT_IN → SCORED
@@ -372,8 +419,12 @@ class GradientAggregator:
         # Shape: {"round": int, "model": ..., "model_cfg": ..., "tokenizer_cfg": ...,
         #         "tokenizer": ..., "device": str}
         self._scoring_cache: dict | None = None
+        self._loader_cache: dict[tuple, Any] = {}
+        self._loader_cache_hits: int = 0
+        self._loader_cache_misses: int = 0
         self.overfit_ratio: float = overfit_ratio
         self.overfit_penalty: float = overfit_penalty
+        self.proposal_norm_ratio: float = proposal_norm_ratio
         self._pending_rows: dict[int, list[dict]] = {}  # book_id → rows
         self._pending_interval_start: dict[int, int] = {}  # book_id → interval start ts
         # Registry of written parquets (avoids S3 LIST for data-readiness checks)
@@ -484,10 +535,12 @@ class GradientAggregator:
             rng.sample(self._all_books, min(n_val, len(self._all_books)))
         )
         logger.info(
-            "Val books: %s (%d/%d)",
+            "Val books: %s (%d/%d, val_fraction=%.2f, seed=%d)",
             sorted(self._val_book_set),
             len(self._val_book_set),
             len(self._all_books),
+            self.val_fraction,
+            self._seed,
         )
         return self._val_book_set
 
@@ -962,6 +1015,13 @@ class GradientAggregator:
         if not ts_ranges:
             return None
 
+        cache_key = ("val", tuple(sorted((int(s), int(e)) for s, e in ts_ranges)))
+        cached = self._loader_cache.get(cache_key)
+        if cached is not None:
+            self._loader_cache_hits += 1
+            return cached
+        self._loader_cache_misses += 1
+
         val_books = self._get_val_books()
         if not val_books:
             return None
@@ -992,7 +1052,16 @@ class GradientAggregator:
             len(val_books),
         )
         ds = OrderDataset(unique_files, seq_len=256, tokenizer=tokenizer, max_cached=2)
-        return DataLoader(ds, batch_size=32, shuffle=False)
+        loader = DataLoader(
+            ds,
+            batch_size=64,
+            shuffle=False,
+            num_workers=2,
+            pin_memory=True,
+            persistent_workers=True,
+        )
+        self._loader_cache[cache_key] = loader
+        return loader
 
     @property
     def version(self) -> int:
@@ -1029,20 +1098,53 @@ class GradientAggregator:
                     if k
                     in (
                         "round",
+                        "n_assigned",
+                        "n_delivered",
+                        "n_collected",
+                        "n_version_mismatched",
                         "n_scored",
                         "n_accepted",
                         "loss_before",
                         "loss_after",
+                        "loss_improvement_pct",
+                        "t_proposal_eval_s",
+                        "t_save_ckpt_s",
+                        "t_loader_build_s",
+                        "grad_norm_mean",
+                        "grad_norm_min",
+                        "grad_norm_max",
+                        "grad_norm_median",
+                        "grad_norm_std",
+                        "overlap_pairs_checked",
+                        "overlap_pairs_high",
+                        "overlap_mean",
+                        "overlap_max",
+                        "loader_cache_hits",
+                        "loader_cache_misses",
+                        "loader_cache_hit_rate",
+                        "proposals_evaluated",
+                        "proposals_skipped",
                         "rolled_back",
                         "sibling_only",
                         "version",
                     )
+                    or k.startswith("per_field_loss_")
                 }
             )
             if event.get("n_accepted", 0) > 0 and not event.get("rolled_back"):
                 self._rounds_aggregated_total += 1
             if event.get("rolled_back"):
                 self._rollbacks_total += 1
+            # Only rounds that actually made a rollback decision count toward
+            # the rate; no-accepted and sibling-only paths skip the gate.
+            if "rolled_back" in event and not event.get("sibling_only"):
+                self._rollback_history.append(bool(event["rolled_back"]))
+                if self._rollback_history:
+                    last10 = list(self._rollback_history)[-10:]
+                    self._last_aggregation["rollback_rate_10w"] = sum(last10) / len(last10)
+                    self._last_aggregation["rollback_rate_50w"] = (
+                        sum(self._rollback_history) / len(self._rollback_history)
+                    )
         try:
             from GenTRX.src import wandb_ops
 
@@ -1305,9 +1407,7 @@ class GradientAggregator:
             if isinstance(restored_round, int) and restored_round > 0:
                 self._agg_round = restored_round
 
-            _restore_assignment_dict(
-                raw.get("assignments") or {}, self._assignments
-            )
+            _restore_assignment_dict(raw.get("assignments") or {}, self._assignments)
             _restore_assignment_dict(
                 raw.get("prev_round_assignments") or {},
                 self._prev_round_assignments,
@@ -1746,7 +1846,14 @@ class GradientAggregator:
                     aws_access_key_id=bucket_info.access_key_id,
                     aws_secret_access_key=bucket_info.secret_access_key,
                     region_name=getattr(bucket_info, "region", "auto"),
-                    config=BotoConfig(connect_timeout=5, read_timeout=10),
+                    config=BotoConfig(
+                        signature_version="s3v4",
+                        s3={"addressing_style": "path"},
+                        connect_timeout=5,
+                        read_timeout=10,
+                        request_checksum_calculation="when_required",
+                        response_checksum_validation="when_required",
+                    ),
                 )
                 key = f"{self._bucket_prefix}gradients/{uid}/{round_id:08d}.grad"
                 logger.debug(
@@ -2075,6 +2182,12 @@ class GradientAggregator:
     def _clear_scoring_cache(self) -> None:
         """Drop the cached scoring model. Called after aggregation."""
         self._scoring_cache = None
+        # Loader cache lives for one round; cross-round reuse risks stale
+        # _written_parquets snapshots when new data arrives.
+        if self._loader_cache:
+            self._loader_cache.clear()
+        self._loader_cache_hits = 0
+        self._loader_cache_misses = 0
 
     def _score_eagerly(
         self, miner_uid: int, assignment: dict, grad_bytes: bytes
@@ -2145,6 +2258,26 @@ class GradientAggregator:
             except ValueError as exc:
                 logger.warning("  miner %d: gradient rejected: %s", miner_uid, exc)
                 return None
+
+            expected_v = int(assignment.get("model_version", 0) or 0)
+            trained_v = int(getattr(comp.metadata, "model_v_trained", 0) or 0)
+            if trained_v and expected_v and trained_v != expected_v:
+                logger.warning(
+                    "  miner %d: model_v mismatch (trained=%d, assignment=%d)",
+                    miner_uid,
+                    trained_v,
+                    expected_v,
+                )
+                assignment["_version_mismatched"] = True
+            else:
+                assignment["_version_mismatched"] = False
+
+            grad_norm_sq = 0.0
+            for _, (_, vals, _) in comp.sparse.items():
+                grad_norm_sq += float(vals.pow(2).sum().item())
+            assignment["_grad_norm"] = grad_norm_sq ** 0.5
+
+            t_loader_start = time.time()
             miner_loader = self._build_miner_loader(assignment, tokenizer, device)
             if miner_loader is None:
                 logger.warning("  miner %d: no data for assigned books", miner_uid)
@@ -2159,8 +2292,13 @@ class GradientAggregator:
             miner_ranges = [
                 (assignment.get("ts_start", 0), assignment.get("ts_end", 0))
             ]
+            t_held_loader_start = time.time()
             held_loader = self._build_val_loader_for_ranges(
                 miner_ranges, tokenizer, device
+            )
+            t_loader_build = (
+                (t_own_start - t_loader_start)
+                + (time.time() - t_held_loader_start)
             )
             t_held = 0.0
             if held_loader is not None:
@@ -2181,10 +2319,11 @@ class GradientAggregator:
             assignment["_overfitting"] = overfitting
             assignment["_score"] = score
             assignment["_comp"] = comp
+            assignment["_t_loader_build"] = t_loader_build
 
             t_total = time.time() - t_start
             logger.info(
-                "[GTX] score_miner=%d: score_own=%+.4f score_held=%s%s combined=%+.4f t_own=%.2fs t_held=%.2fs t_total=%.2fs",
+                "[GTX] score_miner=%d: score_own=%+.4f score_held=%s%s combined=%+.4f t_own=%.2fs t_held=%.2fs t_loader=%.2fs t_total=%.2fs",
                 miner_uid,
                 score_own,
                 f"{score_held:+.4f}" if score_held is not None else "n/a",
@@ -2192,6 +2331,7 @@ class GradientAggregator:
                 score,
                 t_own,
                 t_held,
+                t_loader_build,
                 t_total,
             )
             return score, comp
@@ -2226,6 +2366,80 @@ class GradientAggregator:
             scored.append((miner_uid, window_id, score, comp, assignment))
         return scored
 
+    def _compute_index_overlap(
+        self,
+        accepted: list,
+        *,
+        min_param_size: int = 100,
+        high_threshold: float = 0.9,
+    ) -> dict:
+        """Per-pair Jaccard overlap on top-k indices, size-weighted across params.
+
+        Two miners producing identical index sets are either copying each
+        other or training on identical-enough data — either way worth
+        flagging. The values may differ honestly so we ignore them; only
+        the chosen index positions are compared. Parameters under
+        `min_param_size` elements are skipped to avoid noise on small
+        biases.
+
+        Returns dict with keys overlap_pairs_checked, overlap_pairs_high,
+        overlap_mean, overlap_max.
+        """
+        if len(accepted) < 2:
+            return {}
+
+        comps = [(uid, c) for uid, _, _, c, _ in accepted]
+        param_names: set[str] = set()
+        for _, c in comps:
+            if not param_names:
+                param_names = {
+                    n for n, (_, _, shape) in c.sparse.items()
+                    if shape.numel() >= min_param_size
+                }
+            else:
+                param_names &= set(c.sparse.keys())
+
+        if not param_names:
+            return {}
+
+        pair_overlaps: list[float] = []
+        pair_high = 0
+        for i in range(len(comps)):
+            for j in range(i + 1, len(comps)):
+                _, ci = comps[i]
+                _, cj = comps[j]
+                weighted_sum = 0.0
+                total_weight = 0.0
+                for name in param_names:
+                    idx_i = ci.sparse[name][0]
+                    idx_j = cj.sparse[name][0]
+                    shape = ci.sparse[name][2]
+                    size = float(shape.numel())
+                    si = set(idx_i.tolist())
+                    sj = set(idx_j.tolist())
+                    union = si | sj
+                    if not union:
+                        continue
+                    jacc = len(si & sj) / len(union)
+                    weighted_sum += jacc * size
+                    total_weight += size
+                if total_weight == 0:
+                    continue
+                pair_overlap = weighted_sum / total_weight
+                pair_overlaps.append(pair_overlap)
+                if pair_overlap >= high_threshold:
+                    pair_high += 1
+
+        if not pair_overlaps:
+            return {}
+
+        return {
+            "overlap_pairs_checked": len(pair_overlaps),
+            "overlap_pairs_high": pair_high,
+            "overlap_mean": sum(pair_overlaps) / len(pair_overlaps),
+            "overlap_max": max(pair_overlaps),
+        }
+
     def _aggregate_accepted(
         self,
         scored: list,
@@ -2251,13 +2465,57 @@ class GradientAggregator:
         """
         import torch
 
-        from GenTRX.src.distributed import _eval_loss
+        from GenTRX.src.distributed import _eval_loss, _eval_loss_per_field
         from GenTRX.src.gradient import aggregate, apply_gradient, decompress, serialize
 
         threshold = self._effective_min_score
 
         accepted = [(m, w, s, c, a) for m, w, s, c, a in scored if s > threshold]
         rejected = [(m, w, s, a) for m, w, s, _, a in scored if s <= threshold]
+
+        n_assigned = len(round_assignments)
+        n_delivered = sum(1 for _, a in round_assignments if a.get("_delivered_at"))
+        n_collected = sum(1 for _, a in round_assignments if a.get("_comp") is not None)
+        n_version_mismatched = sum(
+            1 for _, a in round_assignments if a.get("_version_mismatched")
+        )
+        t_loader_build_miners = sum(
+            a.get("_t_loader_build", 0.0) for _, a in round_assignments
+        )
+
+        grad_norms = sorted(
+            a["_grad_norm"]
+            for _, a in round_assignments
+            if a.get("_grad_norm") is not None
+        )
+        if grad_norms:
+            n_g = len(grad_norms)
+            mean_g = sum(grad_norms) / n_g
+            var_g = sum((x - mean_g) ** 2 for x in grad_norms) / n_g
+            grad_norm_stats = {
+                "grad_norm_mean": mean_g,
+                "grad_norm_min": grad_norms[0],
+                "grad_norm_max": grad_norms[-1],
+                "grad_norm_median": grad_norms[n_g // 2],
+                "grad_norm_std": var_g ** 0.5,
+            }
+        else:
+            grad_norm_stats = {}
+
+        overlap_stats = self._compute_index_overlap(accepted)
+        grad_norm_stats.update(overlap_stats)
+        cache_total = self._loader_cache_hits + self._loader_cache_misses
+        if cache_total > 0:
+            grad_norm_stats["loader_cache_hits"] = self._loader_cache_hits
+            grad_norm_stats["loader_cache_misses"] = self._loader_cache_misses
+            grad_norm_stats["loader_cache_hit_rate"] = (
+                self._loader_cache_hits / cache_total
+            )
+
+        # Initialised here so all four log paths see them; populated only
+        # when the val eval runs (otherwise empty dicts spread to nothing).
+        per_field_before: dict[str, float] = {}
+        per_field_after: dict[str, float] = {}
 
         if self._fresh_start and self._agg_round < self.warmup_rounds:
             logger.info(
@@ -2291,9 +2549,15 @@ class GradientAggregator:
                 {
                     "type": "aggregation",
                     "round": self._agg_round,
+                    "n_assigned": n_assigned,
+                    "n_delivered": n_delivered,
+                    "n_collected": n_collected,
+                    "n_version_mismatched": n_version_mismatched,
                     "n_scored": len(scored),
                     "n_accepted": 0,
+                    "t_loader_build_s": t_loader_build_miners,
                     "version": self._version,
+                    **grad_norm_stats,
                 }
             )
             return
@@ -2329,19 +2593,26 @@ class GradientAggregator:
             for _, _, _, _, a in accepted
             if a.get("ts_start")
         ]
+        t_val_loader_start = time.time()
         val_loader = self._build_val_loader_for_ranges(
             trained_ranges, tokenizer, device
         )
+        t_val_loader_build = time.time() - t_val_loader_start
         if val_loader is None:
             val_loader = self._global_val_loader
+        t_loader_build_total = t_loader_build_miners + t_val_loader_build
 
         best_delta = local_delta
+        best_label = "local"
         best_loss = float("inf")
         baseline_loss = 0.0
+        t_proposal_eval = 0.0
 
         if val_loader is not None:
             original_state = {k: v.clone() for k, v in model.state_dict().items()}
-            baseline_loss = _eval_loss(model, val_loader, device, self.max_val_batches)
+            baseline_loss, per_field_before = _eval_loss_per_field(
+                model, val_loader, device, self.max_val_batches
+            )
 
             if self.is_aggregator:
                 # Evaluate all proposals (local + sibling) and pick the best
@@ -2353,7 +2624,31 @@ class GradientAggregator:
                 candidates = [("local", local_agg)]
                 candidates.extend(proposals)
 
+                local_norm_sq = sum(
+                    float(vals.pow(2).sum().item())
+                    for _, (_, vals, _) in local_agg.sparse.items()
+                )
+                local_norm = local_norm_sq ** 0.5
+                norm_threshold = local_norm * self.proposal_norm_ratio
+                proposals_skipped = 0
+
+                t_proposal_eval_start = time.time()
                 for label, comp in candidates:
+                    if label != "local" and local_norm > 0:
+                        cand_norm = sum(
+                            float(vals.pow(2).sum().item())
+                            for _, (_, vals, _) in comp.sparse.items()
+                        ) ** 0.5
+                        if cand_norm > norm_threshold:
+                            logger.warning(
+                                "  Proposal %s skipped: norm=%.2f exceeds %.2f×local (%.2f)",
+                                label,
+                                cand_norm,
+                                self.proposal_norm_ratio,
+                                local_norm,
+                            )
+                            proposals_skipped += 1
+                            continue
                     model.load_state_dict(original_state)
                     delta = decompress(comp)
                     apply_gradient(model, delta)
@@ -2367,33 +2662,56 @@ class GradientAggregator:
                     if loss < best_loss:
                         best_loss = loss
                         best_delta = delta
+                        best_label = label
+                t_proposal_eval = time.time() - t_proposal_eval_start
+                grad_norm_stats["proposals_evaluated"] = len(candidates) - proposals_skipped
+                grad_norm_stats["proposals_skipped"] = proposals_skipped
 
                 # Restore and apply the winner
                 model.load_state_dict(original_state)
 
             # Apply the chosen delta and check rollback
             apply_gradient(model, best_delta)
-            new_loss = (
-                _eval_loss(model, val_loader, device, self.max_val_batches)
-                if self.is_aggregator
-                else best_loss
-            )
+            if self.is_aggregator:
+                new_loss, per_field_after = _eval_loss_per_field(
+                    model, val_loader, device, self.max_val_batches
+                )
+            else:
+                new_loss = best_loss
+
+            for name, val in per_field_before.items():
+                grad_norm_stats[f"per_field_loss_before_{name}"] = val
+            for name, val in per_field_after.items():
+                grad_norm_stats[f"per_field_loss_after_{name}"] = val
 
             if self._effective_rollback and new_loss > baseline_loss:
                 model.load_state_dict(original_state)
                 logger.warning(
                     "  Rollback: val %.4f → %.4f (worse)", baseline_loss, new_loss
                 )
+                if best_label == "local":
+                    for _, _, _, _, a in accepted:
+                        a["_was_rollback_winner"] = True
                 self._log_event(
                     {
                         "type": "aggregation",
                         "round": self._agg_round,
+                        "n_assigned": n_assigned,
+                        "n_delivered": n_delivered,
+                        "n_collected": n_collected,
+                        "n_version_mismatched": n_version_mismatched,
                         "n_scored": len(scored),
                         "n_accepted": len(accepted),
                         "loss_before": baseline_loss,
                         "loss_after": new_loss,
+                        "loss_improvement_pct": (
+                            (baseline_loss - new_loss) / max(abs(baseline_loss), 1e-9)
+                        ),
+                        "t_proposal_eval_s": t_proposal_eval,
+                        "t_loader_build_s": t_loader_build_total,
                         "rolled_back": True,
                         "version": self._version,
+                        **grad_norm_stats,
                     }
                 )
                 return
@@ -2406,10 +2724,15 @@ class GradientAggregator:
                     {
                         "type": "aggregation",
                         "round": self._agg_round,
+                        "n_assigned": n_assigned,
+                        "n_delivered": n_delivered,
+                        "n_collected": n_collected,
+                        "n_version_mismatched": n_version_mismatched,
                         "n_scored": len(scored),
                         "n_accepted": len(accepted),
                         "version": self._version,
                         "sibling_only": True,
+                        **grad_norm_stats,
                     }
                 )
                 return
@@ -2464,12 +2787,23 @@ class GradientAggregator:
             {
                 "type": "aggregation",
                 "round": self._agg_round,
+                "n_assigned": n_assigned,
+                "n_delivered": n_delivered,
+                "n_collected": n_collected,
+                "n_version_mismatched": n_version_mismatched,
                 "n_scored": len(scored),
                 "n_accepted": len(accepted),
                 "loss_before": baseline_loss,
                 "loss_after": new_loss,
+                "loss_improvement_pct": (
+                    (baseline_loss - new_loss) / max(abs(baseline_loss), 1e-9)
+                ),
+                "t_proposal_eval_s": t_proposal_eval,
+                "t_save_ckpt_s": t_local_save + t_s3_put,
+                "t_loader_build_s": t_loader_build_total,
                 "rolled_back": False,
                 "version": self._version,
+                **grad_norm_stats,
             }
         )
         logger.info(
@@ -2508,12 +2842,17 @@ class GradientAggregator:
             if score is None:
                 score = 0.0
             is_submitter = uid in scored_uids
+            score_own = a.get("_score_own")
+            score_held = a.get("_score_held")
+            grad_norm = a.get("_grad_norm")
             scores_dict[str(uid)] = {
                 "score": score,
-                "score_own": a.get("_score_own"),
-                "score_held": a.get("_score_held"),
-                "overfitting": a.get("_overfitting", False),
-                "accepted": is_submitter and score > threshold,
+                "score_own": float(score_own) if score_own is not None else 0.0,
+                "score_held": float(score_held) if score_held is not None else 0.0,
+                "overfitting": bool(a.get("_overfitting", False)),
+                "accepted": bool(is_submitter and score > threshold),
+                "was_rollback_winner": bool(a.get("_was_rollback_winner", False)),
+                "grad_norm": float(grad_norm) if grad_norm is not None else 0.0,
                 "books": a.get("books", []),
             }
         self._latest_scores = {
@@ -2627,6 +2966,18 @@ class GradientAggregator:
 
         ts_start = assignment.get("ts_start", 0)
         ts_end = assignment.get("ts_end", 0)
+        cache_key = (
+            "miner",
+            tuple(sorted(str(b) for b in books)),
+            int(ts_start),
+            int(ts_end),
+        )
+        cached = self._loader_cache.get(cache_key)
+        if cached is not None:
+            self._loader_cache_hits += 1
+            return cached
+        self._loader_cache_misses += 1
+
         files = []
         for book_id in books:
             book_files = self._get_book_files(book_id, ts_start, ts_end)
@@ -2636,7 +2987,16 @@ class GradientAggregator:
             return None
 
         ds = OrderDataset(files, seq_len=256, tokenizer=tokenizer, max_cached=2)
-        return DataLoader(ds, batch_size=32, shuffle=False)
+        loader = DataLoader(
+            ds,
+            batch_size=64,
+            shuffle=False,
+            num_workers=2,
+            pin_memory=True,
+            persistent_workers=True,
+        )
+        self._loader_cache[cache_key] = loader
+        return loader
 
     def receive_state(self, data: bytes) -> None:
         """Receive a msgpack-encoded state tick from the validator.
@@ -2892,7 +3252,9 @@ class GradientAggregator:
                 self._run_data_cleanup()
 
         # Identity guard: drop ticks that can't be tied to a sim_id.
-        incoming_sim_id = tick.get("sim_id") or (tick.get("config") or {}).get("simulation_id")
+        incoming_sim_id = tick.get("sim_id") or (tick.get("config") or {}).get(
+            "simulation_id"
+        )
         if self._sim_id is None and not incoming_sim_id:
             self._pre_bind_drops += 1
             if self._pre_bind_drops <= 3 or self._pre_bind_drops % 64 == 0:
@@ -2963,8 +3325,7 @@ class GradientAggregator:
                 and self._restored_sim_id != new_sim_id
             )
             bucket_mismatch = (
-                self._bucket_sim_id is not None
-                and self._bucket_sim_id != new_sim_id
+                self._bucket_sim_id is not None and self._bucket_sim_id != new_sim_id
             )
             if self._sim_id is None and (staged_mismatch or bucket_mismatch):
                 self._sim_epoch += 1
@@ -3363,6 +3724,16 @@ def create_gradient_router(
             "1 if miner gradient accepted last round",
             ("miner_uid", "is_benchmark"),
         )
+        g_miner_grad_norm = _g(
+            "gentrx_miner_grad_norm",
+            "Miner gradient L2 norm last round (0 if not submitted)",
+            ("miner_uid", "is_benchmark"),
+        )
+        g_rollback_winner = _g(
+            "gentrx_miner_was_rollback_winner",
+            "1 if this miner's gradient was the chosen-but-reverted delta last round",
+            ("miner_uid", "is_benchmark"),
+        )
 
         g_round.labels(*lv).set(aggregator._agg_round)
         g_version.labels(*lv).set(aggregator._version)
@@ -3396,15 +3767,14 @@ def create_gradient_router(
             for uid_str, info in per_miner.items():
                 is_bm = "1" if int(uid_str) in benchmark_uids else "0"
                 mlv = lv + [uid_str, is_bm]
-                s_own = info.get("score_own")
-                s_held = info.get("score_held")
-                s = info.get("score", 0.0)
-                if s_own is not None:
-                    g_score_own.labels(*mlv).set(s_own)
-                if s_held is not None:
-                    g_score_held.labels(*mlv).set(s_held)
-                g_score.labels(*mlv).set(s)
+                g_score_own.labels(*mlv).set(float(info.get("score_own") or 0.0))
+                g_score_held.labels(*mlv).set(float(info.get("score_held") or 0.0))
+                g_score.labels(*mlv).set(float(info.get("score", 0.0) or 0.0))
                 g_accepted.labels(*mlv).set(1 if info.get("accepted") else 0)
+                g_miner_grad_norm.labels(*mlv).set(float(info.get("grad_norm") or 0.0))
+                g_rollback_winner.labels(*mlv).set(
+                    1 if info.get("was_rollback_winner") else 0
+                )
         else:
             g_active.labels(*lv).set(0)
 

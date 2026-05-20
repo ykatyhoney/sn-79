@@ -15,6 +15,9 @@ Miners commit their S3 bucket read credentials on-chain so the validator
 can discover and read gradients from each miner's bucket. Uses bittensor's
 built-in Commitments pallet (same pattern as Templar).
 
+Supports Cloudflare R2, Storj, and Hippius S3. Provider is auto-detected
+from the account_id slot of the commitment (see BucketInfo).
+
 Commitment format (128 chars):
     account_id (32) + access_key_id (32) + secret_access_key (64)
 
@@ -40,6 +43,10 @@ ACCOUNT_ID_LEN = 32
 ACCESS_KEY_LEN = 32
 SECRET_KEY_LEN = 64
 
+STORJ_PREFIX = "storj:"
+STORJ_ENDPOINT = "https://gateway.storjshare.io"
+HIPPIUS_ENDPOINT = "https://s3.hippius.com"
+
 
 _R2_ACCOUNT_ID_RE = None  # compiled lazily
 
@@ -53,24 +60,44 @@ def _is_r2_account_id(value: str) -> bool:
     return bool(_R2_ACCOUNT_ID_RE.match(value))
 
 
+def _resolve_account_id(bucket: str, account_id_env: str, provider_env: str) -> str:
+    """Build the account_id slot value for an on-chain commitment.
+
+    Provider hint comes from the GENTRX_*_S3_PROVIDER env var:
+      "storj":   prepend the "storj:" sigil to the bucket name
+      "r2":      use account_id_env (Cloudflare account ID)
+      "hippius": use bucket name (or account_id_env if explicitly set)
+      unset:     existing behavior — explicit account_id_env wins, else bucket
+    """
+    provider = (provider_env or "").strip().lower()
+    if provider == "storj":
+        return f"{STORJ_PREFIX}{bucket}"
+    return account_id_env or bucket
+
+
 @dataclass
 class BucketInfo:
     """S3 bucket credentials parsed from on-chain commitment.
 
-    Supports Cloudflare R2 and Hippius S3. Provider is auto-detected from the
-    account_id field:
+    Supports Cloudflare R2, Hippius S3, and Storj. Provider is auto-detected
+    from the account_id field:
 
         R2      — account_id is a 32-char lowercase hex Cloudflare account ID.
                   Endpoint:  https://{account_id}.r2.cloudflarestorage.com
                   Region:    auto
                   Bucket:    account_id (convention: bucket == account_id for R2)
 
+        Storj   — account_id starts with "storj:" followed by the bucket name.
+                  Endpoint:  https://gateway.storjshare.io  (static)
+                  Region:    global
+                  Bucket:    account_id without the "storj:" prefix
+
         Hippius — account_id field stores the bucket name (padded to 32 chars).
                   Endpoint:  https://s3.hippius.com  (static)
                   Region:    decentralized
                   Bucket:    account_id.strip()
 
-    The 128-char on-chain format is identical for both providers:
+    The 128-char on-chain format is identical for all providers:
         account_id (32) + access_key_id (32) + secret_access_key (64)
 
     For local MinIO / other providers set _endpoint_override at runtime.
@@ -88,38 +115,68 @@ class BucketInfo:
         return _is_r2_account_id(self.account_id.strip())
 
     @property
+    def is_storj(self) -> bool:
+        """True when account_id starts with the Storj prefix sigil."""
+        return self.account_id.strip().startswith(STORJ_PREFIX)
+
+    @property
     def endpoint_url(self) -> str:
         """Derive endpoint from provider, or use override for local dev."""
         if self._endpoint_override:
             return self._endpoint_override
         if self.is_r2:
             return f"https://{self.account_id.strip()}.r2.cloudflarestorage.com"
-        return "https://s3.hippius.com"
+        if self.is_storj:
+            return STORJ_ENDPOINT
+        return HIPPIUS_ENDPOINT
 
     @property
     def region(self) -> str:
         """AWS region string for boto3 (provider-specific)."""
         if self._endpoint_override:
             return "auto"
-        return "auto" if self.is_r2 else "decentralized"
+        if self.is_r2:
+            return "auto"
+        if self.is_storj:
+            return "global"
+        return "decentralized"
 
     @property
     def bucket_name(self) -> str:
         """Bucket name.
 
         R2: account_id by convention (new account per bucket).
+        Storj: account_id minus the "storj:" prefix.
         Hippius: account_id field IS the bucket name.
         Override: _bucket_override wins (local dev / MinIO).
         """
         if self._bucket_override:
             return self._bucket_override
-        return self.account_id.strip()
+        aid = self.account_id.strip()
+        if aid.startswith(STORJ_PREFIX):
+            return aid[len(STORJ_PREFIX):]
+        return aid
 
     def to_commitment(self) -> str:
         """Serialize to 128-char commitment string."""
-        aid = self.account_id.ljust(ACCOUNT_ID_LEN)[:ACCOUNT_ID_LEN]
-        akid = self.access_key_id.ljust(ACCESS_KEY_LEN)[:ACCESS_KEY_LEN]
-        sk = self.secret_access_key.ljust(SECRET_KEY_LEN)[:SECRET_KEY_LEN]
+        if len(self.account_id) > ACCOUNT_ID_LEN:
+            raise ValueError(
+                f"account_id length {len(self.account_id)} exceeds slot "
+                f"{ACCOUNT_ID_LEN}: {self.account_id!r}"
+            )
+        if len(self.access_key_id) > ACCESS_KEY_LEN:
+            raise ValueError(
+                f"access_key_id length {len(self.access_key_id)} exceeds slot "
+                f"{ACCESS_KEY_LEN}: {self.access_key_id!r}"
+            )
+        if len(self.secret_access_key) > SECRET_KEY_LEN:
+            raise ValueError(
+                f"secret_access_key length {len(self.secret_access_key)} exceeds "
+                f"slot {SECRET_KEY_LEN}"
+            )
+        aid = self.account_id.ljust(ACCOUNT_ID_LEN)
+        akid = self.access_key_id.ljust(ACCESS_KEY_LEN)
+        sk = self.secret_access_key.ljust(SECRET_KEY_LEN)
         return aid + akid + sk
 
     @classmethod
@@ -152,6 +209,7 @@ class BucketInfo:
             GENTRX_AGGREGATOR_S3_READ_SECRET_KEY (falls back to GENTRX_AGGREGATOR_S3_SECRET_KEY)
 
         Optional:
+            GENTRX_AGGREGATOR_S3_PROVIDER    — "r2" | "storj" | "hippius" (provider hint)
             GENTRX_AGGREGATOR_S3_ACCOUNT_ID — Cloudflare account ID (R2 only)
             GENTRX_CHAIN_ENDPOINT_OVERRIDE   — S3 endpoint override for local dev
 
@@ -163,7 +221,11 @@ class BucketInfo:
         if not bucket:
             return None
 
-        account_id = os.environ.get("GENTRX_AGGREGATOR_S3_ACCOUNT_ID", "") or bucket
+        account_id = _resolve_account_id(
+            bucket,
+            os.environ.get("GENTRX_AGGREGATOR_S3_ACCOUNT_ID", ""),
+            os.environ.get("GENTRX_AGGREGATOR_S3_PROVIDER", ""),
+        )
 
         read_access = (
             os.environ.get("GENTRX_AGGREGATOR_S3_READ_ACCESS_KEY", "")
@@ -193,6 +255,8 @@ class BucketInfo:
 
         R2: set GENTRX_VALIDATOR_S3_ACCOUNT_ID to the 32-char Cloudflare account
             ID; endpoint is derived automatically.
+        Storj: set GENTRX_VALIDATOR_S3_PROVIDER=storj. The bucket name is stored
+            in the account_id field with a "storj:" prefix.
         Hippius: set GENTRX_VALIDATOR_S3_BUCKET to the bucket name; it is stored
             in the account_id field (endpoint derived as https://s3.hippius.com).
 
@@ -204,6 +268,7 @@ class BucketInfo:
             GENTRX_VALIDATOR_S3_READ_SECRET_KEY (falls back to GENTRX_VALIDATOR_S3_SECRET_KEY)
 
         Optional:
+            GENTRX_VALIDATOR_S3_PROVIDER   — "r2" | "storj" | "hippius" (provider hint)
             GENTRX_VALIDATOR_S3_ACCOUNT_ID — R2 account ID (defaults to bucket name)
 
         Returns None if required env vars are missing.
@@ -214,7 +279,11 @@ class BucketInfo:
         if not bucket:
             return None
 
-        account_id = os.environ.get("GENTRX_VALIDATOR_S3_ACCOUNT_ID", "") or bucket
+        account_id = _resolve_account_id(
+            bucket,
+            os.environ.get("GENTRX_VALIDATOR_S3_ACCOUNT_ID", ""),
+            os.environ.get("GENTRX_VALIDATOR_S3_PROVIDER", ""),
+        )
 
         read_access = (
             os.environ.get("GENTRX_VALIDATOR_S3_READ_ACCESS_KEY", "")
@@ -241,13 +310,15 @@ class BucketInfo:
 
         Required:
             GENTRX_AGENT_S3_BUCKET — bucket name (also used as account_id for
-                                    MinIO; for R2, set GENTRX_AGENT_S3_ACCOUNT_ID)
+                                    MinIO; for R2, set GENTRX_AGENT_S3_ACCOUNT_ID;
+                                    for Storj, set GENTRX_AGENT_S3_PROVIDER=storj)
 
         Read-only credentials (committed on-chain):
             GENTRX_AGENT_S3_READ_ACCESS_KEY (falls back to GENTRX_AGENT_S3_ACCESS_KEY)
             GENTRX_AGENT_S3_READ_SECRET_KEY (falls back to GENTRX_AGENT_S3_SECRET_KEY)
 
         Optional:
+            GENTRX_AGENT_S3_PROVIDER   — "r2" | "storj" | "hippius" (provider hint)
             GENTRX_AGENT_S3_ACCOUNT_ID — Cloudflare account ID (R2 only)
             GENTRX_CHAIN_ENDPOINT_OVERRIDE — S3 endpoint override for MinIO
                                              localnet (used by service, not
@@ -261,8 +332,11 @@ class BucketInfo:
         if not bucket:
             return None
 
-        # account_id for chain commitment: explicit override or bucket name
-        account_id = os.environ.get("GENTRX_AGENT_S3_ACCOUNT_ID", "") or bucket
+        account_id = _resolve_account_id(
+            bucket,
+            os.environ.get("GENTRX_AGENT_S3_ACCOUNT_ID", ""),
+            os.environ.get("GENTRX_AGENT_S3_PROVIDER", ""),
+        )
 
         # Read-only creds (committed) — fall back to write creds for local/MinIO
         read_access = (
@@ -372,10 +446,32 @@ class GenTRXChain:
 
             for key, value in query_result:
                 try:
-                    decoded_ss58 = ss58_encode(bytes(key[0]), SS58_FORMAT)
-                    commitment_data = value.value["info"]["fields"][0][0]
-                    bytes_key = next(iter(commitment_data.keys()))
-                    raw = bytes(commitment_data[bytes_key][0]).decode()
+                    # substrate-interface used to wrap the storage key in a
+                    # tuple of bytes; newer versions yield the ss58 string
+                    # directly. Handle both.
+                    if isinstance(key, str):
+                        decoded_ss58 = key
+                    else:
+                        raw_key = key[0]
+                        if isinstance(raw_key, str):
+                            raw_key = bytes.fromhex(raw_key.removeprefix("0x"))
+                        else:
+                            raw_key = bytes(raw_key)
+                        decoded_ss58 = ss58_encode(raw_key, SS58_FORMAT)
+                    info = value["info"] if isinstance(value, dict) else value.value["info"]
+                    field = info["fields"][0]
+                    if isinstance(field, dict):
+                        payload = next(iter(field.values()))
+                    else:
+                        payload = field[0]
+                        if isinstance(payload, dict):
+                            payload = next(iter(payload.values()))[0]
+                    if isinstance(payload, str):
+                        raw = bytes.fromhex(payload.removeprefix("0x")).decode("ascii")
+                    elif isinstance(payload, (bytes, bytearray)):
+                        raw = bytes(payload).decode("ascii")
+                    else:
+                        raw = bytes(payload).decode("ascii")
                 except Exception as exc:
                     logger.debug("Failed to decode commitment: %s", exc)
                     continue

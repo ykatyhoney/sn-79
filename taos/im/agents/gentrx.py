@@ -1394,6 +1394,7 @@ class GenTRXAgent(FinanceSimulationAgent):
             lr=self._gtx.train_lr,
             window_id=self._gtx.train_window_id,
             miner_uid=self.uid,
+            model_version=int((assignment or {}).get("model_version", 0) or 0),
         )
         delta = train_window(train_model, loader, win_cfg, self._gtx.device)
         self._gtx.tlog.info(

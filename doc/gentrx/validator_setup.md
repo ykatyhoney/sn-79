@@ -141,7 +141,7 @@ Canonical places for uid-0 to publish the read pair:
 
 ## External setup: Cloudflare R2
 
-R2 is the recommended production backend (S3-compatible API, no egress fees). Hippius is the decentralised alternative. Auto-detected from the account_id format (see below). MinIO works for local testing only.
+R2 is the recommended production backend (S3-compatible API, no egress fees). Storj and Hippius are decentralised alternatives. Provider is auto-detected from the account_id slot of the on-chain commitment. MinIO works for local testing only.
 
 ### One-time R2 account setup
 
@@ -196,11 +196,17 @@ print('validator bucket:', store.endpoint_url, store.bucket)
 
 If the line prints without error, the gradient server can authenticate.
 
+### Storj alternative
+
+Storj is a decentralised S3 implementation. Endpoint is `https://gateway.storjshare.io` (static), region `global`. Access keys are 28 chars and secrets are 53 chars (base32, fixed by the gateway).
+
+Setup pattern: create one bucket via the Storj UI, generate two S3 access keys (write grant with full bucket scope, read grant with GetObject scope only). ListBucket is not required for the validator read flow because gradient keys are deterministic. Set `GENTRX_VALIDATOR_S3_PROVIDER=storj` and `GENTRX_VALIDATOR_S3_BUCKET=<name>`. The bucket name is stored on-chain with a `storj:` prefix in the account_id slot, so the validator can route to the right endpoint without further config.
+
 ### Hippius alternative
 
-Hippius is a decentralised S3 implementation. Provider is auto-detected from the account_id format: if not a 32-char hex string, the code routes to `https://s3.hippius.com` with region `decentralized`.
+Hippius is a decentralised S3 implementation. Endpoint is `https://s3.hippius.com` (static), region `decentralized`. Provider is auto-detected when the account_id slot is a non-hex bucket name without the `storj:` prefix.
 
-Setup pattern is the same - create one bucket, generate read+write tokens. Omit `GENTRX_VALIDATOR_S3_ACCOUNT_ID`; the bucket name is stored in the account_id field on-chain. Read Hippius docs for token generation specifics.
+Setup pattern is the same as R2: create one bucket, generate read+write tokens. Omit `GENTRX_VALIDATOR_S3_ACCOUNT_ID`; the bucket name is stored in the account_id field on-chain.
 
 ### Self-hosted MinIO (localnet only)
 
@@ -212,8 +218,9 @@ MinIO works as a drop-in S3 server for local testing - it's what `agents/proxy/s
 
 ```bash
 # --- Validator bucket (checkpoints + data + scores) ---
+GENTRX_VALIDATOR_S3_PROVIDER=r2                         # r2 | storj | hippius
 GENTRX_VALIDATOR_S3_BUCKET=<bucket-name>
-GENTRX_VALIDATOR_S3_ACCOUNT_ID=<R2-account-id>         # R2 only; omit for Hippius
+GENTRX_VALIDATOR_S3_ACCOUNT_ID=<R2-account-id>          # R2 only
 GENTRX_VALIDATOR_S3_WRITE_ACCESS_KEY=<write-key>        # gradient server only
 GENTRX_VALIDATOR_S3_WRITE_SECRET_KEY=<write-secret>
 GENTRX_VALIDATOR_S3_READ_ACCESS_KEY=<read-only-key>     # committed on-chain

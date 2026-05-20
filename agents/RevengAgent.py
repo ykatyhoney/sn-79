@@ -1029,7 +1029,7 @@ class RevengAgent(GenTRXAgent):
         skipped = {"not_trade": 0, "too_old": 0, "already_processed": 0, "not_other_agent": 0}
 
         for event in book.events:
-            if event.type != "t":
+            if not isinstance(event, TradeInfo):
                 skipped["not_trade"] += 1
                 continue
             if event.timestamp < cutoff:

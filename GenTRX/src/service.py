@@ -799,8 +799,10 @@ class GenTRXService:
         via ReportingService IPC, dashboards, etc. — have everything they
         need without a second HTTP call.
         """
-        for uid_str, score_data in payload.get("scores", {}).items():
-            self._scores[int(uid_str)] = score_data
+        self._scores = {
+            int(uid_str): score_data
+            for uid_str, score_data in payload.get("scores", {}).items()
+        }
         agg = payload.get("aggregation")
         if agg:
             self._last_aggregation_stats = dict(agg)

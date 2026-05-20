@@ -2901,10 +2901,12 @@ if __name__ != "__mp_main__":
             self.scores[uid] = 0.0
             if hasattr(self, 'gentrx_scores'):
                 self.gentrx_scores[uid] = 0.0
-            # Reset per-round GenTRX EMA so new miner at the same UID slot
-            # doesn't inherit the old miner's score history.
+            # Reset GenTRX EMA + service score cache so a new miner at the
+            # same UID slot doesn't inherit the old miner's score history.
             if hasattr(self, '_gentrx_ema') and self._gentrx_ema:
                 self._gentrx_ema.pop(uid, None)
+            if getattr(self, '_gentrx', None) is not None:
+                self._gentrx._scores.pop(uid, None)
             bt.logging.debug(f"UID {uid} Deregistered - Scheduled for reset.")
 
         def process_resets(self, state : MarketSimulationStateUpdate) -> None:

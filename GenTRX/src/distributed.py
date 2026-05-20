@@ -56,6 +56,7 @@ class WindowConfig:
     grad_clip: float = 1.0
     window_id: int = 0
     miner_uid: int = 0
+    model_version: int = 0
 
 
 def train_window(
@@ -128,6 +129,7 @@ def train_window(
         loss_before=loss_before,
         loss_after=loss_after,
         loss_trajectory=loss_trajectory,
+        model_v_trained=config.model_version,
     )
 
     delta = extract_delta(theta_before, theta_after, metadata)
@@ -207,3 +209,30 @@ def _eval_loss(
             n += 1
     model.train()
     return total / max(n, 1)
+
+
+def _eval_loss_per_field(
+    model: OrderModel,
+    loader: DataLoader,
+    device: str,
+    max_batches: int,
+) -> tuple[float, dict[str, float]]:
+    """Like `_eval_loss` but also returns the per-field CE breakdown."""
+    model.eval()
+    total = 0.0
+    n = 0
+    per_field_sum: dict[str, float] = {}
+    with torch.no_grad():
+        for i, batch in enumerate(loader):
+            if i >= max_batches:
+                break
+            logits, labels = _forward_batch(model, batch, device)
+            loss, details = compute_loss(logits, labels)
+            total += loss.item()
+            for name, val in details.items():
+                per_field_sum[name] = per_field_sum.get(name, 0.0) + val
+            n += 1
+    model.train()
+    denom = max(n, 1)
+    per_field_avg = {name: s / denom for name, s in per_field_sum.items()}
+    return total / denom, per_field_avg

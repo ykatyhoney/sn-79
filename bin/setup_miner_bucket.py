@@ -3,7 +3,8 @@
 # SPDX-License-Identifier: MIT
 """GenTRX miner bucket setup — create S3 bucket and commit read credentials on-chain.
 
-Supports Cloudflare R2 (production) and MinIO (local dev).
+Supports Cloudflare R2 (production), Storj, Hippius, and MinIO (local dev).
+Select the provider with --provider or GENTRX_AGENT_S3_PROVIDER.
 
 Usage (R2) — credentials via env vars (preferred, keeps secrets out of ps aux):
     export GENTRX_AGENT_S3_ACCESS_KEY=<FULL_ACCESS_KEY>
@@ -11,10 +12,24 @@ Usage (R2) — credentials via env vars (preferred, keeps secrets out of ps aux)
     export GENTRX_AGENT_S3_READ_ACCESS_KEY=<READ_ONLY_KEY>
     export GENTRX_AGENT_S3_READ_SECRET_KEY=<READ_ONLY_SECRET>
     python bin/setup_miner_bucket \
+        --provider r2 \
         --account-id <CF_ACCOUNT_ID> \
         --wallet-name miner \
         --wallet-hotkey default \
         --netuid 79
+
+Usage (Storj):
+    export GENTRX_AGENT_S3_ACCESS_KEY=<FULL_ACCESS_KEY>   # write grant
+    export GENTRX_AGENT_S3_SECRET_KEY=<FULL_SECRET>
+    export GENTRX_AGENT_S3_READ_ACCESS_KEY=<READ_ONLY_KEY>  # GetObject scope
+    export GENTRX_AGENT_S3_READ_SECRET_KEY=<READ_ONLY_SECRET>
+    python bin/setup_miner_bucket \
+        --provider storj \
+        --bucket <your-bucket-name> \
+        --wallet-name miner --wallet-hotkey default --netuid 79
+    # Endpoint defaults to https://gateway.storjshare.io, region "global".
+    # The read grant only needs GetObject; ListBucket is not required for the
+    # validator read flow (deterministic key paths).
 
 Usage (R2) — credentials via flags (legacy; visible in ps aux):
     python bin/setup_miner_bucket \
@@ -46,7 +61,11 @@ What this does:
 
 On-chain commitment format (128 chars):
   [account_id: 32][access_key_id: 32][secret_access_key: 64]
-  account_id = Cloudflare account ID (R2) or bucket name (MinIO/Hippius)
+  account_id:
+    R2:      32-char Cloudflare account ID (hex)
+    Storj:   "storj:<bucket-name>" sigil
+    Hippius: bucket name
+    MinIO:   bucket name
   access_key_id / secret_access_key = READ-ONLY credentials
 
 Validators read this to discover and pull gradients from your bucket.
@@ -67,23 +86,29 @@ def main():
 
     # Bucket location
     parser.add_argument(
+        "--provider",
+        default=os.environ.get("GENTRX_AGENT_S3_PROVIDER", ""),
+        choices=("", "r2", "storj", "hippius", "minio"),
+        help="Storage provider. Sets default endpoint/region and the "
+        "account_id slot encoding on chain. Or set GENTRX_AGENT_S3_PROVIDER.",
+    )
+    parser.add_argument(
         "--account-id",
         default="",
-        help="Cloudflare account ID (used to derive R2 endpoint). "
-        "Leave blank when using --endpoint.",
+        help="Cloudflare account ID (R2 only). Leave blank for other providers.",
     )
     parser.add_argument(
         "--endpoint",
         default="",
-        help="Override S3 endpoint URL (for MinIO / Hippius). "
-        "If omitted, derived from --account-id for R2.",
+        help="Override S3 endpoint URL. If omitted, derived from --provider.",
     )
     parser.add_argument(
         "--bucket",
         default="",
-        help="Bucket name. Defaults to --account-id (R2 convention).",
+        help="Bucket name. Required for Storj / Hippius / MinIO. "
+        "For R2 defaults to --account-id.",
     )
-    parser.add_argument("--region", default="auto")
+    parser.add_argument("--region", default="")
 
     # Full-access credentials (for bucket creation and write verification)
     # Prefer env vars GENTRX_AGENT_S3_ACCESS_KEY / GENTRX_AGENT_S3_SECRET_KEY to
@@ -146,36 +171,99 @@ def main():
     read_access_key = _cred(args.read_access_key, "GENTRX_AGENT_S3_READ_ACCESS_KEY", "Read-only key ID")
     read_secret_key = _cred(args.read_secret_key, "GENTRX_AGENT_S3_READ_SECRET_KEY", "Read-only secret key", secret=True)
 
-    # Resolve endpoint and bucket name
-    account_id = args.account_id
-    endpoint = args.endpoint or (
-        f"https://{account_id}.r2.cloudflarestorage.com" if account_id else ""
+    from GenTRX.src.chain import (
+        ACCESS_KEY_LEN,
+        ACCOUNT_ID_LEN,
+        HIPPIUS_ENDPOINT,
+        SECRET_KEY_LEN,
+        STORJ_ENDPOINT,
+        STORJ_PREFIX,
+        BucketInfo,
     )
-    bucket = args.bucket or account_id
 
-    if not endpoint:
-        print("ERROR: provide --endpoint or --account-id", file=sys.stderr)
-        sys.exit(1)
-    if not bucket:
-        print("ERROR: provide --bucket or --account-id", file=sys.stderr)
-        sys.exit(1)
+    provider = (args.provider or "").lower()
+    if not provider and args.account_id:
+        provider = "r2"
+
+    account_id = args.account_id
+    endpoint = args.endpoint
+    region = args.region
+    bucket = args.bucket
+
+    if provider == "r2":
+        if not account_id:
+            print("ERROR: --account-id is required for --provider r2", file=sys.stderr)
+            sys.exit(1)
+        endpoint = endpoint or f"https://{account_id}.r2.cloudflarestorage.com"
+        region = region or "auto"
+        bucket = bucket or account_id
+        commitment_account_id = account_id
+    elif provider == "storj":
+        if not bucket:
+            print("ERROR: --bucket is required for --provider storj", file=sys.stderr)
+            sys.exit(1)
+        endpoint = endpoint or STORJ_ENDPOINT
+        region = region or "global"
+        commitment_account_id = f"{STORJ_PREFIX}{bucket}"
+    elif provider == "hippius":
+        if not bucket:
+            print("ERROR: --bucket is required for --provider hippius", file=sys.stderr)
+            sys.exit(1)
+        endpoint = endpoint or HIPPIUS_ENDPOINT
+        region = region or "decentralized"
+        commitment_account_id = bucket
+    else:
+        # MinIO / unspecified — require explicit endpoint and bucket
+        if not endpoint:
+            print("ERROR: --endpoint is required when --provider is not set", file=sys.stderr)
+            sys.exit(1)
+        if not bucket:
+            print("ERROR: --bucket is required when --provider is not set", file=sys.stderr)
+            sys.exit(1)
+        region = region or "auto"
+        commitment_account_id = account_id or bucket
+
+    # Length sanity check — warn before the overflow guard hard-fails
+    def _warn_if_tight(name: str, value: str, slot: int) -> None:
+        if len(value) > slot * 0.8:
+            print(
+                f"   WARNING: {name} length {len(value)} is >80% of slot {slot}",
+                file=sys.stderr,
+            )
+
+    _warn_if_tight("account_id", commitment_account_id, ACCOUNT_ID_LEN)
+    _warn_if_tight("access_key_id", read_access_key, ACCESS_KEY_LEN)
+    _warn_if_tight("secret_access_key", read_secret_key, SECRET_KEY_LEN)
 
     print("\nGenTRX Miner Bucket Setup")
+    print(f"  Provider : {provider or 'unspecified'}")
     print(f"  Endpoint : {endpoint}")
     print(f"  Bucket   : {bucket}")
+    print(f"  Region   : {region}")
     print(f"  Dry run  : {args.dry_run}")
     print()
 
     # --- Step 1: Create bucket ---
     import boto3
+    from botocore.config import Config as BotoConfig
     from botocore.exceptions import ClientError
+
+    boto_config = BotoConfig(
+        signature_version="s3v4",
+        s3={"addressing_style": "path"},
+        connect_timeout=10,
+        read_timeout=15,
+        request_checksum_calculation="when_required",
+        response_checksum_validation="when_required",
+    )
 
     client = boto3.client(
         "s3",
         endpoint_url=endpoint,
         aws_access_key_id=access_key,
         aws_secret_access_key=secret_key,
-        region_name=args.region,
+        region_name=region,
+        config=boto_config,
     )
 
     print("1. Creating bucket...")
@@ -209,7 +297,8 @@ def main():
             endpoint_url=endpoint,
             aws_access_key_id=read_access_key,
             aws_secret_access_key=read_secret_key,
-            region_name=args.region,
+            region_name=region,
+            config=boto_config,
         )
         try:
             resp = read_client.get_object(Bucket=bucket, Key=test_key)
@@ -228,10 +317,6 @@ def main():
         client.delete_object(Bucket=bucket, Key=test_key)
 
     # --- Step 4: Build commitment string ---
-    # account_id field in commitment = account_id (R2) or bucket name (local)
-    commitment_account_id = account_id or bucket
-    from GenTRX.src.chain import BucketInfo
-
     bucket_info = BucketInfo(
         account_id=commitment_account_id,
         access_key_id=read_access_key,

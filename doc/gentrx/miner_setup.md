@@ -58,7 +58,7 @@ If you prefer to manage each step individually, the five steps below describe th
 
 - Bittensor wallet, registered on the subnet.
 - GPU recommended.
-- One **R2 or Hippius** bucket. Mainnet supports only these two providers because the on-chain commitment is fixed at 128 bytes (account_id + access_key + secret).
+- One bucket from **R2**, **Storj**, or **Hippius**. The on-chain commitment is fixed at 128 bytes (account_id + access_key + secret); these are the providers that fit.
 - Project Python venv (e.g. `venv/sn79/`) with deps installed (`pip install -e .`).
 
 ---
@@ -76,9 +76,21 @@ If you prefer to manage each step individually, the five steps below describe th
 
    Each token entry in the R2 dashboard exposes three fields: a **Token Value** (long bearer string for the Cloudflare API — ignore it), an **Access Key ID**, and a **Secret Access Key**. The wizard and `bin/setup_miner_bucket.py` use the latter two; bearer tokens are not part of the chain commitment.
 
+### Storj
+
+1. Storj → sign up at `storj.io` (free trial available).
+2. Create one bucket via the Storj UI. Pick any DNS-safe name.
+3. Generate **two S3-compatible access keys** (Access → Create S3 Credentials):
+   - **Write grant**: full read + write on the bucket. Stays on your miner host. Used to upload gradients.
+   - **Read grant**: GetObject only on the bucket. Goes on-chain. ListBucket is not required because validators read gradient keys deterministically.
+
+Endpoint is `https://gateway.storjshare.io` (static). Region is `global`. Access key is 28 chars, secret is 53 chars (both base32, fixed length).
+
+Pass `--provider storj --bucket <name>` to the helper in Step 2.
+
 ### Hippius
 
-Decentralised S3 alternative. Same flow: account → bucket → write token + read token. Hippius does not need an `account_id`. Pass `--bucket <name>` to the helper in Step 2 instead of `--account-id`.
+Decentralised S3 alternative. Same flow: account → bucket → write token + read token. Hippius does not need an `account_id`. Pass `--provider hippius --bucket <name>` to the helper in Step 2.
 
 [↑ back to Quickstart](#quickstart-running-a-gentrx-miner)
 
@@ -97,6 +109,7 @@ export GENTRX_AGENT_S3_READ_ACCESS_KEY=<READ_ACCESS_KEY>
 export GENTRX_AGENT_S3_READ_SECRET_KEY=<READ_SECRET_KEY>
 
 venv/simulator/bin/python bin/setup_miner_bucket.py \
+    --provider r2 \
     --account-id <R2_ACCOUNT_ID> \
     --wallet-name <coldkey> \
     --wallet-hotkey <hotkey> \
@@ -104,7 +117,7 @@ venv/simulator/bin/python bin/setup_miner_bucket.py \
     --subtensor-network finney
 ```
 
-For Hippius pass `--endpoint <hippius-url> --bucket <bucket-name>` in place of `--account-id`.
+For Storj pass `--provider storj --bucket <name>`. For Hippius pass `--provider hippius --bucket <name>`. Endpoint and region are derived from the provider; override with `--endpoint` / `--region` only if you have a reason to.
 
 Pass `--dry-run` first to print the commitment string without sending the chain transaction. The verification step uploads a small probe object with the write token and reads it back with the read token. Catches misconfigured token permissions before they hit chain.
 
@@ -120,6 +133,7 @@ Drop these into `.env` next to the runner script:
 
 ```bash
 # Your gradient bucket (write side, stays on this host)
+GENTRX_AGENT_S3_PROVIDER=r2                          # r2 | storj | hippius
 GENTRX_AGENT_S3_BUCKET=<your-bucket-name>            # for R2: same as account_id
 GENTRX_AGENT_S3_ACCESS_KEY=<your-write-key>
 GENTRX_AGENT_S3_SECRET_KEY=<your-write-secret>
@@ -128,7 +142,7 @@ GENTRX_AGENT_S3_SECRET_KEY=<your-write-secret>
 GENTRX_AGENT_S3_READ_ACCESS_KEY=<read-only-key>
 GENTRX_AGENT_S3_READ_SECRET_KEY=<read-only-secret>
 
-# For R2 with bucket-name == account_id this is optional.
+# R2 only: account ID for endpoint derivation. Optional if bucket == account_id.
 # GENTRX_AGENT_S3_ACCOUNT_ID=<r2-account-id>
 
 # uid-0 aggregator bucket: first-boot fallback for the canonical

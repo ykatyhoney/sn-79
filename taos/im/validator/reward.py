@@ -600,9 +600,10 @@ def _gentrx_rank_normalize(gentrx_scores: Dict) -> Dict[int, float]:
     if not gentrx_scores:
         return {}
 
-    # Extract (uid, raw_score) pairs
     scored = {}
     for uid_key, entry in gentrx_scores.items():
+        if isinstance(entry, dict) and not entry.get('accepted'):
+            continue
         uid_int = int(uid_key) if isinstance(uid_key, str) else uid_key
         if isinstance(entry, dict):
             scored[uid_int] = entry.get('score', 0.0)

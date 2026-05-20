@@ -272,23 +272,23 @@ _gentrx_validator_setup() {
          [ -n "${GENTRX_VALIDATOR_S3_BUCKET:-}" ] ); then
         _ok "Validator S3 bucket: ${GENTRX_VALIDATOR_S3_BUCKET} [already configured — skipping]"
     else
-        _info "Each validator needs one R2 or Hippius bucket."
-        _info "In your Cloudflare R2 (or Hippius) dashboard, create a bucket and"
-        _info "generate TWO API tokens on it:"
-        _info "  • Write token  (Object Read & Write) — stays on this host"
-        _info "  • Read token   (Object Read only)    — committed on-chain"
-        _info "From each token, copy the Access Key ID and Secret Access Key"
-        _info "(NOT the Token Value — that bearer string is for a different API)."
+        _info "Each validator needs one R2, Storj, or Hippius bucket."
+        _info "In your provider's dashboard, create a bucket and generate TWO keys:"
+        _info "  • Write key  (Object Read & Write) — stays on this host"
+        _info "  • Read key   (Object Read only)    — committed on-chain"
+        _info "Copy the Access Key ID and Secret Access Key from each."
         echo
 
         # Provider selection
         local _provider
-        if [ -n "${GENTRX_VALIDATOR_S3_ACCOUNT_ID:-}" ]; then
+        if [ "${GENTRX_VALIDATOR_S3_PROVIDER:-}" = "storj" ]; then
+            _provider="3"               # Storj: provider hint already in env
+        elif [ -n "${GENTRX_VALIDATOR_S3_ACCOUNT_ID:-}" ]; then
             _provider="configured-r2"   # R2: account_id present
         elif [ -n "${GENTRX_VALIDATOR_S3_ENDPOINT_URL:-}" ]; then
             _provider="2"               # custom endpoint (MinIO/Hippius): no account_id
         else
-            printf '    Provider: (1) Cloudflare R2  (2) Hippius  [1]: '
+            printf '    Provider: (1) Cloudflare R2  (2) Hippius  (3) Storj  [1]: '
             read -r _provider; _provider="${_provider:-1}"
         fi
 
@@ -297,6 +297,15 @@ _gentrx_validator_setup() {
                 _prompt GENTRX_VALIDATOR_S3_ENDPOINT_URL \
                     "Hippius endpoint URL" "https://s3.hippius.com"
                 _prompt GENTRX_VALIDATOR_S3_BUCKET "Bucket name"
+                ;;
+            3|storj|Storj)
+                GENTRX_VALIDATOR_S3_PROVIDER="storj"
+                _env_write "GENTRX_VALIDATOR_S3_PROVIDER" "storj"
+                export GENTRX_VALIDATOR_S3_PROVIDER
+                _prompt GENTRX_VALIDATOR_S3_ENDPOINT_URL \
+                    "Storj gateway URL" "https://gateway.storjshare.io"
+                _prompt GENTRX_VALIDATOR_S3_BUCKET "Bucket name"
+                _info "Storj read grant needs only GetObject scope; ListBucket is not required."
                 ;;
             *)
                 _prompt GENTRX_VALIDATOR_S3_ACCOUNT_ID \
