@@ -34,6 +34,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, FastAPI, Request
 
+from GenTRX.src.util.paths import default_output_dir
 from GenTRX.src.miner_training_service import (
     MinerTrainingConfig,
     MinerTrainingService,
@@ -89,7 +90,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # MinerTrainingConfig knobs (gtx_-prefixed in --agent.params; here we
     # accept the dropped-prefix CLI form for clarity).
-    parser.add_argument("--gtx-output-dir", default="data/live", type=Path)
+    parser.add_argument(
+        "--gtx-output-dir",
+        default=default_output_dir(),
+        type=Path,
+        help="Root directory for parquets, gradient cache, downloaded "
+        "checkpoints, and logs. Default resolves to "
+        "<repo>/data/live/ via Path(__file__).resolve().parents[3], "
+        "or $GENTRX_AGENT_OUTPUT_DIR if set.",
+    )
     parser.add_argument("--gtx-gradient-dir", default=None, type=Path)
     parser.add_argument("--gtx-train-steps", type=int, default=50)
     parser.add_argument("--gtx-train-batch-size", type=int, default=16)

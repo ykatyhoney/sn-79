@@ -174,6 +174,21 @@ _gentrx_miner_setup() {
     _info "Docs: doc/gentrx/miner_setup.md"
     echo
 
+    # ── Data directory ───────────────────────────────────────────────────────
+    _step "Miner data directory"
+    _info "Where the miner writes parquets, gradient cache, downloaded"
+    _info "checkpoints, pending-upload buffer, and rotating logs."
+    _info ""
+    _info "Default: <repo>/agents/data/<uid>/ resolved from the GenTRX"
+    _info "package path (Path(__file__).resolve()), independent of the"
+    _info "directory you launch from."
+    _info ""
+    _info "Override with an absolute path if your repo lives on a small"
+    _info "disk and you want data on a larger volume."
+    echo
+    local _default_data_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/agents/data"
+    _prompt GENTRX_AGENT_OUTPUT_DIR "Miner data directory" "$_default_data_dir"
+
     # ── Miner bucket ─────────────────────────────────────────────────────────
     _step "Miner gradient bucket"
     _info "Each miner needs one R2, Storj, or Hippius bucket for gradient uploads."
@@ -232,30 +247,6 @@ _gentrx_miner_setup() {
     _prompt_secret GENTRX_AGENT_S3_READ_ACCESS_KEY "Read-only access key ID"
     _prompt_secret GENTRX_AGENT_S3_READ_SECRET_KEY "Read-only secret access key"
     _ok "Miner S3 credentials saved to .env"
-
-    # ── Aggregator fallback ───────────────────────────────────────────────────
-    # On testnet/mainnet the gradient server reads uid-0's bucket from chain
-    # automatically (GenTRXChain.get_bucket(0)). These env vars are only needed
-    # as a fallback for local testing (MinIO) where no chain commitment exists yet.
-    if [ -n "${GENTRX_AGGREGATOR_S3_BUCKET:-}${GENTRX_AGGREGATOR_S3_ENDPOINT_URL:-}" ]; then
-        _step "uid-0 aggregator fallback credentials (local override)"
-        _info "GENTRX_AGGREGATOR_S3_BUCKET already set — skipping chain discovery for uid-0."
-        _info "On testnet/mainnet, leave these unset and the gradient server reads uid-0's"
-        _info "bucket from the chain commitment automatically."
-        echo
-        # Account ID is optional when a custom endpoint URL is already set (e.g. MinIO)
-        if [ -z "${GENTRX_AGGREGATOR_S3_ENDPOINT_URL:-}" ]; then
-            _prompt  GENTRX_AGGREGATOR_S3_ACCOUNT_ID    "uid-0 R2 account ID (or same as bucket for Hippius)"
-        fi
-        _prompt_secret GENTRX_AGGREGATOR_S3_READ_ACCESS_KEY   "uid-0 read access key ID"
-        _prompt_secret GENTRX_AGGREGATOR_S3_READ_SECRET_KEY   "uid-0 read secret access key"
-        if [ -z "${GENTRX_AGGREGATOR_S3_ENDPOINT_URL:-}" ] && [ -n "${GENTRX_AGGREGATOR_S3_ACCOUNT_ID:-}" ]; then
-            GENTRX_AGGREGATOR_S3_ENDPOINT_URL="https://${GENTRX_AGGREGATOR_S3_ACCOUNT_ID}.r2.cloudflarestorage.com"
-            _env_write "GENTRX_AGGREGATOR_S3_ENDPOINT_URL" "$GENTRX_AGGREGATOR_S3_ENDPOINT_URL"
-            export GENTRX_AGGREGATOR_S3_ENDPOINT_URL
-        fi
-        _ok "Aggregator fallback credentials saved"
-    fi
 
     # ── Chain commitment ──────────────────────────────────────────────────────
     _step "On-chain bucket commitment"

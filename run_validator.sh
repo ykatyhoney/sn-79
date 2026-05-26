@@ -333,67 +333,6 @@ _gentrx_validator_setup() {
     echo
     _ok "Validator S3 credentials saved to .env"
 
-    # ── Aggregator fallback (sibling only) — discover from chain ─────────────
-    if [ "$mode" = "sibling" ]; then
-        _step "uid-0 aggregator fallback"
-        _info "Sibling validators pull the canonical checkpoint from uid-0's bucket."
-
-        if [ -z "${GENTRX_AGGREGATOR_S3_BUCKET:-}" ]; then
-            _info "Querying chain for uid-0 bucket commitment..."
-            local _agg_info
-            _agg_info=$(python3 - <<PYEOF 2>/dev/null
-import sys
-try:
-    import bittensor as bt
-    from GenTRX.src.chain import GenTRXChain
-    sub = bt.Subtensor(network='$ENDPOINT')
-    meta = sub.metagraph($NETUID)
-    chain = GenTRXChain(sub, $NETUID, meta)
-    b = chain.get_bucket(0)
-    if b:
-        print('|'.join([b.account_id.strip(), b.endpoint_url, b.bucket_name,
-                         b.access_key_id.strip(), b.secret_access_key.strip()]))
-    else:
-        print('')
-except Exception:
-    print('')
-PYEOF
-)
-            if [ -n "$_agg_info" ]; then
-                IFS='|' read -r _agg_acid _agg_ep _agg_bucket _agg_ak _agg_sk <<< "$_agg_info"
-                GENTRX_AGGREGATOR_S3_ACCOUNT_ID="$_agg_acid"
-                GENTRX_AGGREGATOR_S3_ENDPOINT_URL="$_agg_ep"
-                GENTRX_AGGREGATOR_S3_BUCKET="$_agg_bucket"
-                GENTRX_AGGREGATOR_S3_READ_ACCESS_KEY="$_agg_ak"
-                GENTRX_AGGREGATOR_S3_READ_SECRET_KEY="$_agg_sk"
-                _env_write "GENTRX_AGGREGATOR_S3_ACCOUNT_ID"      "$_agg_acid"
-                _env_write "GENTRX_AGGREGATOR_S3_ENDPOINT_URL"    "$_agg_ep"
-                _env_write "GENTRX_AGGREGATOR_S3_BUCKET"          "$_agg_bucket"
-                _env_write "GENTRX_AGGREGATOR_S3_READ_ACCESS_KEY" "$_agg_ak"
-                _env_write "GENTRX_AGGREGATOR_S3_READ_SECRET_KEY" "$_agg_sk"
-                export GENTRX_AGGREGATOR_S3_ACCOUNT_ID GENTRX_AGGREGATOR_S3_ENDPOINT_URL \
-                       GENTRX_AGGREGATOR_S3_BUCKET GENTRX_AGGREGATOR_S3_READ_ACCESS_KEY \
-                       GENTRX_AGGREGATOR_S3_READ_SECRET_KEY
-                _ok "Aggregator bucket loaded from chain: $GENTRX_AGGREGATOR_S3_BUCKET"
-            else
-                _warn "Could not read uid-0 bucket from chain — please enter manually."
-                _info "Find these in the MVTRX Discord pinned message or SUBNET_BOOTSTRAP.md."
-                echo
-                _prompt        GENTRX_AGGREGATOR_S3_BUCKET             "uid-0 bucket name"
-                _prompt        GENTRX_AGGREGATOR_S3_ACCOUNT_ID         "uid-0 R2 account ID (or bucket name for Hippius)"
-                _prompt_secret GENTRX_AGGREGATOR_S3_READ_ACCESS_KEY    "uid-0 read access key ID"
-                _prompt_secret GENTRX_AGGREGATOR_S3_READ_SECRET_KEY    "uid-0 read secret access key"
-                if [ -z "${GENTRX_AGGREGATOR_S3_ENDPOINT_URL:-}" ] && [ -n "${GENTRX_AGGREGATOR_S3_ACCOUNT_ID:-}" ]; then
-                    GENTRX_AGGREGATOR_S3_ENDPOINT_URL="https://${GENTRX_AGGREGATOR_S3_ACCOUNT_ID}.r2.cloudflarestorage.com"
-                    _env_write "GENTRX_AGGREGATOR_S3_ENDPOINT_URL" "$GENTRX_AGGREGATOR_S3_ENDPOINT_URL"
-                    export GENTRX_AGGREGATOR_S3_ENDPOINT_URL
-                fi
-            fi
-        else
-            _ok "Aggregator bucket: ${GENTRX_AGGREGATOR_S3_BUCKET} [already set — skipping]"
-        fi
-    fi
-
     # ── Validator UID lookup ─────────────────────────────────────────────────
     _step "Looking up validator UID on chain"
     _info "Querying metagraph (netuid=$NETUID, network=$ENDPOINT)..."

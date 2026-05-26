@@ -1,91 +1,101 @@
 #!/usr/bin/env bash
-# Launch proxy test: proxy + agents + simulator [+ MinIO + gradient server in GenTRX mode]
-#
-# Usage:
-#   ./agents/proxy/run [--no-gentrx] <simulation_xml>
-#
-# Modes:
-#   (default)    Full GenTRX loop: proxy + simulator + agents + MinIO + gradient server
-#   --no-gentrx  Trading only:     proxy + simulator + agents (no S3, no gradient server)
-#
-# Stop:
-#   tmux kill-session -t proxy_test
-#   kill $(cat /tmp/gentrx_minio.pid) 2>/dev/null          # standalone binary (GenTRX mode)
-#   docker stop gentrx_minio && docker rm gentrx_minio      # Docker fallback (GenTRX mode)
-
 set -e
 
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 G=$(realpath "$SCRIPT_DIR/../..")
 
-GENTRX=1
+TRAIN=0
+NO_TMUX=0
+CONFIG="$SCRIPT_DIR/config.json"
+SIM_XML=""
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --no-gentrx) GENTRX=0; shift ;;
-        *) break ;;
+        --train)   TRAIN=1; shift ;;
+        --no-tmux) NO_TMUX=1; shift ;;
+        --config)  CONFIG="$2"; shift 2 ;;
+        --sim-xml) SIM_XML="$2"; shift 2 ;;
+        -h|--help)
+            cat <<EOF
+Usage: $0 [--train] [--no-tmux] [--config <path>] [--sim-xml <path>]
+
+  --train       trading + GenTRX: + MinIO + gradient server + S3 env
+  --no-tmux     headless single-process runner (delegates to launcher.py)
+  --config      path to config.json (default: agents/proxy/config.json)
+  --sim-xml     override proxy.simulation_xml from the config
+
+Stop:
+  tmux kill-session -t proxy_test
+EOF
+            exit 0 ;;
+        *) echo "Unknown arg: $1 (try --help)"; exit 1 ;;
     esac
 done
 
-# ---- Environment ----
-ENV_FILE="$G/.env"
-if [[ ! -f "$ENV_FILE" ]]; then
-    echo "ERROR: .env not found at $ENV_FILE"
-    echo "Copy .env.example to .env and fill in your paths."
+CONFIG="$(realpath "$CONFIG")"
+[[ -f "$CONFIG" ]] || { echo "ERROR: config not found: $CONFIG"; exit 1; }
+
+if command -v taosim &>/dev/null; then
+    :
+elif [[ -n "$TAOS_BUILD" && -x "$TAOS_BUILD/src/cpp/taosim" ]]; then
+    export PATH="$TAOS_BUILD/src/cpp:$PATH"
+elif [[ -x "$G/simulate/trading/build/src/cpp/taosim" ]]; then
+    export PATH="$G/simulate/trading/build/src/cpp:$PATH"
+else
+    echo "ERROR: 'taosim' not found."
+    echo "  Build it with: bash $G/install_simulator.sh"
+    echo "  Or set TAOS_BUILD=/path/to/simulate/trading/build so \$TAOS_BUILD/src/cpp/taosim exists."
     exit 1
 fi
-source "$ENV_FILE"
 
-export PATH="$TAOS_BUILD/src/cpp:$PATH"
-
-SIM_XML="${1:-}"
-if [[ -z "$SIM_XML" ]]; then
-    echo "Usage: $0 [--no-gentrx] <simulation_xml>"
-    exit 1
-fi
-SIM_XML="$(realpath "$SIM_XML")"
-[[ -f "$SIM_XML" ]] || { echo "ERROR: XML not found: $SIM_XML"; exit 1; }
-
-# Venv
 if [[ -n "$VIRTUAL_ENV" ]]; then
     VENV="$VIRTUAL_ENV/bin/activate"
 elif [[ -n "$TAOS_VENV" && -d "$TAOS_VENV" ]]; then
     VENV="$TAOS_VENV/bin/activate"
 else
-    echo "ERROR: No active venv and TAOS_VENV not set in .env"
-    exit 1
+    VENV=""
 fi
 
-command -v tmux &>/dev/null || { echo "ERROR: tmux not found"; exit 1; }
-command -v taosim &>/dev/null || echo "WARNING: taosim not in PATH (check TAOS_BUILD in .env)"
+if [[ "$NO_TMUX" = "0" ]]; then
+    command -v tmux &>/dev/null || { echo "ERROR: tmux not found (use --no-tmux for headless)"; exit 1; }
+fi
 
-# ---- GenTRX: MinIO (local S3) ----
-if [[ "$GENTRX" = "1" ]]; then
-    _MINIO_BIN="${TAOS_MINIO_BIN:-}"
-    [[ -z "$_MINIO_BIN" ]] && command -v minio &>/dev/null && _MINIO_BIN="minio"
-    if [[ -z "$_MINIO_BIN" ]] && ! command -v docker &>/dev/null; then
-        echo "WARNING: neither 'minio' binary nor 'docker' found — setup_minio will fail"
-        echo "  Install: curl -o ~/bin/minio https://dl.min.io/server/minio/release/linux-amd64/minio && chmod +x ~/bin/minio"
+if [[ "$TRAIN" = "1" ]]; then
+    HAS_TRAINING=$(python3 -c "import json; c=json.load(open('$CONFIG')); print(1 if 'training' in c and 'gradient_server' in c.get('training',{}) else 0)")
+    if [[ "$HAS_TRAINING" != "1" ]]; then
+        echo "ERROR: --train requires a 'training.gradient_server' block in $CONFIG."
+        echo "  Use agents/proxy/config.train.example.json as a template, or run without --train for trading-only."
+        exit 1
     fi
+    N_AGENTS=$(python3 -c "import json; c=json.load(open('$CONFIG')); print(c.get('training',{}).get('n_agents',2))")
+    export GENTRX_N_AGENTS="$N_AGENTS"
+    VAL_DATA=$(python3 -c "
+import json, os
+c = json.load(open('$CONFIG'))
+v = c.get('training',{}).get('gradient_server',{}).get('val_data','')
+if v:
+    if not os.path.isabs(v):
+        anchor = '$SCRIPT_DIR' if v.startswith('..') or v.startswith('./') else '$G'
+        v = os.path.realpath(os.path.join(anchor, v))
+    print(v)
+")
+    [[ -n "$VAL_DATA" ]] && mkdir -p "$VAL_DATA"
     source "$SCRIPT_DIR/setup_minio"
     source "$SCRIPT_DIR/wipe_bucket"
 fi
 
-# ---- Generate config ----
-CONFIG="$SCRIPT_DIR/config.json"
-mkdir -p "$G/data/proxy_test"
+TRAIN_FLAG=""
+[[ "$TRAIN" = "1" ]] && TRAIN_FLAG="--train"
 
-GENTRX_ROOT="$G" TAOS_PROXY="$TAOS_PROXY" TAOS_BUILD="$TAOS_BUILD" \
-    python3 "$G/GenTRX/src/util/gen_config.py" \
-        --sim-xml "$SIM_XML" \
-        --grad-port 8100 \
-        --output "$CONFIG" \
-        --n-agents 2
+SIM_XML_ARGS=()
+[[ -n "$SIM_XML" ]] && SIM_XML_ARGS=(--sim-xml "$(realpath "$SIM_XML")")
 
-# ---- Launch ----
-GENTRX_FLAG="--no-gentrx"
-[[ "$GENTRX" = "1" ]] && GENTRX_FLAG="--gentrx"
-
-"$SCRIPT_DIR/launcher" \
-    --config "$CONFIG" \
-    --venv "$VENV" \
-    "$GENTRX_FLAG"
+if [[ "$NO_TMUX" = "1" ]]; then
+    PY="${VIRTUAL_ENV:+$VIRTUAL_ENV/bin/python}"
+    PY="${PY:-python3}"
+    exec "$PY" "$SCRIPT_DIR/launcher.py" --config "$CONFIG" $TRAIN_FLAG "${SIM_XML_ARGS[@]}"
+else
+    VENV_ARGS=()
+    [[ -n "$VENV" ]] && VENV_ARGS=(--venv "$VENV")
+    exec "$SCRIPT_DIR/launcher" --config "$CONFIG" $TRAIN_FLAG "${VENV_ARGS[@]}" "${SIM_XML_ARGS[@]}"
+fi

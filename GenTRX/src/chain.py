@@ -196,24 +196,11 @@ class BucketInfo:
 
     @classmethod
     def from_aggregator_env(cls) -> BucketInfo | None:
-        """Build BucketInfo from aggregator/checkpoint bucket environment variables.
+        """Last-resort env-var pointer to uid-0's checkpoint bucket.
 
-        Used by the validator to commit the aggregator bucket's read credentials
-        to chain so miners can discover the checkpoint bucket without pre-configuration.
-
-        Required:
-            GENTRX_AGGREGATOR_S3_BUCKET — bucket name
-
-        Read-only credentials (committed on-chain):
-            GENTRX_AGGREGATOR_S3_READ_ACCESS_KEY (falls back to GENTRX_AGGREGATOR_S3_ACCESS_KEY)
-            GENTRX_AGGREGATOR_S3_READ_SECRET_KEY (falls back to GENTRX_AGGREGATOR_S3_SECRET_KEY)
-
-        Optional:
-            GENTRX_AGGREGATOR_S3_PROVIDER    — "r2" | "storj" | "hippius" (provider hint)
-            GENTRX_AGGREGATOR_S3_ACCOUNT_ID — Cloudflare account ID (R2 only)
-            GENTRX_CHAIN_ENDPOINT_OVERRIDE   — S3 endpoint override for local dev
-
-        Returns None if required env vars are missing.
+        Returns None unless the operator has populated GENTRX_AGGREGATOR_S3_BUCKET
+        plus a read key pair. The normal discovery path is the chain commitment;
+        these env vars exist only for operator overrides.
         """
         import os
 

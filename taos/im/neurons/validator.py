@@ -753,7 +753,8 @@ if __name__ != "__mp_main__":
 
                     def _get_current_block():
                         try:
-                            return self.subtensor.get_current_block()
+                            with self._subtensor_lock:
+                                return self.subtensor.get_current_block()
                         except Exception:
                             return 0
 
@@ -3411,6 +3412,7 @@ if __name__ != "__mp_main__":
                 'gentrx_enabled': self._gentrx is not None,
                 'gentrx_training': self._gentrx.get_training_stats() if self._gentrx is not None else {},
                 'gentrx_scores_detailed': self._gentrx.get_scores() if self._gentrx is not None else {},
+                'gentrx_config': self._gentrx.get_config() if self._gentrx is not None else {},
                 'miner_stats': self.miner_stats,
                 'initial_balances': self.initial_balances,
                 'initial_balances_published': self.initial_balances_published,

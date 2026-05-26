@@ -2,9 +2,7 @@
 
 This directory contains tools allowing for the offline testing of miner trading agents against a local instance of the simulation.  Testing is achieved by the use of a "Proxy", which is a descendant of the main taos.im validator class with the Bittensor network functions and requirements removed so as to be run without any other preparations (e.g. localnet subtensor configuration) necessary.  The proxy receives state messages from the simulator and forwards them to agents running on the local machine, parses the instructions returned by agents and submits them to the simulation.  This enables miners to check, debug and evaluate the function and behaviour of their strategies in the base simulated market before deploying to mainnet where they will interact with a simulation having the same background configuration but including of course also the other miner agents.  Agents developed and tested using these tools can be immediately deployed in association with miners on testnet or mainnet.
 
-> **GenTRX testing**: `agents/proxy/run` (default) wires up MinIO, the gradient
-> server, and GenTRX training agents on top of `proxy.py`. Pass `--no-gentrx`
-> for a pure-trading proxy test with no S3 or gradient server.
+> **GenTRX testing**: `agents/proxy/run` defaults to trading-only (proxy + agents + simulator). Pass `--train` to additionally wire up MinIO, the gradient server, and GenTRX training on top of `proxy.py`.
 
 ## Installation
 
@@ -16,17 +14,34 @@ pip install -e .
 ```
 
 ## Config
-The distributed agent/proxy setup is configured by means of a JSON configuration file in this directory; an example configuration (loaded by default if running proxy or launcher without args) is given in `config.json`.  The structure is:
+The distributed agent/proxy setup is configured by means of a JSON configuration file in this directory.  The default config loaded when running `./agents/proxy/run` without args is `config.json`.  Two canonical templates sit alongside it: `config.example.json` (trading only) and `config.train.example.json` (with GenTRX training); pass `--config <path>` to override the default.  The structure is:
 - `proxy` : Proxy configuration options.
   - `port` : Port number on which proxy will listen for state updates from simulator (must match `Simulation.port` in simulation XML config). \[default=`8000`\]
-  - `simulation_xml` : Path to the XML config used to launch the simulation. \[default=`"../../simulate/trading/run/config/simulation_0.xml"` (the current active simulation config in live)\]
+  - `simulation_xml` : Path to the XML config used to launch the simulation.  Resolved relative to `agents/proxy/` when it begins with `./` or `..`, otherwise relative to the repo root. \[default=`"../../simulate/trading/run/config/simulation_0.xml"`\]
   - `timeout` : The number of seconds that proxy will await response from agent before moving on. \[default=`5`\]
+  - `gradient_server_url` : Gradient server base URL for GenTRX training.  Required only when running with `--train`; omit (or leave empty) for trading-only runs.  Typically `"http://127.0.0.1:8100/gentrx"` for single-host setups.
 - `agents` : Configuration for distributed agents.
   - `start_port` : Base port where first distributed agent will be hosted.  When multiple agents are configured, the port for each will be increased by 1. \[default=`8888`\]
   - `path` : Path where agent definition files are found. \[default=`..`\]
   - `<agent_file_name>` : Other entries in the `agents` config define the agents which are to be hosted; use the file name of the agent in the `agents.path` directory (without `.py` extension) as the key to specify a group of this class of agent.  This field contains a list of definitions for the variations/copies of this agent to be run in the experiment:
     - `params` : For each item in the list, define the strategy params to be used.
     - `count` : This number of the class of agents will be launched with the associated params.
+- `taosim` : Simulator process options.
+  - `bin` : Name (resolved on `$PATH`) or absolute path of the `taosim` binary launched by the runner. \[default=`"taosim"`\]
+  - `delay` : Seconds the launcher waits between starting the proxy and starting the simulator, so the proxy's HTTP listener is ready before the simulator emits its first state update. \[default=`5`\]
+- `training` : GenTRX training options (only consumed when `./agents/proxy/run --train` is used; ignored otherwise).
+  - `n_agents` : Number of agent buckets to provision on the local MinIO (one bucket per agent slot).
+  - `gradient_server` : Standalone gradient-server process configuration.
+    - `port` : Port the gradient server binds to. \[default=`8100`, must match `proxy.gradient_server_url`\]
+    - `checkpoint` : Path to the bootstrap checkpoint (relative to repo root). \[default=`"checkpoints/GenTRX/best.pt"`\]
+    - `val_data` : Held-out validation parquet directory. \[default=`"data/proxy_test/server"`\]
+    - `output` : Path the gradient server writes the latest checkpoint to. \[default=`"checkpoints/GenTRX/latest.pt"`\]
+    - `interval` : Seconds between aggregation rounds. \[default=`30`\]
+    - `min_score` : Reject gradients scoring below this threshold. \[default=`-0.1`\]
+    - `mode` : Engine mode the gradient server is associated with — currently `"simulation"`.
+  - `minio` : Local MinIO bring-up.
+    - `port` : S3 API port. \[default=`9000`\]
+    - `console` : Web console port. \[default=`9091`\]
 
 ## Proxy
 
@@ -41,9 +56,9 @@ The file `proxy.py` contains an implementation of a handler for processing messa
 ```
 This agent publishes the full state of the simulation to the configured port on localhost at an interval defined in simulation time via the `Simulation.step` field in the XML.  The Python proxy receives messages published from the simulator by this agent, parses them to a `MarketSimulationStateUpdate` synapse format, and forwards to the configured list of (locally hosted) distributed trading agents.  The proxy then awaits responses from the distributed agents, and when received will validate, parse to the correct format and return the instructions to the simulator for processing. 
 
-To launch the proxy, simply run in this directory:
+For the full local test stack — proxy + agents + simulator (and, with `--train`, MinIO + gradient server) — use the orchestrated runner from the repo root: `./agents/proxy/run [--train]`.  To launch only the proxy FastAPI server directly (useful for debugging the proxy in isolation, without the simulator or agents), run from this directory:
 ```shell
-python proxy.py --config <config_file='config.json'>`
+python proxy.py --config <config_file='config.json'>
 ```
 
 ## Agents
@@ -111,23 +126,38 @@ You should observe logs from the proxy indicating start of the simulation, recei
 
 ## Automated launcher
 
-For GenTRX or multi-agent proxy tests, the `run` script handles MinIO, config generation, and tmux layout automatically:
+The `run` script wires up the proxy, agents, simulator, and (in `--train` mode) MinIO + gradient server, then arranges them in a tmux session.
 
 ```bash
-# GenTRX mode (default) — starts MinIO, gradient server, and training agents
-./agents/proxy/run simulate/trading/run/config/simulation_0.xml
+# Trading-only — proxy + simulator + agents, no S3 or gradient server
+./agents/proxy/run
 
-# Trading-only mode — proxy + simulator + agents, no S3 or gradient server
-./agents/proxy/run --no-gentrx simulate/trading/run/config/simulation_0.xml
+# Training mode — adds MinIO, gradient server, and GenTRX training
+./agents/proxy/run --train
+
+# Headless (no tmux), useful for CI or single-terminal debugging
+./agents/proxy/run --no-tmux
+./agents/proxy/run --train --no-tmux
+
+# Override the config file or simulation XML
+./agents/proxy/run --config /path/to/custom.json
+./agents/proxy/run --sim-xml /path/to/custom_simulation.xml
 ```
 
-Tmux layout (GenTRX mode):
+The config defaults to `agents/proxy/config.json`. Reference examples are alongside it:
+
+- `agents/proxy/config.example.json` — minimal trading-only template
+- `agents/proxy/config.train.example.json` — full training-mode template
+
+Tmux layout (training mode):
 
 | Window | Panes |
 |---|---|
 | `minio` | MinIO logs |
 | `proxy-sim` | proxy.py (left) \| taosim (right) |
 | `grad-agents` | gradient server (top) \| one pane per agent (below) |
+
+Tmux layout (trading mode): `proxy-sim` + `agents`.
 
 Stop: `tmux kill-session -t proxy_test`
 

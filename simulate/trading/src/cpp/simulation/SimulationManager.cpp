@@ -8,6 +8,7 @@
 #include <taosim/filesystem/utils.hpp>
 #include <taosim/message/MultiBookMessagePayloads.hpp>
 #include <taosim/message/PayloadFactory.hpp>
+#include <taosim/process/helpers.hpp>
 #include <taosim/replay/helpers.hpp>
 #include <taosim/serialization/msgpack/common.hpp>
 #include <taosim/serialization/msgpack/utils.hpp>
@@ -677,10 +678,12 @@ std::unique_ptr<SimulationManager> SimulationManager::fromConfig(
 
     mngr->setupLogDir(node, baseDir);
 
+    taosim::process::helpers::initSharedResources(mngr->m_sharedResources, node);
+
     mngr->m_simulations.reserve(mngr->m_blockInfo.count);
     for (size_t blockIdx = 0; blockIdx < mngr->m_blockInfo.count; ++blockIdx) {
         auto simulation = std::make_unique<Simulation>(
-            blockIdx, mngr->m_blockInfo.dimension, mngr->m_logDir);
+            blockIdx, mngr->m_blockInfo.dimension, mngr->m_logDir, &mngr->m_sharedResources);
         simulation->configure(node);
         mngr->m_simulations.push_back(std::move(simulation));
         printProgress(blockIdx + 1, mngr->m_blockInfo.count, "Configuring blocks");
@@ -882,12 +885,13 @@ std::unique_ptr<SimulationManager> SimulationManager::fromReplay(const replay::R
         });
 
     mngr->setupLogDir(node, desc.dir.parent_path());
+    taosim::process::helpers::initSharedResources(mngr->m_sharedResources, node);
     mngr->m_simulations = [&] {
         std::vector<std::unique_ptr<Simulation>> res;
         res.reserve(mngr->m_blockInfo.count);
         for (uint32_t blockIdx{}; blockIdx < mngr->m_blockInfo.count; ++blockIdx) {
             auto simulation = std::make_unique<Simulation>(
-                blockIdx, mngr->m_blockInfo.dimension, mngr->m_logDir, true, desc);
+                blockIdx, mngr->m_blockInfo.dimension, mngr->m_logDir, &mngr->m_sharedResources, true, desc);
             simulation->configure(node);
             res.push_back(std::move(simulation));
             printProgress(blockIdx + 1, mngr->m_blockInfo.count, "Configuring blocks");

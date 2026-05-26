@@ -14,8 +14,14 @@ Two bucket types, each committed on-chain (state arrives over HTTP — no state 
   - Per-miner buckets (GENTRX_AGENT_S3_*): gradients/ — one per miner
 
 Run standalone:
-    python -m GenTRX.src.gradient_server --checkpoint checkpoints/GenTRX/best.pt \\
-        --val-data data/server --subtensor-network local --netuid 1
+    python -m GenTRX.src.gradient_server \\
+        --checkpoint $REPO/checkpoints/GenTRX/best.pt \\
+        --val-data $REPO/data/server \\
+        --subtensor-network local --netuid 1
+
+All filesystem paths are resolved to absolute at construction. Pass
+absolute paths or `$VAR`-expanded paths to keep the invocation
+independent of the launching shell's CWD.
 """
 
 from __future__ import annotations
@@ -25,6 +31,7 @@ import json as _json
 import logging
 import os
 import random
+import secrets
 import threading
 import time
 from collections import deque
@@ -194,6 +201,7 @@ class GradientAggregator:
         proposal_norm_ratio: float = 10.0,
         keep_checkpoints: int = 10,
         keep_proposals: int = 10,
+        s3_cache_retention_hours: float = 24.0,
         blocks_per_round: int = 25,
         block_time_s: float = 12.0,
         validator_uid: str = "",
@@ -206,11 +214,23 @@ class GradientAggregator:
             str(validator_uid) if validator_uid not in (None, "") else "0"
         )
         self._bucket_prefix: str = bucket_prefix
-        self.checkpoint_path = Path(checkpoint_path)
-        self.val_data_path = val_data_path
-        self.output_path = Path(output_path or checkpoint_path)
+        # Resolve all filesystem paths to absolute at construction time.
+        # If the operator passes a relative --checkpoint, the audit log
+        # and any derived paths would otherwise depend on the launching
+        # process's CWD.
+        self.checkpoint_path = Path(checkpoint_path).expanduser().resolve()
+        self.val_data_path = (
+            str(Path(val_data_path).expanduser().resolve())
+            if val_data_path
+            else val_data_path
+        )
+        self.output_path = (
+            Path(output_path).expanduser().resolve()
+            if output_path
+            else self.checkpoint_path
+        )
         self.log_path = (
-            Path(log_path)
+            Path(log_path).expanduser().resolve()
             if log_path
             else self.output_path.parent / "aggregation.jsonl"
         )
@@ -229,6 +249,8 @@ class GradientAggregator:
         # Defaults: 10 checkpoints (~470 MB at 47 MB each), 10 proposals.
         self.keep_checkpoints = keep_checkpoints
         self.keep_proposals = keep_proposals
+        self.s3_cache_retention_hours = s3_cache_retention_hours
+        self._last_s3_cache_prune: float = 0.0
         # Round-completion fallback timing. The validator drives round
         # closure via POST /gentrx/round (block-sync); these only feed the
         # fallback that fires when the validator stops pushing.
@@ -389,9 +411,9 @@ class GradientAggregator:
         # scored 0.
         self._pending_aggregation_at: dict[int, float] = {}
 
-        # Global val/train book split (deterministic from seed)
         self._all_books: list[str] = []
-        self._val_book_set: set[str] | None = None
+        self._round_val_seeds: dict[int, int] = {}
+        self._round_val_books: dict[int, frozenset[str]] = {}
         self._seed = seed
 
         # Track simulation progress (updated as data arrives)
@@ -519,36 +541,42 @@ class GradientAggregator:
 
         return []
 
-    def _get_val_books(self) -> set[str]:
-        """Global val book set (deterministic from seed, stable across rounds)."""
-        if self._val_book_set is not None:
-            return self._val_book_set
+    def _get_val_books(self, round_id: int | None = None) -> set[str]:
+        if round_id is None:
+            round_id = getattr(self, "_agg_round", 0)
+
+        cached = self._round_val_books.get(round_id)
+        if cached is not None:
+            return set(cached)
 
         if not self._all_books:
             self._all_books = self._discover_books()
         if not self._all_books:
             return set()
 
+        seed = self._round_val_seeds.get(round_id)
+        if seed is None:
+            seed = secrets.randbits(64) if round_id > 0 else self._seed
+            self._round_val_seeds[round_id] = seed
+
         n_val = max(1, int(len(self._all_books) * self.val_fraction))
-        rng = random.Random(self._seed)
-        self._val_book_set = set(
-            rng.sample(self._all_books, min(n_val, len(self._all_books)))
-        )
+        rng = random.Random(seed)
+        val_set = set(rng.sample(self._all_books, min(n_val, len(self._all_books))))
+        self._round_val_books[round_id] = frozenset(val_set)
         logger.info(
-            "Val books: %s (%d/%d, val_fraction=%.2f, seed=%d)",
-            sorted(self._val_book_set),
-            len(self._val_book_set),
+            "Val books (round %d): %s (%d/%d, val_fraction=%.2f)",
+            round_id,
+            sorted(val_set),
+            len(val_set),
             len(self._all_books),
             self.val_fraction,
-            self._seed,
         )
-        return self._val_book_set
+        return val_set
 
-    def _get_train_books(self) -> list[str]:
-        """Train books (all books minus val books)."""
+    def _get_train_books(self, round_id: int | None = None) -> list[str]:
         if not self._all_books:
             self._all_books = self._discover_books()
-        val = self._get_val_books()
+        val = self._get_val_books(round_id)
         return [b for b in self._all_books if b not in val]
 
     def update_max_timestamp(self, ts_ns: int) -> None:
@@ -632,7 +660,7 @@ class GradientAggregator:
             return
 
         max_start = max_ts - self.window_ns
-        train_books = self._get_train_books()
+        train_books = self._get_train_books(self._agg_round)
         if not train_books:
             train_books = list(self._all_books)
 
@@ -713,7 +741,7 @@ class GradientAggregator:
             return
 
         max_start = max_ts - self.window_ns
-        train_books = self._get_train_books()
+        train_books = self._get_train_books(self._agg_round)
         if not train_books:
             train_books = list(self._all_books)
 
@@ -885,7 +913,7 @@ class GradientAggregator:
         Uses the global val book split. Reads all available data for val books
         from S3 or local filesystem.
         """
-        val_books = self._get_val_books()
+        val_books = self._get_val_books(self._agg_round)
         if not val_books:
             return []
 
@@ -906,12 +934,15 @@ class GradientAggregator:
     # ------------------------------------------------------------------
 
     def _get_s3_cache_dir(self) -> Path:
-        """Get or create the local cache directory for S3 parquets."""
-        if self._s3_cache_dir is None:
-            import tempfile
+        """Local mirror of validator parquets.
 
-            self._s3_cache_dir = Path(tempfile.mkdtemp(prefix="gentrx_s3_cache_"))
+        Deterministic path under output_path.parent so restarts reuse the
+        same directory instead of leaking a fresh tempdir each launch.
+        """
+        if self._s3_cache_dir is None:
+            self._s3_cache_dir = self.output_path.parent / "s3_cache"
             logger.info("S3 data cache: %s", self._s3_cache_dir)
+        self._s3_cache_dir.mkdir(parents=True, exist_ok=True)
         return self._s3_cache_dir
 
     def _fetch_s3_book_files(
@@ -957,6 +988,13 @@ class GradientAggregator:
                 continue
 
             local_path = cache_dir / str(book_id) / "intervals" / fname
+            if local_path.is_file() and local_path.stat().st_size > 0:
+                # Warm cache from a prior process: file already on disk
+                # under the deterministic cache dir. Register and skip download.
+                self._s3_cached_files[cache_key] = local_path
+                local_files.append(local_path)
+                continue
+
             local_path.parent.mkdir(parents=True, exist_ok=True)
             try:
                 data = self.validator_store.get_data(
@@ -1022,7 +1060,7 @@ class GradientAggregator:
             return cached
         self._loader_cache_misses += 1
 
-        val_books = self._get_val_books()
+        val_books = self._get_val_books(self._agg_round)
         if not val_books:
             return None
 
@@ -1085,6 +1123,7 @@ class GradientAggregator:
         event["timestamp"] = time.time()
         event.setdefault("sim_id", self._sim_id)
         event.setdefault("sim_epoch", self._sim_epoch)
+        self._rotate_log_if_large()
         with open(self.log_path, "a") as f:
             f.write(_json.dumps(event) + "\n")
         # Mirror aggregation events into the snapshot dict + counters so
@@ -1152,6 +1191,35 @@ class GradientAggregator:
         except Exception:
             pass  # logging must never break the caller
 
+    def _rotate_log_if_large(
+        self, max_bytes: int = 50 * 1024 * 1024, keep: int = 5
+    ) -> None:
+        """Size-based rotation for the JSONL audit log.
+
+        Written via raw `open(..., "a")`, so RotatingFileHandler doesn't
+        apply. Check size before each append. After rotation the file
+        does not exist; the next `open("a")` creates it fresh.
+        """
+        try:
+            if not self.log_path.exists():
+                return
+            if self.log_path.stat().st_size < max_bytes:
+                return
+
+            def _backup(i: int) -> Path:
+                return self.log_path.with_name(f"{self.log_path.name}.{i}")
+
+            oldest = _backup(keep)
+            if oldest.exists():
+                oldest.unlink()
+            for i in range(keep - 1, 0, -1):
+                src = _backup(i)
+                if src.exists():
+                    src.rename(_backup(i + 1))
+            self.log_path.rename(_backup(1))
+        except Exception:
+            pass  # rotation must never break the caller
+
     def _sync_from_uid0(self) -> bool:
         """Download the latest checkpoint from uid 0's chain-committed bucket.
 
@@ -1173,23 +1241,16 @@ class GradientAggregator:
             if self._chain is not None:
                 bucket_info = self._chain.get_bucket(0)
 
-            # Fallback: GENTRX_AGGREGATOR_S3_* env vars. Operators running a
-            # sibling validator set these to the aggregator's published read
-            # credentials so checkpoint sync keeps working when the chain
-            # commitment has not propagated (or chain RPC is flaky).
             if bucket_info is None:
                 bucket_info = BucketInfo.from_aggregator_env()
                 if bucket_info is not None:
                     logger.info(
                         "uid-0 chain bucket unavailable; using "
-                        "GENTRX_AGGREGATOR_S3_* env fallback"
+                        "GENTRX_AGGREGATOR_S3_* env override"
                     )
 
             if bucket_info is None:
-                logger.debug(
-                    "No uid-0 bucket available (chain empty and no "
-                    "GENTRX_AGGREGATOR_S3_* fallback); skipping sync"
-                )
+                logger.debug("No uid-0 bucket available; skipping sync")
                 return False
 
             store = GradientStore(
@@ -1514,6 +1575,14 @@ class GradientAggregator:
                 # cleanup never overlaps a fresh assignment creation.
                 if self._data_cleanup_pending:
                     self._run_data_cleanup()
+
+                # Rolling eviction of the local parquet mirror. Throttled to
+                # once per 5 min — the cost is a recursive directory scan,
+                # cheap but not free.
+                _now = time.time()
+                if _now - self._last_s3_cache_prune > 300:
+                    self._prune_s3_cache()
+                    self._last_s3_cache_prune = _now
 
                 # Flush any book whose interval has elapsed by wall-clock sim
                 # time even if no new event has arrived for it.  Without this,
@@ -2867,6 +2936,13 @@ class GradientAggregator:
                 "rounds_aggregated_total": self._rounds_aggregated_total,
                 "rollbacks_total": self._rollbacks_total,
             },
+            "config": {
+                "min_score": self.min_score,
+                "overfit_penalty": self.overfit_penalty,
+                "overfit_ratio": self.overfit_ratio,
+                "books_per_miner": self.books_per_miner,
+                "val_fraction": self.val_fraction,
+            },
         }
 
     def _fetch_validator_proposals(
@@ -3183,28 +3259,81 @@ class GradientAggregator:
         except Exception as exc:
             logger.debug("proposal prune failed: %s", exc)
 
-    def _run_data_cleanup(self) -> int:
-        """Delete stale parquets under data/ in the validator bucket.
+    def _prune_s3_cache(self) -> int:
+        """Evict local mirror parquets older than s3_cache_retention_hours.
 
-        Returns the number of objects removed. No-op when no validator
-        store is configured (proxy-only setups, or bootstrap before S3 is
-        wired). Clears `_data_cleanup_pending` even on failure so one
-        transient S3 error does not loop the cleanup attempt forever.
+        No-op when retention is disabled (<=0) or the cache dir has not
+        been created yet. Also drops stale `_s3_cached_files` entries that
+        point at unlinked files.
+        """
+        if self.s3_cache_retention_hours <= 0 or self._s3_cache_dir is None:
+            return 0
+        if not self._s3_cache_dir.exists():
+            return 0
+        cutoff = time.time() - self.s3_cache_retention_hours * 3600.0
+        removed = 0
+        for path in self._s3_cache_dir.rglob("*.parquet"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    removed += 1
+            except OSError:
+                continue
+        if removed:
+            stale = [k for k, p in self._s3_cached_files.items() if not p.is_file()]
+            for k in stale:
+                del self._s3_cached_files[k]
+            logger.info(
+                "[GTX] s3_cache eviction: removed %d file(s) older than %.0fh",
+                removed,
+                self.s3_cache_retention_hours,
+            )
+        return removed
+
+    def _clear_local_data_cache(self) -> None:
+        """Wipe the local s3_cache mirror on sim transition.
+
+        Pairs with the S3-side `delete_prefix(data/<uid>/)` so the next sim
+        starts from a clean local mirror as well as a clean bucket.
+        """
+        import shutil
+
+        self._s3_cached_files.clear()
+        if self._loader_cache:
+            self._loader_cache.clear()
+        if self._s3_cache_dir is not None and self._s3_cache_dir.exists():
+            try:
+                shutil.rmtree(self._s3_cache_dir)
+                logger.info("[GTX] Local data cache wiped: %s", self._s3_cache_dir)
+            except OSError as exc:
+                logger.warning("Local data cache wipe failed: %s", exc)
+
+    def _run_data_cleanup(self) -> int:
+        """Delete stale parquets under data/ in the validator bucket and
+        wipe the local mirror.
+
+        Returns the number of S3 objects removed. No-op on the S3 side when
+        no validator store is configured (proxy-only setups, or bootstrap
+        before S3 is wired); the local mirror is wiped regardless. Clears
+        `_data_cleanup_pending` even on failure so one transient S3 error
+        does not loop the cleanup attempt forever.
         """
         self._data_cleanup_pending = False
-        if self.validator_store is None:
-            return 0
-        try:
-            n = self.validator_store.delete_prefix(f"data/{self._validator_uid}/")
-            if n:
-                logger.info(
-                    "[GTX] Sim transition cleanup: removed %d parquets from data/",
-                    n,
+        n = 0
+        if self.validator_store is not None:
+            try:
+                n = self.validator_store.delete_prefix(
+                    f"data/{self._validator_uid}/"
                 )
-            return n
-        except Exception as exc:
-            logger.warning("Sim transition cleanup failed: %s", exc)
-            return 0
+                if n:
+                    logger.info(
+                        "[GTX] Sim transition cleanup: removed %d parquets from data/",
+                        n,
+                    )
+            except Exception as exc:
+                logger.warning("Sim transition cleanup failed: %s", exc)
+        self._clear_local_data_cache()
+        return n
 
     def _process_tick(self, tick: dict) -> None:
         """Process a single sim state tick into training rows.
@@ -3506,12 +3635,13 @@ class GradientAggregator:
             table = pa.table(columns, schema=order_stream_schema())
             buf = _io.BytesIO()
             pq.write_table(table, buf)
+            parquet_bytes = buf.getvalue()
             # Write parquets to data bucket (read by miners + validator)
             self.validator_store.put_data(
                 self._validator_uid,
                 book_id=book_id,
                 filename=pq_filename,
-                data=buf.getvalue(),
+                data=parquet_bytes,
             )
             logger.debug(
                 "Parquet flushed: book %d, %d rows, %s",
@@ -3519,6 +3649,22 @@ class GradientAggregator:
                 len(rows),
                 pq_filename,
             )
+            # Mirror to local cache so scoring reads hit disk instead of
+            # round-tripping back through S3 for data this process just wrote.
+            try:
+                cache_dir = self._get_s3_cache_dir()
+                local_path = cache_dir / str(book_id) / "intervals" / pq_filename
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                local_path.write_bytes(parquet_bytes)
+                self._s3_cached_files[f"{book_id}/{pq_filename}"] = local_path
+            except Exception as exc:
+                logger.debug(
+                    "Local parquet mirror failed (book %d, %s): %s; "
+                    "scoring will fall back to S3 download",
+                    book_id,
+                    pq_filename,
+                    exc,
+                )
             # Register and clear only on success — failed writes leave rows
             # intact so the next interval flush retries with the accumulated data.
             if book_id not in self._written_parquets:
@@ -4119,6 +4265,14 @@ if __name__ == "__main__":
         "Set 0 to disable pruning.",
     )
     parser.add_argument(
+        "--s3-cache-retention-hours",
+        type=float,
+        default=24.0,
+        help="Evict local parquet mirror (under <output>/s3_cache/) files "
+        "older than this. Default 24h. Set 0 to disable rolling eviction "
+        "(the sim-end wipe still runs).",
+    )
+    parser.add_argument(
         "--window-ns",
         type=int,
         default=None,
@@ -4328,6 +4482,7 @@ if __name__ == "__main__":
         window_ns=args.window_ns,
         keep_checkpoints=args.keep_checkpoints,
         keep_proposals=args.keep_proposals,
+        s3_cache_retention_hours=args.s3_cache_retention_hours,
         blocks_per_round=args.blocks_per_round,
         block_time_s=args.block_time_s,
         validator_uid=args.validator_uid,

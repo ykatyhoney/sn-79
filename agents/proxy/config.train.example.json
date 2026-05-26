@@ -2,7 +2,8 @@
     "proxy": {
         "port": 8000,
         "simulation_xml": "../../simulate/trading/run/config/simulation_0.xml",
-        "timeout": 5
+        "timeout": 3,
+        "gradient_server_url": "http://127.0.0.1:8100/gentrx"
     },
     "agents": {
         "path": "..",
@@ -15,7 +16,7 @@
                     "expiry_period": 200000000000,
                     "lazy_load": 1
                 },
-                "count": 8
+                "count": 2
             }
         ],
         "RandomTakerAgent": [
@@ -25,12 +26,28 @@
                     "max_quantity": 2.0,
                     "lazy_load": 1
                 },
-                "count": 8
+                "count": 2
             }
         ]
     },
     "taosim": {
         "bin": "taosim",
         "delay": 5
+    },
+    "training": {
+        "n_agents": 4,
+        "gradient_server": {
+            "port": 8100,
+            "checkpoint": "checkpoints/GenTRX/best.pt",
+            "val_data": "data/proxy_test/server",
+            "output": "checkpoints/GenTRX/latest.pt",
+            "interval": 30,
+            "min_score": -0.1,
+            "mode": "simulation"
+        },
+        "minio": {
+            "port": 9000,
+            "console": 9091
+        }
     }
 }

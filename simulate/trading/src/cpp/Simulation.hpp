@@ -10,6 +10,7 @@
 #include "LocalAgentManager.hpp"
 #include <taosim/message/Message.hpp>
 #include <taosim/message/MessageQueue.hpp>
+#include <taosim/simulation/SharedResources.hpp>
 #include <taosim/simulation/SimulationConfig.hpp>
 #include <taosim/simulation/SimulationSignals.hpp>
 #include <taosim/simulation/SimulationState.hpp>
@@ -38,6 +39,7 @@ public:
         uint32_t blockIdx,
         uint32_t blockDim,
         const fs::path& logDir,
+        const taosim::simulation::SharedResources* sharedResources,
         bool replayMode = false,
         taosim::replay::ReplayDesc = {});
 
@@ -119,6 +121,7 @@ public:
     [[nodiscard]] std::string_view id() const noexcept { return m_id; }
     [[nodiscard]] std::string_view configSv() const noexcept { return m_config; }
     [[nodiscard]] auto&& state(this auto&& self) noexcept { return self.m_state; }
+    [[nodiscard]] const taosim::simulation::SharedResources* sharedResources() const noexcept { return m_sharedResources; }
 
     [[nodiscard]] bool shouldAdjustLimitPrice(Message::Ptr msg) const noexcept
     {
@@ -200,6 +203,7 @@ private:
     Timestamp m_logWindow{};
     bool m_replayMode{};
     taosim::replay::ReplayDesc m_replayDesc;
+    const taosim::simulation::SharedResources* m_sharedResources{};
     std::unordered_map<Timestamp, taosim::decimal_t> m_timestampToMidPrice;
 
     friend class LocalAgentManager;

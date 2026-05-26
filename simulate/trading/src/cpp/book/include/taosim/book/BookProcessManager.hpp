@@ -8,6 +8,7 @@
 #include <taosim/book/UpdateCounter.hpp>
 #include <taosim/process/Process.hpp>
 #include <taosim/process/ProcessFactory.hpp>
+#include <taosim/simulation/SharedResources.hpp>
 #include <taosim/simulation/SimulationSignals.hpp>
 #include <CheckpointSerializable.hpp>
 #include "common.hpp"
@@ -62,7 +63,10 @@ public:
     void updateProcesses(Timespan timespan);
 
     [[nodiscard]] static std::unique_ptr<BookProcessManager> fromXML(
-        pugi::xml_node node, Simulation* simulation, taosim::exchange::ExchangeConfig* exchangeConfig);
+        pugi::xml_node node,
+        Simulation* simulation,
+        taosim::exchange::ExchangeConfig* exchangeConfig,
+        const taosim::simulation::SharedResources* sharedResources);
 
 private:
     ProcessContainer m_container;

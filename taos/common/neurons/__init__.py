@@ -24,7 +24,7 @@ import typing
 import bittensor as bt
 
 from abc import ABC, abstractmethod
-from threading import Thread
+from threading import Thread, Lock
 
 # Sync calls set weights and also resyncs the metagraph.
 from taos.common.config import check_config, add_args, config
@@ -99,6 +99,12 @@ class BaseNeuron(ABC):
             self.subtensor = bt.Subtensor(self.config.subtensor.chain_endpoint)
             self.metagraph = self.subtensor.metagraph(self.config.netuid)
 
+        # bt 10.3.x's substrate websocket is not thread-safe — concurrent
+        # ws.recv() from different threads raises ConcurrencyError. Serialize
+        # all subtensor calls through this lock (taken inside sync(), set_weights,
+        # and any callback that hits self.subtensor from a non-main thread).
+        self._subtensor_lock = Lock()
+
         bt.logging.info(f"Wallet: {self.wallet}")
         bt.logging.info(f"Subtensor: {self.subtensor}")
         bt.logging.info(f"Metagraph: {self.metagraph}")
@@ -144,17 +150,18 @@ class BaseNeuron(ABC):
         """
         Wrapper for synchronizing the state of the network for the given miner or validator.
         """
-        # Ensure miner or validator hotkey is still registered on the network.
-        self.check_registered()
-        # Update block and hyperparameters
-        self.update_block()
-        self.update_hyperparams()
+        with self._subtensor_lock:
+            # Ensure miner or validator hotkey is still registered on the network.
+            self.check_registered()
+            # Update block and hyperparameters
+            self.update_block()
+            self.update_hyperparams()
 
-        if self.should_sync_metagraph():
-            self.resync_metagraph()
+            if self.should_sync_metagraph():
+                self.resync_metagraph()
 
-        if self.should_set_weights():
-            self.set_weights()
+            if self.should_set_weights():
+                self.set_weights()
 
         if save_state:
             self.save_state()

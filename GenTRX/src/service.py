@@ -245,6 +245,7 @@ class GenTRXService:
         # State
         self._scores: dict[int, dict] = {}
         self._last_aggregation_stats: dict = {}
+        self._last_config: dict = {}
         self._last_poll: float = 0.0
         self._last_score_poll: float = 0.0
         self._last_score_round_seen: int = -1
@@ -809,6 +810,9 @@ class GenTRXService:
         counters = payload.get("counters")
         if counters:
             self._last_aggregation_stats.update(counters)
+        cfg = payload.get("config")
+        if cfg:
+            self._last_config = dict(cfg)
         scores_compact = {
             uid: f"{s['score']:.3f}{'✓' if s.get('accepted') else '✗'}"
             for uid, s in self._scores.items()
@@ -828,6 +832,10 @@ class GenTRXService:
     def get_training_stats(self) -> dict:
         """Return last aggregation stats (loss, acceptance rate, version, timing)."""
         return dict(self._last_aggregation_stats)
+
+    def get_config(self) -> dict:
+        """Return the gradient server's effective hyperparameter config."""
+        return dict(self._last_config)
 
     def register_benchmark_bucket(self, uid: int, bucket: dict) -> bool:
         """POST /gentrx/register_bucket/{uid} — inject static bucket for a benchmark miner.

@@ -18,6 +18,7 @@ from taos.im.utils.coinbase import CoinbaseClient
 from coinbase.websocket import WSClientConnectionClosedException, WSClientException
 
 from taos.im.utils.streams import *
+from taos.common.config import _backfill_nested_namespaces
 
 _current_log_dir = None
 _log_dir_changed = False
@@ -594,7 +595,7 @@ if __name__ == "__main__":
     parser.add_argument('--seed.external.sampling_seconds', type=int, required=True)
     parser.add_argument('--logging.level', type=str, default='INFO')
 
-    config = bt.Config(parser)
+    config = _backfill_nested_namespaces(bt.Config(parser), parser)
     bt.logging(config=config)
-    
+
     run_seed_service(config)

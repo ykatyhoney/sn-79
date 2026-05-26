@@ -33,6 +33,7 @@ struct FundamentalPriceDesc
     double hurst{0.5};
     double epsilon{0.0};
     ProcessDesc proc;
+    const Eigen::MatrixXd* L{};
 };
 
 struct FundamentalPriceState
@@ -40,7 +41,6 @@ struct FundamentalPriceState
     double dJ{};
     double t{};
     double W{};
-    Eigen::MatrixXd L; 
     Eigen::VectorXd X;
     Eigen::VectorXd V;
     double BH{};
@@ -65,11 +65,14 @@ public:
     virtual double value() const override { return m_state.value; }
 
     [[nodiscard]] static std::unique_ptr<FundamentalPrice> fromXML(
-        simulation::ISimulation* simulation, pugi::xml_node node, uint64_t bookId, double X0);
+        simulation::ISimulation* simulation,
+        pugi::xml_node node,
+        uint64_t bookId,
+        double X0,
+        const Eigen::MatrixXd* L);
 
 private:
     void cholesky_step(int64_t i);
-    double gamma_fn(int64_t k, double H) const;
 
     simulation::ISimulation* m_simulation;
     std::mt19937* m_rng;
@@ -78,6 +81,7 @@ private:
     std::string m_seedfile;
     double m_X0, m_mu, m_sigma, m_dt;
     FundamentalPriceState m_state;
+    const Eigen::MatrixXd* m_L;
     std::normal_distribution<double> m_gaussian;
     double m_epsilon;
     double m_hurst;

@@ -26,6 +26,7 @@ FundamentalPrice::FundamentalPrice(const FundamentalPriceDesc& desc) noexcept
       m_dt{desc.dt},
       m_gaussian{0.0, std::sqrt(desc.dt)},
       m_X0{desc.X0},
+      m_L{desc.L},
       m_poisson{desc.lambda},
       m_jump{desc.muJump, desc.sigmaJump},
       m_hurst{desc.hurst},
@@ -33,11 +34,10 @@ FundamentalPrice::FundamentalPrice(const FundamentalPriceDesc& desc) noexcept
 {
     m_updatePeriod = desc.proc.updatePeriod;
     m_state.value = m_X0;
- 
+
     const auto sim = dynamic_cast<Simulation*>(m_simulation);
     Timestamp N = sim->duration() / m_updatePeriod;
     const double dtH = std::pow(N, -m_hurst);
-    m_state.L = Eigen::MatrixXd::Zero(N + 2, N + 2);
     m_state.X = Eigen::VectorXd::Zero(N + 2);
     m_state.V.resize(N + 2);
     // TODO seed
@@ -47,12 +47,8 @@ FundamentalPrice::FundamentalPrice(const FundamentalPriceDesc& desc) noexcept
         m_state.V(i) = m_epsilon * m_fractionalGaussian(*m_rng);
     }
 
-    m_state.L(0,0) = 1.0;
     m_state.X(0) = m_state.V(0);
-
-    m_state.L(1,0) = gamma_fn(1, m_hurst);
-    m_state.L(1,1) = std::sqrt(1.0 - std::pow(m_state.L(1,0), 2));
-    m_state.X(1) = m_state.L.row(1).head(2).dot(m_state.V.head(2));
+    m_state.X(1) = m_L->row(1).head(2).dot(m_state.V.head(2));
 
     m_seedfile = (sim->logDir() / "fundamental_seed.csv").generic_string();
 }
@@ -126,34 +122,18 @@ void FundamentalPrice::update(Timestamp timestamp)
 
 void FundamentalPrice::cholesky_step(int64_t i)
 {
-    m_state.L(i, 0) = gamma_fn(i, m_hurst);
     m_state.V(i + 1) = m_fractionalGaussian(*m_rng);
-
-    for (int j = 1; j < i; j++)
-    {
-        double dot_val = m_state.L.row(i).head(j).dot(m_state.L.row(j).head(j));
-        m_state.L(i, j) = (1.0 / m_state.L(j, j)) * (gamma_fn(i - j, m_hurst) - dot_val);
-    }
-
-    double sumsq = m_state.L.row(i).head(i).squaredNorm();
-    m_state.L(i, i) = std::sqrt(1.0 - sumsq);
-
-    m_state.X(i) = m_state.L.row(i).head(i + 1).dot(m_state.V.head(i + 1));
-}
-
-//-------------------------------------------------------------------------
-
-double FundamentalPrice::gamma_fn(int64_t k, double H) const
-{
-    return 0.5 * (std::pow(std::abs(k - 1), 2.0 * H)
-                - 2.0 * std::pow(std::abs(k), 2.0 * H)
-                + std::pow(std::abs(k + 1), 2.0 * H));
+    m_state.X(i) = m_L->row(i).head(i + 1).dot(m_state.V.head(i + 1));
 }
 
 //-------------------------------------------------------------------------
 
 std::unique_ptr<FundamentalPrice> FundamentalPrice::fromXML(
-    taosim::simulation::ISimulation* simulation, pugi::xml_node node, uint64_t bookId, double X0)
+    taosim::simulation::ISimulation* simulation,
+    pugi::xml_node node,
+    uint64_t bookId,
+    double X0,
+    const Eigen::MatrixXd* L)
 {
     static constexpr auto ctx = std::source_location::current().function_name();
 
@@ -180,24 +160,26 @@ std::unique_ptr<FundamentalPrice> FundamentalPrice::fromXML(
             return value;
         }
     };
-    const double hurst = node.attribute("Hurst").as_double(0.5); 
+    const double hurst = node.attribute("Hurst").as_double(0.5);
     const double epsilon = node.attribute("epsilon").as_double(0.0);
+
     return std::make_unique<FundamentalPrice>(FundamentalPriceDesc{
         .simulation = simulation,
         .bookId = bookId,
         .seedInterval = getNonNegativeUint64Attribute(node, "seedInterval"),
-        .X0 = X0,      
+        .X0 = X0,
         .mu = getNonNegativeFloatAttribute(node, "mu"),
         .sigma = getNonNegativeFloatAttribute(node, "sigma"),
         .dt = dt,
         .lambda = getNonNegativeFloatAttribute(node, "lambda"),
         .muJump = getNonNegativeFloatAttribute(node, "muJump"),
         .sigmaJump = getNonNegativeFloatAttribute(node, "sigmaJump"),
-        .hurst = hurst, 
+        .hurst = hurst,
         .epsilon = epsilon,
         .proc = {
             .updatePeriod = updatePeriod
-        }
+        },
+        .L = L
     });
 }
 

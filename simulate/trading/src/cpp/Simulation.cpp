@@ -37,6 +37,7 @@ Simulation::Simulation(
     uint32_t blockIdx,
     uint32_t blockDim,
     const fs::path& baseLogDir,
+    const taosim::simulation::SharedResources* sharedResources,
     bool replayMode,
     taosim::replay::ReplayDesc replayDesc)
     : IMessageable{this, "SIMULATION"},
@@ -45,7 +46,8 @@ Simulation::Simulation(
       m_baseLogDir{baseLogDir},
       m_localAgentManager{std::make_unique<LocalAgentManager>(this)},
       m_replayMode{replayMode},
-      m_replayDesc{replayDesc}
+      m_replayDesc{replayDesc},
+      m_sharedResources{sharedResources}
 {}
 
 //-------------------------------------------------------------------------

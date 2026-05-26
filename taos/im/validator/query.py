@@ -20,6 +20,7 @@ from collections import defaultdict
 from taos.im.protocol import STP
 from taos.im.protocol import MarketSimulationStateUpdate
 from taos.im.validator.forward import DendriteManager
+from taos.common.config import _backfill_nested_namespaces
 
 class QueryService:
     def __init__(self, config):
@@ -922,9 +923,9 @@ if __name__ == '__main__':
     parser.add_argument('--notify-fd', type=int, default=None)
     
 
-    config = bt.Config(parser)
+    config = _backfill_nested_namespaces(bt.Config(parser), parser)
     bt.logging(config=config)
-    
+
     if config.cpu_cores:
         cores = [int(c) for c in config.cpu_cores.split(',')]
         os.sched_setaffinity(0, set(cores))

@@ -48,7 +48,7 @@ If you prefer to manage each step individually, the five steps below describe th
 
 1. **[Bucket](#step-1-create-the-bucket).** Create one R2 (or Hippius) bucket. Generate two API tokens on the bucket: write (private) + read (committed on-chain).
 2. **[On-chain commit](#step-2-commit-your-bucket-on-chain).** `python bin/setup_miner_bucket.py …` verifies the tokens and writes the read pair to the chain so validators can find you.
-3. **[Env vars](#step-3-set-env-vars).** Drop your `GENTRX_AGENT_S3_*` keys plus the uid-0 `GENTRX_AGGREGATOR_S3_*` bootstrap pair into `.env`.
+3. **[Env vars](#step-3-set-env-vars).** Drop your `GENTRX_AGENT_S3_*` keys into `.env`.
 4. **[Launch](#step-4-launch).** Run `bin/gentrx_preflight` first, then run `./run_miner.sh -G …`. pm2-supervised, default agent is `HybridTrainingAgent`.
 5. **[Verify](#step-5-verify).** `pm2 logs miner | grep "\[GTX\]"` should show bucket commit success, assignments arriving, gradients uploading.
 
@@ -144,18 +144,9 @@ GENTRX_AGENT_S3_READ_SECRET_KEY=<read-only-secret>
 
 # R2 only: account ID for endpoint derivation. Optional if bucket == account_id.
 # GENTRX_AGENT_S3_ACCOUNT_ID=<r2-account-id>
-
-# uid-0 aggregator bucket: first-boot fallback for the canonical
-# checkpoint, before the aggregator's chain commitment propagates.
-# Find these in the MVTRX Discord pinned message or SUBNET_BOOTSTRAP.md.
-GENTRX_AGGREGATOR_S3_ENDPOINT_URL=https://<account_id>.r2.cloudflarestorage.com
-GENTRX_AGGREGATOR_S3_BUCKET=<aggregator-bucket>
-GENTRX_AGGREGATOR_S3_ACCOUNT_ID=<aggregator-account-id>
-GENTRX_AGGREGATOR_S3_READ_ACCESS_KEY=<published-read-key>
-GENTRX_AGGREGATOR_S3_READ_SECRET_KEY=<published-read-secret>
 ```
 
-In steady state the miner discovers uid-0's bucket from chain. The `GENTRX_AGGREGATOR_S3_*` block above is the bootstrap fallback for first boot before the chain commitment propagates. Full discovery order is documented in [`validator_setup.md` § Bucket Setup](validator_setup.md#bucket-setup).
+The miner discovers uid-0's checkpoint bucket from the chain commitment. No aggregator credentials live in `.env`.
 
 [↑ back to Quickstart](#quickstart-running-a-gentrx-miner)
 
@@ -219,7 +210,7 @@ pm2 logs miner | grep "\[GTX\]"
 Expected log lines in the first few minutes:
 
 - `GenTRX bucket committed on-chain: account=…`. Step 2 worked.
-- `S3 aggregator bucket fallback: …`. Step 3 env vars loaded.
+- `Aggregator bucket discovered: uid=0 …`. Chain discovery resolved uid-0's checkpoint bucket.
 - `GenTRX assignment received: round=N, books=[…], data=K files`. Validator found you and dendrited an assignment.
 - `gradient uploaded to S3 (round=N)`. Your gradient hit your bucket.
 

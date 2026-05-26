@@ -58,6 +58,11 @@ class Proxy(Validator):
         self.config.neuron.timeout = launcher_config['proxy']['timeout']
         self.check_config(self.config)
         config_file = launcher_config['proxy']['simulation_xml']
+        if not os.path.isabs(config_file):
+            script_dir = Path(__file__).resolve().parent
+            repo_root = Path(__file__).resolve().parents[2]
+            anchor = script_dir if config_file.startswith("..") or config_file.startswith("./") else repo_root
+            config_file = str((anchor / config_file).resolve())
         if not os.path.exists(config_file):
             raise Exception(f"Simulator config does not exist at {config_file}!")
         self.simulator_config_file = os.path.realpath(Path(config_file))
@@ -79,19 +84,17 @@ class Proxy(Validator):
         self.start_timestamp = None
         self.step = 0
 
-        # GenTRX service — state packaging + assignment delivery
         self._gentrx = None
-        if _GENTRX_AVAILABLE:
-            grad_url = launcher_config.get("proxy", {}).get("gradient_server_url", "")
+        grad_url = launcher_config.get("proxy", {}).get("gradient_server_url", "")
+        if _GENTRX_AVAILABLE and grad_url:
             gs_interval = launcher_config.get("gradient_server", {}).get("interval", 60)
             n_agents = len(self.agent_urls)
 
-            # Log path: same dir as gradient_server.log
             gs_log = launcher_config.get("gradient_server", {}).get("log", "")
             log_path = os.path.join(os.path.dirname(gs_log), "gentrx_service.log") if gs_log else None
 
             from GenTRX.src.state_packager import StatePackager
-            agent_uids = list(range(n_agents))  # proxy uses sequential 0..n
+            agent_uids = list(range(n_agents))
             self._gentrx = GenTRXService(
                 packager=StatePackager(),
                 gradient_server_url=grad_url,
@@ -100,7 +103,9 @@ class Proxy(Validator):
                 miner_uids=agent_uids,
                 log_path=log_path,
             )
-            bt.logging.info(f"GenTRX service: server={grad_url or 'none'}, poll={gs_interval}s, uids={agent_uids}")
+            bt.logging.info(f"GenTRX service: server={grad_url}, poll={gs_interval}s, uids={agent_uids}")
+        elif _GENTRX_AVAILABLE:
+            bt.logging.info("GenTRX service: disabled (no proxy.gradient_server_url in config)")
 
         # Add routes for methods receiving input from simulator
         self.router = APIRouter()

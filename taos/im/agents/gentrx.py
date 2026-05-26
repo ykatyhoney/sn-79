@@ -30,7 +30,11 @@ Three capabilities, controlled by config:
     Model version is pulled on-demand from the assignment; no background poll.
 
 Data collection params:
-    gtx_output_dir         (str):   Parquet output root. Default: data/live
+    gtx_output_dir         (str):   Parquet output root. Default:
+                                    <repo>/agents/data/<uid>/ (resolved
+                                    via __file__-anchored REPO_ROOT).
+                                    Override with the GENTRX_AGENT_OUTPUT_DIR
+                                    env var for an absolute path.
     gtx_collect_data       (bool):  Write parquets locally. Set false for pure
                                     training agents that read data from S3.
                                     In-memory event processing still runs (needed
@@ -93,6 +97,7 @@ from taos.im.protocol.events import SimulationEndEvent
 
 from GenTRX.src.bt_log import gtx_log
 from GenTRX.src.orderbook import MatchingEngine, LobSnapshot
+from GenTRX.src.util.paths import default_output_dir
 from GenTRX.src.util.schema import (
     BID,
     ASK,
@@ -219,7 +224,13 @@ class GenTRXAgent(FinanceSimulationAgent):
         g = self._gtx
 
         # ---- Data collection config (gtx_* params) ----
-        g.output_dir = Path(getattr(self.config, "gtx_output_dir", f"../../../agents/data/{self.uid}"))
+        # Default resolves to <repo>/agents/data/<uid>/ via __file__-anchored
+        # repo root (see GenTRX/src/util/paths.py). Override with the
+        # gtx_output_dir agent param or GENTRX_AGENT_OUTPUT_DIR env var.
+        g.output_dir = Path(
+            getattr(self.config, "gtx_output_dir", "")
+            or default_output_dir(self.uid)
+        )
         # Interval-aligned flush: 1 hour default, 10 min for local test
         g.flush_interval_ns = int(
             getattr(self.config, "gtx_flush_interval_ns", 3_600_000_000_000)
@@ -270,20 +281,11 @@ class GenTRXAgent(FinanceSimulationAgent):
         g.retry_cooldown = 30.0  # seconds, doubles on failure up to 300s
 
         # ---- S3 wiring ----
-        # Three logical stores:
-        #   store        : uid-0 aggregator bucket (read). Checkpoint-source
-        #                  fallback when chain discovery has not resolved yet.
-        #                  Built from GENTRX_AGGREGATOR_S3_* env vars.
-        #   data_store   : set to store at init. Overridden per-assignment by
-        #                  _assignment_data_store() when the sending validator
-        #                  carries its own data-bucket credentials in the
-        #                  assignment payload.
-        #   write_store  : per-miner bucket (write-only), for gradient upload.
-        #                  Built from GENTRX_AGENT_S3_* env vars.
-        # Checkpoints always come from the aggregator bucket (UID 0 or the
-        # configured gtx_aggregator_uid), resolved via chain in
-        # _get_aggregator_store_for_assignment and cached. The env-var
-        # fallback (store) is only used when the chain lookup fails.
+        # Checkpoints come from the aggregator bucket (uid 0 or
+        # gtx_aggregator_uid), resolved via chain in
+        # _get_aggregator_store_for_assignment. data_store is overridden
+        # per-assignment from the payload. write_store is the miner's
+        # own bucket built from GENTRX_AGENT_S3_*.
         g.store = None
         g.data_store = None
         g.write_store = None
@@ -878,9 +880,9 @@ class GenTRXAgent(FinanceSimulationAgent):
 
         Tries candidates in order:
           1. configured aggregator_uid (operator override via --agent.params).
-          2. env-var store (self._gtx.store) — pre-configured by operator.
-          3. assignment["validator_uid"] — the validator that sent this assignment.
-          4. metagraph scan — handles aggregator uid-drift across registration orders.
+          2. assignment["validator_uid"] — the validator that sent this assignment.
+          3. metagraph scan — handles aggregator uid-drift across registration orders.
+          4. self._gtx.store (env-var operator override, last resort).
 
         A candidate "wins" only if its bucket has at least one published
         checkpoint (`get_latest_version() > 0`). Result is cached for the
@@ -922,12 +924,6 @@ class GenTRXAgent(FinanceSimulationAgent):
                 if _ep_override:
                     gtx_chain._endpoint_override = _ep_override
 
-                # Priority:
-                #   1. configured gtx_aggregator_uid (operator override; mainnet=0,
-                #      localnet=1 because the owner wallet sits at uid 0).
-                #   2. env-var store (self._gtx.store) — pre-configured by operator.
-                #   3. assignment sender uid.
-                #   4. metagraph scan (handles aggregator uid-drift).
                 try:
                     configured_uid = int(getattr(self.config, "gtx_aggregator_uid", 0))
                 except (TypeError, ValueError):
@@ -937,7 +933,6 @@ class GenTRXAgent(FinanceSimulationAgent):
                     f"chain discovery: netuid={netuid} aggregator_uid={configured_uid}"
                 )
 
-                # Step 1: configured uid via chain
                 try:
                     bucket_info = gtx_chain.get_bucket(configured_uid)
                     if bucket_info is not None:
@@ -963,21 +958,6 @@ class GenTRXAgent(FinanceSimulationAgent):
                 except Exception as exc:
                     self._gtx.tlog.info(f"uid={configured_uid} bucket probe failed: {exc}")
 
-                # Step 2: env-var store
-                if self._gtx.store is not None:
-                    try:
-                        if self._gtx.store.get_latest_version(configured_uid) > 0:
-                            self._gtx.tlog.info(
-                                f"Aggregator bucket from env: "
-                                f"{self._gtx.store.endpoint_url}/{self._gtx.store.bucket}"
-                            )
-                            self._gtx.discovered_aggregator_store = self._gtx.store
-                            self._gtx.discovered_aggregator_uid = configured_uid
-                            return self._gtx.store
-                    except Exception as exc:
-                        self._gtx.tlog.info(f"env-var store probe failed: {exc}")
-
-                # Steps 3+4: sender then remaining metagraph
                 scan_uids: list[int] = []
                 sender = (assignment or {}).get("validator_uid")
                 if sender is not None:
@@ -1013,12 +993,24 @@ class GenTRXAgent(FinanceSimulationAgent):
                 self._gtx.tlog.info(
                     f"chain discovery exhausted {len(scan_uids)} uids — no aggregator with checkpoint found"
                 )
+
+                if self._gtx.store is not None:
+                    try:
+                        if self._gtx.store.get_latest_version(configured_uid) > 0:
+                            self._gtx.tlog.info(
+                                f"Aggregator bucket from env override: "
+                                f"{self._gtx.store.endpoint_url}/{self._gtx.store.bucket}"
+                            )
+                            self._gtx.discovered_aggregator_store = self._gtx.store
+                            self._gtx.discovered_aggregator_uid = configured_uid
+                            return self._gtx.store
+                    except Exception as exc:
+                        self._gtx.tlog.info(f"env-var store probe failed: {exc}")
         except Exception as exc:
             self._gtx.tlog.warning(f"Chain aggregator discovery failed: {exc}")
             import traceback as _tb
             self._gtx.tlog.warning(_tb.format_exc())
 
-        # Final fallback: env-var store unchecked (caller's retry handles it)
         return self._gtx.store
 
     def _assignment_data_store(self, assignment: dict):
@@ -1470,8 +1462,7 @@ class GenTRXAgent(FinanceSimulationAgent):
                     uid-0's latest — uses whichever is newer so miners stay
                     synced with the canonical model even when their assigning
                     validator is a sibling with a stale version.
-            assignment: If provided, uses chain-based discovery (always uid-0)
-                    before falling back to env-var-configured self._gtx.store.
+            assignment: If provided, uses chain-based discovery (always uid-0).
 
         Returns True if the local model is at the requested version after the
         call (already current or freshly downloaded). Returns False on failure.
@@ -1487,8 +1478,8 @@ class GenTRXAgent(FinanceSimulationAgent):
             store = self._get_aggregator_store_for_assignment({})
         if store is None:
             self._gtx.tlog.warning(
-                "no aggregator store — GENTRX_AGGREGATOR_S3_* env vars missing or "
-                "chain discovery failed; cannot download checkpoint"
+                "no aggregator store — chain discovery for uid-0 failed; "
+                "cannot download checkpoint"
             )
             return self._gtx.model is not None
 

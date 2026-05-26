@@ -4,12 +4,23 @@
 
 Usage:
     from GenTRX.src.train import train, TrainConfig
-    model, train_losses, val_losses = train(TrainConfig(data_dir="data/sim/20260218"))
+    from GenTRX.src.util.paths import REPO_ROOT
+
+    model, train_losses, val_losses = train(
+        TrainConfig(data_dir=str(REPO_ROOT / "data" / "sim" / "20260218"))
+    )
 
     # Resume from checkpoint:
     model, train_losses, val_losses = train(
-        TrainConfig(data_dir="data/sim/20260218", resume="checkpoints/GenTRX/best.pt")
+        TrainConfig(
+            data_dir=str(REPO_ROOT / "data" / "sim" / "20260218"),
+            resume=str(REPO_ROOT / "checkpoints" / "GenTRX" / "best.pt"),
+        )
     )
+
+Pass absolute paths only. `TrainConfig.data_dir` and `resume` are
+both filesystem paths read at process start; relative paths bind to
+the shell's CWD and have surprised operators before.
 """
 
 from __future__ import annotations

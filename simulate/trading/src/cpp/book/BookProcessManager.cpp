@@ -68,7 +68,10 @@ void BookProcessManager::updateProcesses(Timespan timespan)
 //-------------------------------------------------------------------------
 
 std::unique_ptr<BookProcessManager> BookProcessManager::fromXML(
-    pugi::xml_node node, Simulation* simulation, taosim::exchange::ExchangeConfig* exchangeConfig)
+    pugi::xml_node node,
+    Simulation* simulation,
+    taosim::exchange::ExchangeConfig* exchangeConfig,
+    const taosim::simulation::SharedResources* sharedResources)
 {
     static constexpr auto ctx = std::source_location::current().function_name();
 
@@ -84,7 +87,7 @@ std::unique_ptr<BookProcessManager> BookProcessManager::fromXML(
     };
 
     auto processFactory =
-        std::make_unique<taosim::process::ProcessFactory>(simulation, exchangeConfig);
+        std::make_unique<taosim::process::ProcessFactory>(simulation, exchangeConfig, sharedResources);
 
     ProcessContainer container;
     LoggerContainer loggers;

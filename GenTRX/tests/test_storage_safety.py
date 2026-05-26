@@ -16,6 +16,7 @@ regardless of implementation strategy:
 from __future__ import annotations
 
 import io
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pyarrow.parquet as pq
@@ -72,6 +73,9 @@ def aggregator(tmp_path):
     )
     agg.validator_store = MagicMock()
     agg.validator_store.put_data.return_value = None
+    # Pin the local-mirror cache to pytest tmp_path so flushes don't leak
+    # gentrx_s3_cache_* directories into the system tempdir on each run.
+    agg._s3_cache_dir = tmp_path / "s3_cache"
     return agg
 
 
@@ -153,6 +157,188 @@ def test_flush_failure_retains_rows(aggregator):
 
     timestamps = [r["timestamp"] for r in aggregator._pending_rows[book_id]]
     assert timestamps == [100, 200, 300]
+
+
+# ---------------------------------------------------------------------------
+# Disk-primary mirror: scoring reads hit local disk instead of round-tripping
+# back through S3 for data this process just wrote.
+# ---------------------------------------------------------------------------
+
+
+def test_flush_mirrors_parquet_to_local_cache(aggregator):
+    """After a successful flush, the parquet exists on local disk at the same
+    path `_fetch_s3_book_files` would download to, and is registered in
+    `_s3_cached_files` so the cache lookup short-circuits the S3 download."""
+    book_id = 0
+    aggregator._pending_rows[book_id] = [_row(ts) for ts in (100, 200, 300)]
+
+    captured: dict = {}
+
+    def capture(validator_uid, *, book_id, filename, data):
+        captured["filename"] = filename
+        captured["data"] = data
+
+    aggregator.validator_store.put_data = MagicMock(side_effect=capture)
+
+    aggregator._flush_book_parquet(book_id)
+
+    fname = captured["filename"]
+    cache_key = f"{book_id}/{fname}"
+    assert cache_key in aggregator._s3_cached_files, (
+        "flushed parquet was not registered in the local cache map"
+    )
+    local_path = aggregator._s3_cached_files[cache_key]
+    assert local_path.is_file(), "mirror path was registered but file is missing"
+    assert local_path.read_bytes() == captured["data"], (
+        "local mirror bytes differ from what was sent to S3"
+    )
+    # Path mirrors the shape `_fetch_s3_book_files` constructs.
+    assert local_path.parent.name == "intervals"
+    assert local_path.parent.parent.name == str(book_id)
+
+
+def test_flush_mirror_failure_does_not_block_publish(aggregator, monkeypatch):
+    """A local-disk write failure (e.g. disk full) must not break the S3
+    publish or leave rows un-flushed — the mirror is best-effort."""
+    book_id = 0
+    aggregator._pending_rows[book_id] = [_row(ts) for ts in (100, 200, 300)]
+
+    def explode(*_a, **_kw):
+        raise OSError("simulated disk full")
+
+    monkeypatch.setattr(Path, "write_bytes", explode)
+
+    aggregator._flush_book_parquet(book_id)
+
+    aggregator.validator_store.put_data.assert_called_once()
+    assert aggregator._pending_rows[book_id] == [], (
+        "rows must clear when the S3 publish succeeded, regardless of mirror outcome"
+    )
+    assert aggregator._s3_cached_files == {}, (
+        "mirror failure must not pollute the cache map"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cache-dir lifecycle: deterministic path, restart re-use, sim-end wipe,
+# rolling age eviction.
+# ---------------------------------------------------------------------------
+
+
+def test_cache_dir_is_deterministic_and_under_output(tmp_path):
+    """Cache dir is `<output_path>.parent/s3_cache/` — stable across runs,
+    no tempdir leak in /tmp."""
+    from GenTRX.src.gradient_server import GradientAggregator
+
+    agg = GradientAggregator(
+        checkpoint_path=str(tmp_path / "ckpt.pt"),
+        val_data_path=str(tmp_path / "val"),
+        output_path=str(tmp_path / "out.pt"),
+    )
+    agg._s3_cache_dir = None
+    cache_dir = agg._get_s3_cache_dir()
+    assert cache_dir == tmp_path / "s3_cache"
+    assert cache_dir.is_dir()
+    # Re-call returns the same path and does not raise on existing dir.
+    assert agg._get_s3_cache_dir() == cache_dir
+
+
+def test_warm_cache_skips_s3_download_on_restart(aggregator, tmp_path):
+    """A parquet already on disk under the deterministic cache dir is
+    registered without a redundant S3 GET on the first read."""
+    book_id = 7
+    fname = "00000000-00000300.parquet"
+    cache_dir = aggregator._get_s3_cache_dir()
+    local_path = cache_dir / str(book_id) / "intervals" / fname
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    local_path.write_bytes(b"already-on-disk")
+
+    aggregator.validator_store.list_data = MagicMock(return_value=[fname])
+    aggregator.validator_store.get_data = MagicMock(
+        side_effect=AssertionError("get_data must not be called when file exists locally")
+    )
+
+    files = aggregator._fetch_s3_book_files(str(book_id))
+
+    assert files == [local_path]
+    cache_key = f"{book_id}/{fname}"
+    assert aggregator._s3_cached_files.get(cache_key) == local_path
+    aggregator.validator_store.get_data.assert_not_called()
+
+
+def test_run_data_cleanup_wipes_local_mirror(aggregator):
+    """Sim-end cleanup deletes S3 data/<uid>/ AND the local mirror, plus
+    clears the in-memory cache map and loader cache."""
+    book_id = 3
+    fname = "00000000-00000300.parquet"
+    cache_dir = aggregator._get_s3_cache_dir()
+    local_path = cache_dir / str(book_id) / "intervals" / fname
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    local_path.write_bytes(b"stale-from-prev-sim")
+    aggregator._s3_cached_files[f"{book_id}/{fname}"] = local_path
+    aggregator._loader_cache[("dummy_key",)] = "stale loader"
+    aggregator.validator_store.delete_prefix = MagicMock(return_value=5)
+
+    aggregator._data_cleanup_pending = True
+    removed = aggregator._run_data_cleanup()
+
+    aggregator.validator_store.delete_prefix.assert_called_once_with(
+        f"data/{aggregator._validator_uid}/"
+    )
+    assert removed == 5
+    assert not local_path.exists(), "local mirror file should be deleted"
+    assert not cache_dir.exists(), "cache dir should be removed"
+    assert aggregator._s3_cached_files == {}
+    assert aggregator._loader_cache == {}
+    assert aggregator._data_cleanup_pending is False
+
+
+def test_prune_s3_cache_evicts_old_files(aggregator):
+    """Files older than retention are deleted; fresh files are kept; the
+    `_s3_cached_files` map drops entries pointing at unlinked files."""
+    import os as _os
+    import time as _time
+
+    aggregator.s3_cache_retention_hours = 1.0
+    cache_dir = aggregator._get_s3_cache_dir()
+
+    old = cache_dir / "1" / "intervals" / "old.parquet"
+    fresh = cache_dir / "1" / "intervals" / "fresh.parquet"
+    old.parent.mkdir(parents=True, exist_ok=True)
+    old.write_bytes(b"old")
+    fresh.write_bytes(b"fresh")
+    aggregator._s3_cached_files["1/old.parquet"] = old
+    aggregator._s3_cached_files["1/fresh.parquet"] = fresh
+
+    # Push old's mtime two hours into the past.
+    long_ago = _time.time() - 2 * 3600
+    _os.utime(old, (long_ago, long_ago))
+
+    removed = aggregator._prune_s3_cache()
+
+    assert removed == 1
+    assert not old.exists()
+    assert fresh.is_file()
+    assert "1/old.parquet" not in aggregator._s3_cached_files
+    assert "1/fresh.parquet" in aggregator._s3_cached_files
+
+
+def test_prune_s3_cache_disabled_is_noop(aggregator):
+    """Retention <= 0 disables rolling eviction. Sim-end wipe is unaffected
+    (covered by test_run_data_cleanup_wipes_local_mirror)."""
+    import os as _os
+    import time as _time
+
+    aggregator.s3_cache_retention_hours = 0
+    cache_dir = aggregator._get_s3_cache_dir()
+    ancient = cache_dir / "1" / "intervals" / "ancient.parquet"
+    ancient.parent.mkdir(parents=True, exist_ok=True)
+    ancient.write_bytes(b"ancient")
+    long_ago = _time.time() - 365 * 24 * 3600
+    _os.utime(ancient, (long_ago, long_ago))
+
+    assert aggregator._prune_s3_cache() == 0
+    assert ancient.is_file()
 
 
 # ---------------------------------------------------------------------------

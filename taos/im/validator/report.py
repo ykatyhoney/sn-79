@@ -26,6 +26,7 @@ from taos.im.protocol.models import TradeInfo, MarketSimulationConfig
 from taos.im.protocol.events import TradeEvent
 
 from taos.common.utils.prometheus import prometheus
+from taos.common.config import _backfill_nested_namespaces
 from taos.im.utils import duration_from_timestamp
 from prometheus_client import Counter, Gauge, Info, CollectorRegistry, generate_latest, CONTENT_TYPE_LATEST
 from fastapi import FastAPI
@@ -214,6 +215,9 @@ class ReportingService:
         self.prometheus_gentrx_miner_score_held = Gauge('gentrx_miner_score_held', 'Per-miner GenTRX held-out validation score (last round, pre-EMA).', ['wallet', 'netuid', 'sim_id', 'uid'], registry=self.registry_gentrx)
         self.prometheus_gentrx_miner_score = Gauge('gentrx_miner_score', 'Per-miner GenTRX combined score (last round, pre-EMA).', ['wallet', 'netuid', 'sim_id', 'uid'], registry=self.registry_gentrx)
         self.prometheus_gentrx_miner_accepted = Gauge('gentrx_miner_accepted', 'Per-miner GenTRX gradient accepted in last round (1=yes, 0=no).', ['wallet', 'netuid', 'sim_id', 'uid'], registry=self.registry_gentrx)
+        self.prometheus_gentrx_miner_overfitting = Gauge('gentrx_miner_overfitting', 'Per-miner overfitting flag in last round (1=overfit detected, 0=ok).', ['wallet', 'netuid', 'sim_id', 'uid'], registry=self.registry_gentrx)
+        self.prometheus_gentrx_miner_rollback_winner = Gauge('gentrx_miner_rollback_winner', 'Per-miner flag indicating gradient was selected during rollback (1=yes, 0=no).', ['wallet', 'netuid', 'sim_id', 'uid'], registry=self.registry_gentrx)
+        self.prometheus_gentrx_miner_grad_norm = Gauge('gentrx_miner_grad_norm', 'Per-miner gradient L2 norm in last round.', ['wallet', 'netuid', 'sim_id', 'uid'], registry=self.registry_gentrx)
         self._start_metrics_server()
         self.prometheus_initialized = True
         
@@ -417,6 +421,7 @@ class ReportingService:
         self.gentrx_enabled = data.get('gentrx_enabled', False)
         self.gentrx_training = data.get('gentrx_training', {})
         self.gentrx_scores_detailed = data.get('gentrx_scores_detailed', {})
+        self.gentrx_config = data.get('gentrx_config', {})
         
         class SimpleState:
             pass
@@ -519,6 +524,15 @@ def publish_gentrx_gauges(self: ReportingService) -> None:
     g.labels(wallet=wallet_addr, netuid=netuid, sim_id=simid, gentrx_gauge_name="simulation_share").set(gentrx_share)
     g.labels(wallet=wallet_addr, netuid=netuid, sim_id=simid, gentrx_gauge_name="active_miners").set(active_miners)
 
+    cfg = getattr(self, 'gentrx_config', {}) or {}
+    for key in ('min_score', 'overfit_penalty', 'overfit_ratio', 'books_per_miner', 'val_fraction'):
+        v = cfg.get(key)
+        if v is not None:
+            g.labels(wallet=wallet_addr, netuid=netuid, sim_id=simid, gentrx_gauge_name=key).set(float(v))
+    ema_alpha = self.validator_config.get('scoring', {}).get('gentrx_ema_alpha')
+    if ema_alpha is not None:
+        g.labels(wallet=wallet_addr, netuid=netuid, sim_id=simid, gentrx_gauge_name="ema_alpha").set(float(ema_alpha))
+
     ms = self.prometheus_gentrx_miner_scores
     for uid_str, score in gentrx_scores.items():
         ms.labels(wallet=wallet_addr, netuid=netuid, sim_id=simid, uid=str(uid_str)).set(float(score))
@@ -537,6 +551,11 @@ def publish_gentrx_gauges(self: ReportingService) -> None:
             self.prometheus_gentrx_miner_score_held.labels(**lv).set(float(s_held))
         self.prometheus_gentrx_miner_score.labels(**lv).set(float(entry.get('score', 0.0)))
         self.prometheus_gentrx_miner_accepted.labels(**lv).set(1.0 if entry.get('accepted') else 0.0)
+        self.prometheus_gentrx_miner_overfitting.labels(**lv).set(1.0 if entry.get('overfitting') else 0.0)
+        self.prometheus_gentrx_miner_rollback_winner.labels(**lv).set(1.0 if entry.get('was_rollback_winner') else 0.0)
+        gn = entry.get('grad_norm')
+        if gn is not None:
+            self.prometheus_gentrx_miner_grad_norm.labels(**lv).set(float(gn))
 
     # Training stats from last aggregation round
     tr = getattr(self, 'gentrx_training', {}) or {}
@@ -1383,9 +1402,9 @@ if __name__ == '__main__':
     parser.add_argument('--prometheus.level', type=str, default='INFO')
     parser.add_argument('--cpu-cores', type=str, default=None)
     
-    config = bt.Config(parser)
+    config = _backfill_nested_namespaces(bt.Config(parser), parser)
     bt.logging(config=config)
-    
+
     if config.cpu_cores:
         cores = [int(c) for c in config.cpu_cores.split(',')]
         os.sched_setaffinity(0, set(cores))

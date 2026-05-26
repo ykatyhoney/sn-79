@@ -176,7 +176,7 @@ The launchers resolve your venv in this order:
 **Option A** (activate before running):
 ```bash
 source .venv/taos/bin/activate
-./agents/proxy/run /path/to/simulation.xml
+./agents/proxy/run --sim-xml /path/to/simulation.xml
 ```
 
 **Option B** (set once in `.env`):

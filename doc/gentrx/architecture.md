@@ -179,10 +179,9 @@ GenTRX is trained distributedly during live simulations. Miners contribute compu
 | Bucket | Env vars | Write | Read |
 |---|---|---|---|
 | **Validator** (per validator) | `GENTRX_VALIDATOR_S3_*` | Gradient server (checkpoints + data + proposals) | Miners (via chain) + sibling validators (proposals + checkpoints from uid-0) |
-| **Aggregator fallback** (optional) | `GENTRX_AGGREGATOR_S3_*` | (not writeable) | Miners (always) + sibling validators (optional). Uid-0's published read pair, used when chain discovery has not resolved yet. |
 | **Per-miner** (per miner) | `GENTRX_AGENT_S3_*` | Miner (gradients) | Gradient server (via chain) |
 
-Each validator has a single unified bucket (checkpoints/ + data/ + proposals/), committed on-chain at startup. All keys live under `gentrx/<network>/<mode>/`, where `<network>` is derived from the connected subtensor (`finney` → `mainnet`, anything else → `testnet`) and `<mode>` is `simulation` (default) or `exchange` (reserved for future exchange-data training). One bucket can therefore host both networks and both modes side by side. Miners discover the checkpoint bucket from the chain primarily, and fall back to `GENTRX_AGGREGATOR_S3_*` when the commitment has not propagated. Assignment payloads carry data bucket credentials inline. Per-miner read credentials are committed on-chain via bittensor's `Commitments` pallet.
+Each validator has a single unified bucket (checkpoints/ + data/ + proposals/), committed on-chain at startup. All keys live under `gentrx/<network>/<mode>/`, where `<network>` is derived from the connected subtensor (`finney` → `mainnet`, anything else → `testnet`) and `<mode>` is `simulation` (default) or `exchange` (reserved for future exchange-data training). One bucket can therefore host both networks and both modes side by side. Miners discover every validator bucket (including uid-0's checkpoint bucket) from chain commitments. Assignment payloads echo the sending validator's data bucket credentials inline so miners can start fetching without a chain round-trip; the same credentials are on-chain. Per-miner read credentials are committed on-chain via bittensor's `Commitments` pallet.
 
 ### Event-driven aggregation
 

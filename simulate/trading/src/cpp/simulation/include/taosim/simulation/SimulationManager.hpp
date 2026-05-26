@@ -9,6 +9,7 @@
 #include <taosim/checkpoint/CheckpointManager.hpp>
 #include <taosim/ipc/ipc.hpp>
 #include <taosim/replay/ReplayManager.hpp>
+#include <taosim/simulation/SharedResources.hpp>
 #include <net.hpp>
 
 #include <boost/asio.hpp>
@@ -55,6 +56,7 @@ public:
     [[nodiscard]] auto&& stepSignal(this auto&& self) noexcept { return self.m_stepSignal; }
     [[nodiscard]] auto&& checkpointManager(this auto&& self) noexcept { return self.m_checkpointManager; }
     [[nodiscard]] auto&& measurements(this auto&& self) noexcept { return self.m_measurements; }
+    [[nodiscard]] auto&& sharedResources(this auto&& self) noexcept { return self.m_sharedResources; }
 
     [[nodiscard]] bool online() const noexcept;
     [[nodiscard]] bool warmingUp() const noexcept;
@@ -80,6 +82,7 @@ private:
     SimulationBlockInfo m_blockInfo;
     boost::asio::io_context m_io;
     std::unique_ptr<boost::asio::thread_pool> m_threadPool;
+    SharedResources m_sharedResources;
     std::vector<std::unique_ptr<Simulation>> m_simulations;
     fs::path m_logDir;
     Timestamp m_gracePeriod;

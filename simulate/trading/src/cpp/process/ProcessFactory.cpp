@@ -21,9 +21,11 @@ namespace taosim::process
 
 ProcessFactory::ProcessFactory(
     taosim::simulation::ISimulation* simulation,
-    taosim::exchange::ExchangeConfig* exchangeConfig) noexcept
+    taosim::exchange::ExchangeConfig* exchangeConfig,
+    const taosim::simulation::SharedResources* sharedResources) noexcept
     : m_simulation{simulation},
-      m_exchangeConfig{exchangeConfig}
+      m_exchangeConfig{exchangeConfig},
+      m_shared{sharedResources}
 {}
 
 //-------------------------------------------------------------------------
@@ -40,7 +42,8 @@ std::unique_ptr<Process> ProcessFactory::createFromXML(pugi::xml_node node, uint
             m_simulation,
             node,
             seedShift,
-            taosim::util::decimal2double(m_exchangeConfig->initialPrice)
+            taosim::util::decimal2double(m_exchangeConfig->initialPrice),
+            &m_shared->fundamentalPriceL
         );
     }
     else if (name == "JumpDiffusion") {

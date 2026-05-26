@@ -309,7 +309,7 @@ Delivered to miners via `GenTRXAssignment` synapse (dendrite) or HTTP GET respon
 }
 ```
 
-`data_endpoint` / `data_bucket` / `data_access_key` / `data_secret_key`: populated by the gradient server from its own validator bucket credentials. Miners use these directly so no per-validator env vars are required on the miner side. Falls back to the miner's `GENTRX_AGGREGATOR_S3_*` env vars if the assignment payload is missing them.
+`data_endpoint` / `data_bucket` / `data_access_key` / `data_secret_key`: populated by the gradient server from its own validator bucket credentials. Miners use these directly so no per-validator env vars are required on the miner side. The same credentials are on chain via the validator's commitment, which is the canonical source if the inline copy is missing.
 
 **Round closure runs on block-sync.** The validator advances rounds on the chain block counter (`--gentrx.blocks_per_round` blocks per round) and closes each one by calling `POST /gentrx/round` on the gradient server. Miners work until the next assignment arrives. The gradient server keeps a server-side heartbeat-loss fallback timer (see [`operations.md` § Failure semantics](operations.md#gradient-server-is-down)) so a stuck validator does not freeze scoring.
 
@@ -557,7 +557,6 @@ stateDiagram-v2
 | `GENTRX_VALIDATOR_S3_ACCOUNT_ID` | R2 account ID (optional; defaults to bucket name) |
 | `GENTRX_VALIDATOR_S3_READ_ACCESS_KEY/SECRET_KEY` | Read creds committed on-chain for miner discovery |
 | `GENTRX_VALIDATOR_S3_WRITE_ACCESS_KEY/SECRET_KEY` | Write creds for gradient server (never leave this host) |
-| `GENTRX_AGGREGATOR_S3_*` | **Sibling validators only.** Uid-0's published read creds, used as fallback when chain discovery has not propagated. Aggregator itself does not set these. |
 | `GENTRX_CHAIN_ENDPOINT_OVERRIDE` | S3 endpoint for on-chain discovered buckets (MinIO only; empty for R2/Hippius) |
 | `GENTRX_API_KEY` | Shared secret for `/state`, `/round`, `/data-status`, `/scores` |
 
@@ -574,8 +573,5 @@ Same `GENTRX_VALIDATOR_S3_*` as the validator it serves (write creds used). `GEN
 | `GENTRX_AGENT_S3_ACCESS_KEY/SECRET_KEY` | Own bucket write creds |
 | `GENTRX_AGENT_S3_READ_ACCESS_KEY/SECRET_KEY` | Own bucket read creds (committed on-chain) |
 | `GENTRX_AGENT_S3_ACCOUNT_ID` | R2 account ID (optional; defaults to bucket name) |
-| `GENTRX_AGGREGATOR_S3_BUCKET` | Uid-0's published bucket. Read-only fallback for checkpoint discovery when the chain commitment has not propagated. |
-| `GENTRX_AGGREGATOR_S3_ACCOUNT_ID` | R2 account ID of uid-0 (optional) |
-| `GENTRX_AGGREGATOR_S3_READ_ACCESS_KEY/SECRET_KEY` | Uid-0's published read pair |
 
-Data bucket credentials for the current round are delivered in the assignment payload (`data_endpoint`, `data_bucket`, `data_access_key`, `data_secret_key`). No pre-configuration needed for data; that is discovered from the sending validator's chain commitment at assignment time. The `GENTRX_AGGREGATOR_S3_*` vars are the fallback specifically for the **checkpoint** source (uid-0).
+The miner's own bucket is the only S3 namespace it needs to configure. The uid-0 checkpoint bucket and every per-validator data bucket are read from chain commitments at runtime. Assignment payloads echo the sending validator's data bucket credentials (`data_endpoint`, `data_bucket`, `data_access_key`, `data_secret_key`) inline so the miner can fetch without a chain round-trip.

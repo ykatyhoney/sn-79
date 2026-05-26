@@ -23,9 +23,6 @@ def main():
         raise EnvironmentError("GENTRX_ROOT env var is not set")
     G = Path(GenTRX_ROOT).resolve()
 
-    taos_proxy = os.environ.get("TAOS_PROXY", "")
-    taos_build = os.environ.get("TAOS_BUILD", "")
-
     parser = argparse.ArgumentParser(description="Generate proxy test config")
     parser.add_argument("--sim-xml", required=True, help="Simulation XML path")
     parser.add_argument("--grad-port", type=int, default=8100)
@@ -146,27 +143,35 @@ def main():
             "port": 8000,
             "simulation_xml": sim_xml,
             "timeout": 5,
-            "path": taos_proxy,
             "gradient_server_url": grad_url,
         },
-        "gradient_server": {
-            "gentrx_root": str(G),
-            "checkpoint": str(G / args.checkpoint),
-            "val_data": str(val_data),
-            "output": str(ckpt_dir / "latest.pt"),
-            "port": args.grad_port,
-            "interval": args.interval,
-            "min_score": args.min_score,
-            "log": str(G / "data" / "proxy_test" / "gradient_server.log"),
-            "miner_buckets": os.environ.get("GENTRX_MINER_BUCKETS", ""),
-            "mode": "simulation",
-        },
-        "simulator": {
-            "xml": sim_xml,
-            "taos_build": str(Path(taos_build) / "src" / "cpp") if taos_build else "",
+        "agents": agents_section,
+        "taosim": {
+            "bin": "taosim",
             "delay": args.sim_delay,
         },
-        "agents": agents_section,
+        "training": {
+            "n_agents": args.n_agents,
+            "gradient_server": {
+                "port": args.grad_port,
+                "checkpoint": str(G / args.checkpoint),
+                "val_data": str(val_data),
+                "output": str(ckpt_dir / "latest.pt"),
+                "interval": args.interval,
+                "min_score": args.min_score,
+                "mode": "simulation",
+                "log": str(G / "data" / "proxy_test" / "gradient_server.log"),
+                "miner_buckets": os.environ.get("GENTRX_MINER_BUCKETS", ""),
+            },
+            "minio": {
+                "port": 9000,
+                "console": 9091,
+            },
+        },
+        "gradient_server": {
+            "interval": args.interval,
+            "log": str(G / "data" / "proxy_test" / "gradient_server.log"),
+        },
     }
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)

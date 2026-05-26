@@ -17,7 +17,7 @@ Full path: [`miner_setup.md`](miner_setup.md). Quickstart:
 
 1. Create one R2 (or Hippius) bucket. Generate write + read tokens.
 2. Commit the read pair on-chain with `bin/setup_miner_bucket.py`.
-3. `GENTRX_AGENT_S3_*` + uid-0 `GENTRX_AGGREGATOR_S3_*` into `.env`.
+3. `GENTRX_AGENT_S3_*` into `.env`.
 4. Run [`bin/gentrx_preflight`](preflight.md) to verify deps, S3 reach, wallet registration, and chain commitments before launch.
 5. Run `./run_miner.sh -G -w <coldkey> -h <hotkey> -u 79` - handles bucket prompts, chain commit, and pm2 launch on first run.
 6. `pm2 logs miner | grep "\[GTX\]"` should show assignments arriving and gradients uploading.

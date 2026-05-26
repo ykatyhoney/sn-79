@@ -6,7 +6,6 @@
 
 #include <taosim/process/FundamentalPrice.hpp>
 #include <taosim/checkpoint/serialization/process/RNG.hpp>
-#include <taosim/serialization/msgpack/Eigen/MatrixXd.hpp>
 #include <taosim/serialization/msgpack/Eigen/VectorXd.hpp>
 
 //-------------------------------------------------------------------------
@@ -47,9 +46,6 @@ struct convert<taosim::process::FundamentalPrice>
             else if (key == "W") {
                 val.convert(s.W);
             }
-            else if (key == "L") {
-                val.convert(s.L);
-            }
             else if (key == "X") {
                 val.convert(s.X);
             }
@@ -84,7 +80,7 @@ struct pack<taosim::process::FundamentalPrice>
     {
         const auto& s = v.state();
 
-        o.pack_map(11);
+        o.pack_map(10);
 
         o.pack("value");
         o.pack(s.value);
@@ -97,9 +93,6 @@ struct pack<taosim::process::FundamentalPrice>
 
         o.pack("W");
         o.pack(s.W);
-
-        o.pack("L");
-        o.pack(s.L);
 
         o.pack("X");
         o.pack(s.X);

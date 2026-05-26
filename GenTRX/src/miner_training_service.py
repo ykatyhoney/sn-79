@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from GenTRX.src.bt_log import gtx_log
+from GenTRX.src.util.paths import default_output_dir
 
 
 logger = logging.getLogger("GenTRX.miner_training_service")
@@ -49,7 +50,7 @@ class MinerTrainingConfig:
     """
 
     uid: int
-    output_dir: Path = Path("data/live")
+    output_dir: Path = field(default_factory=default_output_dir)
     gradient_dir: Path | None = None  # defaults to output_dir / "gradients"
     train_steps: int = 50
     train_batch_size: int = 16
@@ -72,6 +73,10 @@ class MinerTrainingConfig:
     # — operator handles cleanup themselves). Default 50 ≈ ~4 hours
     # of history at the standard round cadence.
     keep_gradients: int = 50
+    # Age-based local-disk eviction for <output_dir>/_s3_cache/. Files
+    # older than this are deleted after each successful upload. 0
+    # disables pruning (cache grows until shutdown or disk fill).
+    s3_cache_retention_hours: int = 24
 
 
 @dataclass
@@ -316,11 +321,17 @@ class MinerTrainingService:
     # ------------------------------------------------------------------
 
     def _build_logger(self) -> logging.Logger:
+        from logging.handlers import RotatingFileHandler
+
         log = logging.getLogger(f"GenTRX.miner_training_service.{self.cfg.uid}")
         log.setLevel(logging.INFO)
         log.propagate = False
         if not log.handlers:
-            fh = logging.FileHandler(self.cfg.gradient_dir / "train.log")
+            fh = RotatingFileHandler(
+                self.cfg.gradient_dir / "train.log",
+                maxBytes=50 * 1024 * 1024,
+                backupCount=5,
+            )
             fh.setFormatter(
                 logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S")
             )
@@ -554,6 +565,7 @@ class MinerTrainingService:
                     self._tlog.info(f"gradient uploaded to S3 (round={round_id})")
                     self.state.last_uploaded_round = round_id
                     self._prune_gradients()
+                    self._prune_s3_cache()
                 except Exception as exc:
                     self._tlog.warning(f"S3 upload failed: {exc} — saving for retry")
                     pending_dir = self.cfg.gradient_dir / "pending"
@@ -853,3 +865,35 @@ class MinerTrainingService:
                 )
         except Exception as exc:
             self._tlog.debug(f"gradient prune failed: {exc}")
+
+    def _prune_s3_cache(self) -> None:
+        """Age-evict files under <output_dir>/_s3_cache/.
+
+        Files with mtime older than `s3_cache_retention_hours` are
+        deleted. No-op when the cache directory does not exist or
+        retention is set to 0.
+        """
+        if self.cfg.s3_cache_retention_hours <= 0:
+            return
+        cache_root = self._s3_cache_dir or (self.cfg.output_dir / "_s3_cache")
+        if not cache_root.exists():
+            return
+        cutoff = time.time() - self.cfg.s3_cache_retention_hours * 3600
+        n = 0
+        try:
+            for f in cache_root.rglob("*"):
+                if not f.is_file():
+                    continue
+                try:
+                    if f.stat().st_mtime < cutoff:
+                        f.unlink()
+                        n += 1
+                except OSError:
+                    continue
+            if n:
+                self._tlog.info(
+                    f"pruned {n} stale _s3_cache file(s) older than "
+                    f"{self.cfg.s3_cache_retention_hours}h"
+                )
+        except Exception as exc:
+            self._tlog.debug(f"_s3_cache prune failed: {exc}")

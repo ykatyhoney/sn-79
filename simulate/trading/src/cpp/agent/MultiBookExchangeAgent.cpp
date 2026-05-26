@@ -258,7 +258,10 @@ void MultiBookExchangeAgent::configure(const pugi::xml_node& node)
         const size_t detailedDepth = booksNode.attribute("detailedDepth").as_ullong(5);
 
         m_bookProcessManager = taosim::book::BookProcessManager::fromXML(
-            booksNode, const_cast<Simulation*>(simulation()), &m_config2);
+            booksNode,
+            const_cast<Simulation*>(simulation()),
+            &m_config2,
+            simulation()->sharedResources());
 
         if (std::string(node.child("FeePolicy").attribute("type").as_string()) == "dynamic"){
             simulation()->logDebug("DYNAMIC FEE POLICY");

@@ -1,19 +1,8 @@
 #!/usr/bin/env bash
-# Start MinIO (local S3) and create bucket.
-# Sources env vars into the current shell.
-#
-# Does NOT wipe data — bucket contents are preserved if the container is reused.
-# To wipe data at proxy test start, call bin/proxy/wipe_bucket after sourcing this.
-#
-# Usage: source agents/proxy/setup_minio
-#        (must be sourced, not executed, to export env vars)
 SCRIPT_DIR=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
 G=$(realpath "$SCRIPT_DIR/../..")
 PY3="${VIRTUAL_ENV:+$VIRTUAL_ENV/bin/python}"
 PY3="${PY3:-python3}"
-
-# Load repo .env so TAOS_MINIO_BIN and overrides are available
-[ -f "$G/.env" ] && . "$G/.env"
 
 MINIO_CONTAINER="${MINIO_CONTAINER:-gentrx_minio}"
 MINIO_PORT="${MINIO_PORT:-9000}"

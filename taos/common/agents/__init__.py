@@ -19,7 +19,8 @@ class SimulationAgent(ABC):
         if not log_dir:
             log_dir = f"logs/{uid}"
         self.log_dir = log_dir
-        self.data_dir = getattr(self.config, 'data_dir', '../../../agents/data')
+        default_data_dir = str(Path(__file__).resolve().parents[3] / "agents" / "data")
+        self.data_dir = getattr(self.config, 'data_dir', default_data_dir)
         Path(self.data_dir).mkdir(parents=True, exist_ok=True)
         self.output_dir = os.path.join(self.data_dir, str(self.uid))
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)

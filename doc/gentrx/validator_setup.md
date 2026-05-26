@@ -59,7 +59,7 @@ If you prefer to manage processes individually (systemd, custom scripts), the se
 
 ## Architecture
 
-GenTRX maintains a **canonical model** updated each round by a designated aggregator (uid 0) operated by the MVTRX team. Validators (uid 1+) score miners independently, aggregate locally, and publish proposals to their own bucket; the aggregator evaluates all proposals and publishes the winning checkpoint. All validators commit their bucket to chain at startup, and miners discover buckets without pre-configuration (see [fallback](#bucket-setup)).
+GenTRX maintains a **canonical model** updated each round by a designated aggregator (uid 0) operated by the MVTRX team. Validators (uid 1+) score miners independently, aggregate locally, and publish proposals to their own bucket; the aggregator evaluates all proposals and publishes the winning checkpoint. All validators commit their bucket to chain at startup, and miners discover buckets from those commitments without pre-configuration.
 
 For the cross-validator proposal flow, see [`data_flow.md` § Multi-Validator Design](data_flow.md#multi-validator-design).
 
@@ -104,36 +104,9 @@ treeView-beta
 
 **Writer**: Your gradient server (write creds never leave this host) **Reader**: All miners and sibling validators (via chain-committed read credentials) **Chain**: Read credentials committed on-chain at validator startup
 
-**Important: uid-0 bootstrap responsibility.** The aggregator (uid 0) bucket is the canonical checkpoint source for the entire subnet. Miners and sibling validators pull checkpoints from it, discovered via chain commitment.
+**uid-0 publishes the canonical checkpoint.** The aggregator (uid 0) bucket is the checkpoint source for the entire subnet. Miners and sibling validators discover it from the chain commitment uid 0 writes at startup, the same path every other validator uses for its own bucket.
 
-The chain commitment is the default discovery path. For robustness against chain propagation delays and transient RPC failures, the uid-0 operator **publishes read credentials** in a well-known location so other participants can pin them as a fallback.
-
-Two env-var namespaces are in play here, and they are different because a sibling validator already uses `GENTRX_VALIDATOR_S3_*` for its own bucket:
-
-| Env namespace | Points at | Set by |
-|---|---|---|
-| `GENTRX_VALIDATOR_S3_*` | **Your own** validator bucket. Writeable. | Every validator (aggregator and siblings). Miners do not set this. |
-| `GENTRX_AGGREGATOR_S3_*` | **uid-0's** bucket. Read-only. Fallback used when chain discovery has not resolved yet. | Miners (always, as the env-var fallback). Sibling validators (optional). |
-
-Sibling validator `.env` fallback block (uses uid-0's published read pair):
-
-```bash
-GENTRX_AGGREGATOR_S3_BUCKET=<uid-0-bucket>
-GENTRX_AGGREGATOR_S3_ACCOUNT_ID=<uid-0-account-id>
-GENTRX_AGGREGATOR_S3_READ_ACCESS_KEY=<uid-0-scoped-read-key>
-GENTRX_AGGREGATOR_S3_READ_SECRET_KEY=<uid-0-scoped-read-secret>
-```
-
-The aggregator's own gradient server does not need these; it reads from and writes to its own bucket via `GENTRX_VALIDATOR_S3_*`.
-
-Only the **read** pair is published. Write keys stay on the uid-0 host.
-
-Canonical places for uid-0 to publish the read pair:
-- Subnet's GitHub README (or a dedicated `SUBNET_BOOTSTRAP.md`)
-- Subnet Discord pinned message
-- Chain commitment from owner / sn-owner hotkey (alternative: write the same string via `btcli commit` so the chain also carries a known-good copy)
-
-**Miner-side wiring is automatic.** `GenTRXAgent._get_aggregator_store_for_assignment` tries, in order: (1) `gtx_aggregator_uid` from `--agent.params` via chain commitment, (2) the miner's `GENTRX_AGGREGATOR_S3_*` env vars as a pinned fallback, (3) the assignment's `validator_uid` via chain commitment, (4) any other chain-committed validator bucket. The env-var fallback at step 2 covers the bootstrap window before the aggregator's chain commit propagates and remains a permanent backup if chain lookups ever fail.
+The aggregator and siblings both use `GENTRX_VALIDATOR_S3_*` to point at their own bucket. The aggregator writes; siblings write to their own bucket and pull uid-0's checkpoint from chain. No separate aggregator-pointing env namespace is required on the miner or sibling side.
 
 **Credential rotation:** committed read creds go on-chain, so rotation requires a new chain commit. Plan your token lifetimes accordingly (30-day rotation is pragmatic; automate via a cron re-running `commit_bucket`).
 
@@ -447,10 +420,6 @@ Read credentials committed on-chain are public by design: peers need them to pul
 - The on-chain commitment is static; rotate read tokens manually on whatever schedule fits your operator policy. Quarterly is a reasonable default.
 
 The gradient server's collect path runs sequentially today, which keeps the local boto3 client pool predictable. If collection moves to a concurrent fan-out at higher miner counts, Templar's `client_semaphore` + `upload_sem` pattern in `templar/src/tplr/comms.py` is the shape for capping the local pool (a self-throttle, not an access control).
-
-### Checkpoint access fallback
-
-If uid-0 has not yet committed its bucket on-chain, miners and sibling validators fall back to `GENTRX_AGGREGATOR_S3_*` env vars for the canonical checkpoint source. Once uid-0 commits, the chain path takes over automatically.
 
 ---
 
