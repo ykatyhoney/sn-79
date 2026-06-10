@@ -313,6 +313,21 @@ if [ "$SKIP_UPDATE" = "0" ]; then
     pip install -e .
 fi
 
+# scalecodec ↔ cyscale conflict: bittensor's transitive deps drag py-scale-codec
+# (PyPI package `scalecodec`) back in on every `pip install -e .`, even though
+# we want cyscale to provide the `scalecodec` namespace. Both installed at once
+# → async_substrate_interface raises a RuntimeError at `import bittensor` time
+# and the gradient server never starts. Detect by trying to import bittensor;
+# on failure, uninstall both and force-reinstall cyscale. Idempotent. Mirrors
+# the repair in run_validator.sh.
+# Runs even when -n (SKIP_UPDATE=1) is passed: the conflict can be present on
+# a host that skipped the update step.
+if ! python3 -c "import bittensor" >/dev/null 2>&1; then
+    echo "Repairing scalecodec/cyscale conflict (bittensor import failed)"
+    pip uninstall -y scalecodec cyscale 2>/dev/null || true
+    pip install --force-reinstall --no-cache-dir cyscale
+fi
+
 # CUDA check — warn with install command if torch has no CUDA
 _cuda_ok=$(python3 -c "
 try:
@@ -397,6 +412,18 @@ chmod +x "$LAUNCHER"
 if [ "$PRESERVE" = "0" ]; then
     pm2 delete gradient-server 2>/dev/null || true
 fi
+
+# pm2 log rotation: cap each .log at 100 MB, keep 10 rotated copies, gzip
+# old ones. Idempotent — `pm2 install` is a no-op when already present, and
+# `pm2 set` overwrites silently. Applies daemon-wide (also covers validator,
+# miner, etc. if they're running under the same pm2).
+if ! pm2 describe pm2-logrotate >/dev/null 2>&1; then
+    pm2 install pm2-logrotate >/dev/null 2>&1 || true
+fi
+pm2 set pm2-logrotate:max_size 100M >/dev/null 2>&1 || true
+pm2 set pm2-logrotate:retain 10 >/dev/null 2>&1 || true
+pm2 set pm2-logrotate:compress true >/dev/null 2>&1 || true
+
 pm2 start --name=gradient-server "$LAUNCHER"
 pm2 save
 echo ""

@@ -553,6 +553,11 @@ class MinerTrainingService:
                 lr=self.cfg.train_lr,
                 window_id=self.state.train_window_id,
                 miner_uid=self.cfg.uid,
+                # Tag with the version actually loaded so the aggregator's
+                # version-mismatch filter can drop stale-regime gradients.
+                # Without this the metadata defaults to 0 and the filter
+                # silently passes everything through (trained_v=0 is falsy).
+                model_version=int(self.state.model_version or 0),
                 label_smooth_sigma=self.cfg.label_smooth_sigma,
             )
             delta = train_window(train_model, loader, win_cfg, self.device)

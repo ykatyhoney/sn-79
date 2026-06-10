@@ -42,8 +42,14 @@ from GenTRX.src.gradient import (
 )
 from GenTRX.src.model import OrderModel, compute_loss
 from GenTRX.src.train import _forward_batch
+from GenTRX.src.bt_log import gtx_log
 
 logger = logging.getLogger(__name__)
+
+# Returned instead of inf when an eval has no usable (finite) batches. A large
+# finite value keeps comparisons/serialization normal — it sorts as "very bad"
+# so scoring rejects and aggregation rolls back, without any inf in the system.
+_MAX_EVAL_LOSS = 1e4
 
 
 @dataclass
@@ -200,6 +206,36 @@ def evaluate_gradient(
     return score
 
 
+def _log_bad_batch(i, batch, logits, labels, details):
+    """Diagnostic dump for a val batch whose loss is non-finite on every row.
+    Shows which field, whether logits overflowed (forward issue) vs not (label/
+    input issue), label ranges, and input magnitudes — so the cause is visible
+    without reproducing offline."""
+    try:
+        nonfinite_logits = {
+            k: int((~torch.isfinite(v)).sum().item()) for k, v in logits.items()
+        }
+        logit_absmax = {
+            k: round(float(v.detach().float().abs().max().item()), 3)
+            for k, v in logits.items()
+        }
+        label_range = {
+            k: (int(v.min().item()), int(v.max().item())) for k, v in labels.items()
+        }
+        input_absmax = {}
+        if hasattr(batch, "items"):
+            for k, v in batch.items():
+                if torch.is_tensor(v) and v.numel():
+                    input_absmax[k] = round(float(v.detach().float().abs().max().item()), 3)
+        gtx_log.warning(
+            "BAD VAL BATCH i=%d (all rows non-finite): per_field_loss=%s "
+            "nonfinite_logits=%s logit_absmax=%s label_range=%s input_absmax=%s"
+            % (i, details, nonfinite_logits, logit_absmax, label_range, input_absmax)
+        )
+    except Exception as exc:
+        gtx_log.warning("bad-batch dump failed (i=%d): %s" % (i, exc))
+
+
 def _eval_loss(
     model: OrderModel,
     loader: DataLoader,
@@ -207,20 +243,40 @@ def _eval_loss(
     max_batches: int,
     label_smooth_sigma: float = 0.0,
 ) -> float:
-    """Compute average loss over up to max_batches."""
+    """Average loss over up to max_batches. Non-finite rows are masked within a
+    batch; a batch is skipped (and dumped) only if every row is non-finite."""
     model.eval()
     total = 0.0
     n = 0
+    n_bad = 0
+    n_salvaged = 0
     with torch.no_grad():
         for i, batch in enumerate(loader):
             if i >= max_batches:
                 break
             logits, labels = _forward_batch(model, batch, device)
-            loss, _ = compute_loss(logits, labels, label_smooth_sigma=label_smooth_sigma)
-            total += loss.item()
+            loss, details = compute_loss(
+                logits, labels, label_smooth_sigma=label_smooth_sigma,
+                mask_nonfinite_rows=True,
+            )
+            lv = loss.item()
+            if not math.isfinite(lv):
+                n_bad += 1
+                _log_bad_batch(i, batch, logits, labels, details)
+                continue
+            if not all(bool(torch.isfinite(v).all()) for v in logits.values()):
+                n_salvaged += 1
+            total += lv
             n += 1
     model.train()
-    return total / max(n, 1)
+    if n_bad or n_salvaged:
+        gtx_log.warning(
+            "eval: %d/%d batches non-finite, skipped; %d salvaged via row-masking"
+            % (n_bad, n_bad + n, n_salvaged)
+        )
+    if n == 0:
+        return _MAX_EVAL_LOSS if n_bad else 0.0
+    return total / n
 
 
 def _eval_loss_per_field(
@@ -234,18 +290,60 @@ def _eval_loss_per_field(
     model.eval()
     total = 0.0
     n = 0
+    n_bad = 0
+    n_salvaged = 0
+    per_batch_losses: list[float] = []
     per_field_sum: dict[str, float] = {}
     with torch.no_grad():
         for i, batch in enumerate(loader):
             if i >= max_batches:
                 break
             logits, labels = _forward_batch(model, batch, device)
-            loss, details = compute_loss(logits, labels, label_smooth_sigma=label_smooth_sigma)
-            total += loss.item()
+            loss, details = compute_loss(
+                logits, labels, label_smooth_sigma=label_smooth_sigma,
+                mask_nonfinite_rows=True,
+            )
+            lv = loss.item()
+            # Always-on per-batch trace at DEBUG-level so a finer-grained
+            # picture is one --logging.debug flip away. INFO summary below.
+            per_batch_losses.append(lv)
+            gtx_log.debug(
+                "eval(per-field) batch %d: lv=%r finite=%s details=%s",
+                i, lv, math.isfinite(lv), {k: round(v, 4) for k, v in details.items()},
+            )
+            if not math.isfinite(lv):
+                n_bad += 1
+                _log_bad_batch(i, batch, logits, labels, details)
+                continue
+            if not all(bool(torch.isfinite(v).all()) for v in logits.values()):
+                n_salvaged += 1
+            total += lv
             for name, val in details.items():
                 per_field_sum[name] = per_field_sum.get(name, 0.0) + val
             n += 1
     model.train()
-    denom = max(n, 1)
-    per_field_avg = {name: s / denom for name, s in per_field_sum.items()}
-    return total / denom, per_field_avg
+    # Always log a one-line trace summary so the eval's internal state is
+    # visible even when nothing's flagged as bad. Useful when the rollback
+    # log says ↑ inf but no BAD VAL BATCH was emitted — the per-batch and
+    # cumulative-total values surface the actual progression.
+    finite_batches = [v for v in per_batch_losses if math.isfinite(v)]
+    summary_max = max(finite_batches) if finite_batches else float("nan")
+    summary_min = min(finite_batches) if finite_batches else float("nan")
+    gtx_log.info(
+        "eval(per-field): n=%d n_bad=%d n_salvaged=%d total=%r batch_max=%.4g batch_min=%.4g per_batch=%s",
+        n, n_bad, n_salvaged, total, summary_max, summary_min,
+        [round(v, 4) if math.isfinite(v) else repr(v) for v in per_batch_losses],
+    )
+    if n_bad or n_salvaged:
+        gtx_log.warning(
+            "eval(per-field): %d/%d batches non-finite, skipped; %d salvaged via row-masking"
+            % (n_bad, n_bad + n, n_salvaged)
+        )
+    if n == 0:
+        return (_MAX_EVAL_LOSS if n_bad else 0.0), {}
+    per_field_avg = {name: s / n for name, s in per_field_sum.items()}
+    avg = total / n
+    gtx_log.info(
+        "eval(per-field) returning avg=%r (total=%r / n=%d)", avg, total, n,
+    )
+    return avg, per_field_avg

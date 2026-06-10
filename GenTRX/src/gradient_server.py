@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import json as _json
 import logging
+import math
 import os
 import random
 import secrets
@@ -89,6 +90,23 @@ _ASSIGNMENT_PERSIST_FIELDS = (
     "ts_end",
     "model_version",
 )
+
+
+def _json_safe(obj):
+    # Diverged gradients yield inf/nan losses that starlette's encoder (allow_nan=False) 500s on.
+    if isinstance(obj, float):
+        if obj != obj:
+            return 0.0
+        if obj == float("inf"):
+            return 1e30
+        if obj == float("-inf"):
+            return -1e30
+        return obj
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
 
 
 def _serialize_assignments(d: dict) -> dict:
@@ -208,6 +226,10 @@ class GradientAggregator:
         overfit_ratio: float = 3.0,
         overfit_penalty: float = 0.1,
         proposal_norm_ratio: float = 10.0,
+        max_grad_norm: float | None = None,
+        max_agg_norm: float | None = None,
+        max_agg_element: float | None = None,
+        no_startup_cleanup: bool = True,
         keep_checkpoints: int = 10,
         keep_proposals: int = 10,
         s3_cache_retention_hours: float = 24.0,
@@ -334,6 +356,10 @@ class GradientAggregator:
         self._restored_sim_id: str | None = None
         # Sim id from the bucket marker (data/<uid>/.sim_id).
         self._bucket_sim_id: str | None = None
+        # Last sim_id durably written to the bucket marker. Re-asserted on each
+        # flush so the marker always matches the data on disk (a bind-time write
+        # can fail silently and strand a stale marker → false wipe on restart).
+        self._sim_marker_written: str | None = None
         # Sim transition handling. Set to True when an 'ESE' marker is seen
         # (or when the heuristic detects a restart without an explicit
         # marker). Picked up by the aggregation loop on its next tick,
@@ -457,6 +483,27 @@ class GradientAggregator:
         self.overfit_ratio: float = overfit_ratio
         self.overfit_penalty: float = overfit_penalty
         self.proposal_norm_ratio: float = proposal_norm_ratio
+        # Reject a miner gradient whose L2 norm exceeds this. None disables;
+        # set once the per-miner grad_norm log reveals the legitimate range.
+        self.max_grad_norm: float | None = max_grad_norm
+        # Scale the AGGREGATED delta (after compress) so its L2 norm is at
+        # most this. None disables. Use when one valid-but-large gradient
+        # dominates the proposal and pushes the apply over fp32-stability on
+        # a fresh-init model — capping the magnitude preserves direction
+        # while preventing forward-pass overflow. Distinct from
+        # `max_grad_norm`, which rejects per-miner *inputs* outright.
+        self.max_agg_norm: float | None = max_agg_norm
+        # Element-wise clamp on the aggregated delta: every sparse value is
+        # clamped to ±max_agg_element after compression. Catches single-
+        # weight overshoots that the norm cap misses (a delta with low total
+        # norm can still have one outlier element that breaks softmax).
+        # Slightly direction-distorting at the saturating entries; preserves
+        # the rest. None disables.
+        self.max_agg_element: float | None = max_agg_element
+        # Operator override: never wipe data/ on the startup sim-id bind (a pm2
+        # restart resumes the existing data). A genuine rollover detected at
+        # runtime still cleans up.
+        self._no_startup_cleanup: bool = no_startup_cleanup
         self._pending_rows: dict[int, list[dict]] = {}  # book_id → rows
         self._pending_interval_start: dict[int, int] = {}  # book_id → interval start ts
         # Cap on in-memory staging rows per book. Flush early when exceeded so
@@ -495,6 +542,12 @@ class GradientAggregator:
         # training).  Enables warmup — first N rounds accept all gradients
         # and skip val rollback so the model can bootstrap from random weights.
         self._fresh_start = False
+        # Anchors the warmup window to whatever _agg_round value we're
+        # starting from. The gate must not key on `_agg_round < warmup_rounds`
+        # alone, because a regime-incompatible restart restores _agg_round
+        # from disk (often >> warmup_rounds) and the warmup would never fire.
+        # Set in `start()` after state restore, when `_fresh_start` is True.
+        self._warmup_anchor_round: int = -1
 
         # Lazy-loaded
         self._model = None
@@ -503,14 +556,18 @@ class GradientAggregator:
     @property
     def _effective_min_score(self) -> float:
         """Min score threshold, disabled during warmup rounds after fresh start."""
-        if self._fresh_start and self._agg_round < self.warmup_rounds:
+        if self._fresh_start and self._warmup_anchor_round >= 0 and (
+            self._agg_round - self._warmup_anchor_round < self.warmup_rounds
+        ):
             return float("-inf")
         return self.min_score
 
     @property
     def _effective_rollback(self) -> bool:
         """Rollback check, disabled during warmup rounds after fresh start."""
-        if self._fresh_start and self._agg_round < self.warmup_rounds:
+        if self._fresh_start and self._warmup_anchor_round >= 0 and (
+            self._agg_round - self._warmup_anchor_round < self.warmup_rounds
+        ):
             return False
         return self.rollback
 
@@ -1427,16 +1484,16 @@ class GradientAggregator:
                     # warmup and drop the data/ collected under the old regime.
                     self._version = existing_version
                     if self._regime_incompatible():
+                        # A train-regime bump (e.g. strict→soft CE) makes the old
+                        # model's scores incomparable, so re-warmup from the
+                        # existing weights. The order data is regime-independent,
+                        # so KEEP it — do not wipe data/ (that also stops a
+                        # missing/old stamp from nuking data on every restart).
                         self._fresh_start = True
-                        self._data_cleanup_pending = True
-                        # Drop in-memory + local staging so the restores below
-                        # don't re-adopt data collected under the old regime;
-                        # the S3 data/ delete runs on the first loop tick.
-                        self._reset_sim_buffers()
                         logger.warning(
                             "Existing checkpoint v%d predates train regime %d — "
-                            "keeping weights as init, forcing %d warmup round(s) "
-                            "and queueing data/ cleanup",
+                            "keeping weights as init and forcing %d warmup round(s); "
+                            "data/ retained (regime-independent)",
                             self._version,
                             TRAIN_REGIME_VERSION,
                             self.warmup_rounds,
@@ -1472,6 +1529,42 @@ class GradientAggregator:
             # force a full 5-min re-accumulation before assignments can be created.
             if self.validator_store is not None:
                 self._restore_written_parquets()
+
+        # A full crash loses the local round file; the round is block-derived
+        # (round = block // blocks_per_round, sim-independent), so reseed it from
+        # the chain on a cold start to match live miner uploads instead of
+        # stalling at round 0. Only fires when neither the local restore nor a
+        # validator POST /round supplied a round; chain failure is non-fatal.
+        if (
+            self._chain is not None
+            and self.blocks_per_round > 0
+            and self._agg_round == 0
+        ):
+            try:
+                block = int(self._chain.subtensor.get_current_block())
+                seeded = block // self.blocks_per_round
+                if seeded > 0:
+                    self._agg_round = seeded
+                    logger.info(
+                        "Seeded agg_round=%d from chain block %d (no local round to restore)",
+                        seeded,
+                        block,
+                    )
+            except Exception as exc:
+                logger.warning("Could not seed agg_round from chain: %s", exc)
+
+        # Anchor the warmup window. After state restore + chain reseed,
+        # `_agg_round` reflects the round we'll actually start aggregating
+        # from — that's the moment to peg the warmup gate against, so
+        # `warmup_rounds` rounds of accept-all/no-rollback fire from here
+        # regardless of how high the restored counter is.
+        if self._fresh_start:
+            self._warmup_anchor_round = self._agg_round
+            logger.info(
+                "Warmup window anchored at round %d (warmup_rounds=%d)",
+                self._warmup_anchor_round,
+                self.warmup_rounds,
+            )
 
         self._running = True
         self._thread = threading.Thread(target=self._aggregation_loop, daemon=True)
@@ -2423,7 +2516,30 @@ class GradientAggregator:
 
             expected_v = int(assignment.get("model_version", 0) or 0)
             trained_v = int(getattr(comp.metadata, "model_v_trained", 0) or 0)
-            if trained_v and expected_v and trained_v != expected_v:
+            logger.info(
+                "  miner %d: trained=v%d expected=v%d",
+                miner_uid, trained_v, expected_v,
+            )
+            # NOTE: strict rejection of untagged (`trained_v=0`) gradients is
+            # currently DISABLED to keep the network functional while the
+            # miner-side version-tagging patch hasn't propagated. When the
+            # public miner code has been updated, re-enable by flipping the
+            # condition below to also flag `not trained_v` as mismatched.
+            if False and not trained_v:  # noqa: SIM223 — gated rejection, see note above
+                logger.warning(
+                    "  miner %d: gradient untagged (model_v_trained=0) — rejected",
+                    miner_uid,
+                )
+                assignment["_version_mismatched"] = True
+            elif not trained_v:
+                # Soft path: log so we can still see who's submitting without
+                # version metadata, but accept the gradient into aggregation.
+                logger.info(
+                    "  miner %d: gradient untagged (pre-patch miner, accepted)",
+                    miner_uid,
+                )
+                assignment["_version_mismatched"] = False
+            elif expected_v and trained_v != expected_v:
                 logger.warning(
                     "  miner %d: model_v mismatch (trained=%d, assignment=%d)",
                     miner_uid,
@@ -2436,8 +2552,16 @@ class GradientAggregator:
 
             grad_norm_sq = 0.0
             for _, (_, vals, _) in comp.sparse.items():
-                grad_norm_sq += float(vals.pow(2).sum().item())
-            assignment["_grad_norm"] = grad_norm_sq ** 0.5
+                grad_norm_sq += float(vals.double().pow(2).sum().item())
+            grad_norm = grad_norm_sq ** 0.5
+            assignment["_grad_norm"] = grad_norm
+            logger.info("  miner %d: grad_norm=%.4g", miner_uid, grad_norm)
+            if self.max_grad_norm is not None and grad_norm > self.max_grad_norm:
+                logger.warning(
+                    "  miner %d: gradient rejected, norm %.4g > max %.4g",
+                    miner_uid, grad_norm, self.max_grad_norm,
+                )
+                return None
 
             t_loader_start = time.time()
             miner_loader = self._build_miner_loader(assignment, tokenizer, device)
@@ -2630,12 +2754,32 @@ class GradientAggregator:
         import torch
 
         from GenTRX.src.distributed import _eval_loss, _eval_loss_per_field
-        from GenTRX.src.gradient import aggregate, apply_gradient, decompress, serialize
+        from GenTRX.src.gradient import (
+            aggregate, apply_gradient, compress, decompress, serialize,
+        )
 
         threshold = self._effective_min_score
 
-        accepted = [(m, w, s, c, a) for m, w, s, c, a in scored if s > threshold]
-        rejected = [(m, w, s, a) for m, w, s, _, a in scored if s <= threshold]
+        # Version-mismatched gradients are trained against an older model
+        # than the one we'd apply them to — their direction-of-improvement is
+        # for a checkpoint that no longer exists. Letting them into the
+        # aggregation pollutes the proposal (and, on a fresh-regime random
+        # init, can push the apply over fp32 stability). Drop them outside
+        # warmup; during warmup we accept anything since the model is being
+        # bootstrapped from scratch.
+        in_warmup = self._fresh_start and self._warmup_anchor_round >= 0 and (
+            self._agg_round - self._warmup_anchor_round < self.warmup_rounds
+        )
+
+        def _is_acceptable(s: float, a: dict) -> bool:
+            if s <= threshold:
+                return False
+            if not in_warmup and a.get("_version_mismatched"):
+                return False
+            return True
+
+        accepted = [(m, w, s, c, a) for m, w, s, c, a in scored if _is_acceptable(s, a)]
+        rejected = [(m, w, s, a) for m, w, s, _, a in scored if not _is_acceptable(s, a)]
 
         n_assigned = len(round_assignments)
         n_delivered = sum(1 for _, a in round_assignments if a.get("_delivered_at"))
@@ -2681,10 +2825,12 @@ class GradientAggregator:
         per_field_before: dict[str, float] = {}
         per_field_after: dict[str, float] = {}
 
-        if self._fresh_start and self._agg_round < self.warmup_rounds:
+        if self._fresh_start and self._warmup_anchor_round >= 0 and (
+            self._agg_round - self._warmup_anchor_round < self.warmup_rounds
+        ):
             logger.info(
                 "  Warmup round %d/%d — min_score disabled, rollback disabled",
-                self._agg_round + 1,
+                (self._agg_round - self._warmup_anchor_round) + 1,
                 self.warmup_rounds,
             )
 
@@ -2728,7 +2874,58 @@ class GradientAggregator:
 
         # --- Phase 1: Local aggregation (all validators) ---
         # Every validator aggregates its own accepted gradients into a delta.
-        local_agg = aggregate([c for _, _, _, c, _ in accepted])
+        # `aggregate()` returns a fully-dense CompressedGradient (every index
+        # kept) — re-compress to top-k so the proposal serializes to the same
+        # size budget as a single miner gradient and the model is updated
+        # only on the top-k parameters instead of all of them.
+        local_agg_dense = aggregate([c for _, _, _, c, _ in accepted])
+        local_agg = compress(decompress(local_agg_dense), top_k_frac=0.05)
+
+        # Aggregated-delta safety: always log the L2 norm + max |element|
+        # so the operator can see the distribution and tune the caps. The
+        # norm cap scales the whole delta down proportionally; the element
+        # cap clamps individual sparse entries that exceed the bound.
+        agg_norm_sq = 0.0
+        agg_max_elem = 0.0
+        for _, (_, vals, _) in local_agg.sparse.items():
+            if vals.numel() == 0:
+                continue
+            agg_norm_sq += float(vals.double().pow(2).sum().item())
+            m = float(vals.double().abs().max().item())
+            if m > agg_max_elem:
+                agg_max_elem = m
+        agg_norm = agg_norm_sq ** 0.5
+        logger.info(
+            "  local_agg norm=%.4g max_elem=%.4g (cap_norm=%s cap_elem=%s)",
+            agg_norm, agg_max_elem,
+            f"{self.max_agg_norm:.4g}" if self.max_agg_norm is not None else "off",
+            f"{self.max_agg_element:.4g}" if self.max_agg_element is not None else "off",
+        )
+
+        if self.max_agg_norm is not None and self.max_agg_norm > 0 and agg_norm > self.max_agg_norm:
+            scale = self.max_agg_norm / agg_norm
+            for name, (idx, vals, shape) in list(local_agg.sparse.items()):
+                local_agg.sparse[name] = (idx, vals * scale, shape)
+            logger.warning(
+                "  local_agg norm %.4g > cap %.4g → scaled by %.4g",
+                agg_norm, self.max_agg_norm, scale,
+            )
+
+        if (
+            self.max_agg_element is not None and self.max_agg_element > 0
+            and agg_max_elem > self.max_agg_element
+        ):
+            cap = self.max_agg_element
+            n_clamped = 0
+            for name, (idx, vals, shape) in list(local_agg.sparse.items()):
+                clipped = vals.clamp(-cap, cap)
+                n_clamped += int((clipped != vals).sum().item())
+                local_agg.sparse[name] = (idx, clipped, shape)
+            logger.warning(
+                "  local_agg max_elem %.4g > cap %.4g → clamped %d entries",
+                agg_max_elem, cap, n_clamped,
+            )
+
         local_delta = decompress(local_agg)
 
         # Publish the local delta as a proposal — proof of work.
@@ -2790,7 +2987,7 @@ class GradientAggregator:
                 candidates.extend(proposals)
 
                 local_norm_sq = sum(
-                    float(vals.pow(2).sum().item())
+                    float(vals.double().pow(2).sum().item())
                     for _, (_, vals, _) in local_agg.sparse.items()
                 )
                 local_norm = local_norm_sq ** 0.5
@@ -2801,7 +2998,7 @@ class GradientAggregator:
                 for label, comp in candidates:
                     if label != "local" and local_norm > 0:
                         cand_norm = sum(
-                            float(vals.pow(2).sum().item())
+                            float(vals.double().pow(2).sum().item())
                             for _, (_, vals, _) in comp.sparse.items()
                         ) ** 0.5
                         if cand_norm > norm_threshold:
@@ -2816,16 +3013,31 @@ class GradientAggregator:
                             continue
                     model.load_state_dict(original_state)
                     delta = decompress(comp)
+                    # Pre-apply diagnostic for this candidate's delta.
+                    try:
+                        _d_norm_sq = 0.0
+                        _d_max = 0.0
+                        for _t in delta.delta.values():
+                            if _t.numel() == 0:
+                                continue
+                            _d_norm_sq += float(_t.double().pow(2).sum().item())
+                            _m = float(_t.double().abs().max().item())
+                            if _m > _d_max:
+                                _d_max = _m
+                        logger.info(
+                            "  Proposal %s pre-apply: delta norm=%.4g max_abs=%.4g",
+                            label, _d_norm_sq ** 0.5, _d_max,
+                        )
+                    except Exception as exc:
+                        logger.warning("  Proposal %s delta stats failed: %s", label, exc)
                     apply_gradient(model, delta)
                     loss = _eval_loss(
                         model, val_loader, device, self.max_val_batches,
                         self.label_smooth_sigma,
                     )
                     logger.info(
-                        "  Proposal %s: val loss %.4f (baseline %.4f)",
-                        label,
-                        loss,
-                        baseline_loss,
+                        "  Proposal %s: val loss %r (baseline %.4f, finite=%s)",
+                        label, loss, baseline_loss, math.isfinite(loss),
                     )
                     if loss < best_loss:
                         best_loss = loss
@@ -2838,22 +3050,90 @@ class GradientAggregator:
                 # Restore and apply the winner
                 model.load_state_dict(original_state)
 
-            # Apply the chosen delta and check rollback
-            apply_gradient(model, best_delta)
-            if self.is_aggregator:
-                new_loss, per_field_after = _eval_loss_per_field(
-                    model, val_loader, device, self.max_val_batches,
-                    self.label_smooth_sigma,
+            # Apply the chosen delta and check rollback. Detailed pre/post
+            # state logging so the actual failure point is in the log even
+            # when the inputs to apply_gradient look benign.
+            try:
+                bd_norm_sq = 0.0
+                bd_max_abs = 0.0
+                bd_n = 0
+                for _name, _t in best_delta.delta.items():
+                    if _t.numel() == 0:
+                        continue
+                    bd_norm_sq += float(_t.double().pow(2).sum().item())
+                    m = float(_t.double().abs().max().item())
+                    if m > bd_max_abs:
+                        bd_max_abs = m
+                    bd_n += int(_t.numel())
+                logger.info(
+                    "  pre-apply best_delta(label=%s): n_elems=%d norm=%.4g max_abs=%.4g",
+                    best_label, bd_n, bd_norm_sq ** 0.5, bd_max_abs,
                 )
-            else:
-                new_loss = best_loss
+            except Exception as exc:
+                logger.warning("  pre-apply best_delta stats failed: %s", exc)
+
+            try:
+                w_max_abs = 0.0
+                for _p in model.parameters():
+                    if _p.numel() == 0:
+                        continue
+                    m = float(_p.data.double().abs().max().item())
+                    if m > w_max_abs:
+                        w_max_abs = m
+                logger.info(
+                    "  pre-apply model param max_abs=%.4g (baseline_loss=%r)",
+                    w_max_abs, baseline_loss,
+                )
+            except Exception as exc:
+                logger.warning("  pre-apply model param stats failed: %s", exc)
+
+            apply_gradient(model, best_delta)
+
+            try:
+                w_max_abs_after = 0.0
+                w_nonfinite = 0
+                for _p in model.parameters():
+                    if _p.numel() == 0:
+                        continue
+                    m = float(_p.data.double().abs().max().item())
+                    if m > w_max_abs_after:
+                        w_max_abs_after = m
+                    w_nonfinite += int((~torch.isfinite(_p.data)).sum().item())
+                logger.info(
+                    "  post-apply model param max_abs=%.4g n_nonfinite=%d",
+                    w_max_abs_after, w_nonfinite,
+                )
+            except Exception as exc:
+                logger.warning("  post-apply model param stats failed: %s", exc)
+
+            # Both aggregator and siblings evaluate the applied delta against
+            # the val set. Previously this was gated on `is_aggregator` and
+            # the else branch fell back to `new_loss = best_loss`, but for
+            # siblings the candidates loop above is also gated on
+            # `is_aggregator` — so `best_loss` stays at its initial
+            # `float("inf")` and the rollback check always fires. Run the
+            # eval unconditionally so siblings get a real `new_loss` for the
+            # rollback decision.
+            new_loss, per_field_after = _eval_loss_per_field(
+                model, val_loader, device, self.max_val_batches,
+                self.label_smooth_sigma,
+            )
+            logger.info(
+                "  post-apply new_loss=%r baseline=%r per_field_after=%s",
+                new_loss, baseline_loss,
+                {k: round(v, 4) for k, v in per_field_after.items()},
+            )
 
             for name, val in per_field_before.items():
                 grad_norm_stats[f"per_field_loss_before_{name}"] = val
             for name, val in per_field_after.items():
                 grad_norm_stats[f"per_field_loss_after_{name}"] = val
 
-            if self._effective_rollback and new_loss > baseline_loss:
+            # A non-finite update must never be committed, even during warmup
+            # when the worse-than-baseline rollback is otherwise disabled.
+            if not math.isfinite(new_loss) or (
+                self._effective_rollback and new_loss > baseline_loss
+            ):
                 model.load_state_dict(original_state)
                 logger.warning(
                     "  Rollback: val %.4f → %.4f (worse)", baseline_loss, new_loss
@@ -2861,6 +3141,17 @@ class GradientAggregator:
                 if best_label == "local":
                     for _, _, _, _, a in accepted:
                         a["_was_rollback_winner"] = True
+                # The model was reverted, so the effective post-round loss
+                # equals the baseline. Reporting `loss_after=new_loss` (the
+                # rejected proposal's eval) would surface as a spurious
+                # regression on downstream dashboards even though nothing
+                # actually changed. Overwrite per-field after-stats too —
+                # individual fields can be inf even when the total isn't.
+                # The attempted value stays only in the warning log above,
+                # not in the structured event, so dashboards don't render a
+                # second series alongside the corrected one.
+                for name, val in per_field_before.items():
+                    grad_norm_stats[f"per_field_loss_after_{name}"] = val
                 self._log_event(
                     {
                         "type": "aggregation",
@@ -2872,10 +3163,8 @@ class GradientAggregator:
                         "n_scored": len(scored),
                         "n_accepted": len(accepted),
                         "loss_before": baseline_loss,
-                        "loss_after": new_loss,
-                        "loss_improvement_pct": (
-                            (baseline_loss - new_loss) / max(abs(baseline_loss), 1e-9)
-                        ),
+                        "loss_after": baseline_loss,
+                        "loss_improvement_pct": 0.0,
                         "t_proposal_eval_s": t_proposal_eval,
                         "t_loader_build_s": t_loader_build_total,
                         "rolled_back": True,
@@ -3026,7 +3315,7 @@ class GradientAggregator:
                 "grad_norm": float(grad_norm) if grad_norm is not None else 0.0,
                 "books": a.get("books", []),
             }
-        self._latest_scores = {
+        self._latest_scores = _json_safe({
             "round": self._agg_round,
             "model_version": self._version,
             "scores": scores_dict,
@@ -3040,12 +3329,13 @@ class GradientAggregator:
             },
             "config": {
                 "min_score": self.min_score,
+                "max_grad_norm": self.max_grad_norm,
                 "overfit_penalty": self.overfit_penalty,
                 "overfit_ratio": self.overfit_ratio,
                 "books_per_miner": self.books_per_miner,
                 "val_fraction": self.val_fraction,
             },
-        }
+        })
 
     def _fetch_validator_proposals(
         self,
@@ -3372,6 +3662,20 @@ class GradientAggregator:
         except Exception as exc:
             logger.warning("bucket sim_id marker write failed: %s", exc)
 
+    def _ensure_sim_marker(self) -> None:
+        """Keep data/<uid>/.sim_id consistent with the data we flush. Retries
+        each flush until the write succeeds, so a transient failure can't leave
+        a stale marker that wrongly trips the sim-transition wipe on restart."""
+        if self.validator_store is None or not self._sim_id:
+            return
+        if self._sim_marker_written == self._sim_id:
+            return
+        try:
+            self.validator_store.put_sim_marker(self._validator_uid, self._sim_id)
+            self._sim_marker_written = self._sim_id
+        except Exception as exc:
+            logger.warning("sim_id marker write failed (retry next flush): %s", exc)
+
     def _prune_proposals(self) -> None:
         """Trim this validator's proposals/<uid>/ to keep_proposals newest .grad files."""
         if self.validator_store is None or self.keep_proposals <= 0:
@@ -3465,6 +3769,11 @@ class GradientAggregator:
             except Exception as exc:
                 logger.warning("Sim transition cleanup failed: %s", exc)
         self._clear_local_data_cache()
+        # delete_prefix also removed data/<uid>/.sim_id — re-push the marker for
+        # the current binding so the bucket reflects the live sim (otherwise the
+        # _sim_marker_written guard would think it's still written and skip it).
+        self._sim_marker_written = None
+        self._ensure_sim_marker()
         return n
 
     def _process_tick(self, tick: dict) -> None:
@@ -3601,19 +3910,31 @@ class GradientAggregator:
         # Bind sim_id from any packet that carries one.
         new_sim_id = incoming_sim_id
         if new_sim_id and new_sim_id != self._sim_id:
-            staged_mismatch = (
-                self._restored_sim_id is not None
-                and self._restored_sim_id != new_sim_id
-            )
-            bucket_mismatch = (
-                self._bucket_sim_id is not None and self._bucket_sim_id != new_sim_id
-            )
-            if self._sim_id is None and (staged_mismatch or bucket_mismatch):
+            # Decide a genuine sim transition by the most reliable signal: the
+            # locally-restored marker (written by THIS server while it was
+            # running the sim) takes precedence over the bucket marker, which
+            # can lag a failed write and otherwise trip a false wipe on a normal
+            # restart. Only fall back to the bucket marker on a full crash where
+            # no local marker survived.
+            if self._restored_sim_id is not None:
+                transition = self._restored_sim_id != new_sim_id
+            elif self._bucket_sim_id is not None:
+                transition = self._bucket_sim_id != new_sim_id
+            else:
+                transition = False
+            if self._sim_id is None and transition and self._no_startup_cleanup:
+                logger.warning(
+                    "sim_id transition on restart (restored=%s, bucket=%s → live=%s) "
+                    "but --no-startup-cleanup set: keeping existing data/, NOT wiping. "
+                    "A genuine rollover detected at runtime will still clean up.",
+                    self._restored_sim_id, self._bucket_sim_id, new_sim_id,
+                )
+            elif self._sim_id is None and transition:
                 self._sim_epoch += 1
                 self._reset_sim_buffers()
                 self._data_cleanup_pending = True
                 logger.info(
-                    "sim_id mismatch on restart (staged=%s, bucket=%s → live=%s), "
+                    "sim_id transition on restart (restored=%s, bucket=%s → live=%s), "
                     "advancing sim_epoch to %d and queueing data/ cleanup",
                     self._restored_sim_id,
                     self._bucket_sim_id,
@@ -3623,7 +3944,8 @@ class GradientAggregator:
             self._restored_sim_id = None
             self._sim_id = new_sim_id
             self._bucket_sim_id = new_sim_id
-            self._write_bucket_sim_marker(new_sim_id)
+            self._sim_marker_written = None   # force a re-assert for the new binding
+            self._ensure_sim_marker()
             logger.info(
                 "Bound to sim_id=%s (sim_epoch=%d)", self._sim_id, self._sim_epoch
             )
@@ -3830,6 +4152,9 @@ class GradientAggregator:
             buf = _io.BytesIO()
             pq.write_table(table, buf)
             parquet_bytes = buf.getvalue()
+            # Marker must be current before data lands, so a restart binding to
+            # this sim sees a matching marker and resumes instead of wiping.
+            self._ensure_sim_marker()
             # Write parquets to data bucket (read by miners + validator)
             self.validator_store.put_data(
                 self._validator_uid,
@@ -4378,6 +4703,36 @@ if __name__ == "__main__":
     )
     parser.add_argument("--min-score", type=float, default=-0.1)
     parser.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=None,
+        help="Reject a miner gradient whose L2 norm exceeds this (default: off). "
+        "Set from the per-miner grad_norm log once the legitimate range is known.",
+    )
+    parser.add_argument(
+        "--max-agg-norm",
+        type=float,
+        default=None,
+        help="Cap the aggregated delta's L2 norm by scaling it down (default: off). "
+        "Direction-preserving safety net for outlier rounds where one large gradient "
+        "dominates the top-k re-compression. The rollback check itself catches "
+        "catastrophic applies; this is belt-and-braces. Set to a number to engage.",
+    )
+    parser.add_argument(
+        "--max-agg-element",
+        type=float,
+        default=None,
+        help="Clamp each entry of the aggregated delta to ±this value (default: off). "
+        "Catches single-weight overshoots the norm cap misses. Set to a number to engage.",
+    )
+    parser.add_argument(
+        "--enable-startup-cleanup",
+        action="store_true",
+        help="Allow wiping data/ on the startup sim-id bind. OFF by default: a "
+        "pm2 restart resumes existing data instead of risking a false wipe from "
+        "a stale marker. A genuine rollover detected at runtime always cleans up.",
+    )
+    parser.add_argument(
         "--label-smooth-sigma",
         type=float,
         default=1.0,
@@ -4679,6 +5034,10 @@ if __name__ == "__main__":
         log_path=args.log_path,
         interval=args.interval,
         min_score=args.min_score,
+        max_grad_norm=args.max_grad_norm,
+        max_agg_norm=args.max_agg_norm,
+        max_agg_element=args.max_agg_element,
+        no_startup_cleanup=not args.enable_startup_cleanup,
         warmup_rounds=args.warmup_rounds,
         label_smooth_sigma=args.label_smooth_sigma,
         max_val_batches=args.max_val_batches,

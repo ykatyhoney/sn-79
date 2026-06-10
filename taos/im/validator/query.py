@@ -676,6 +676,8 @@ class QueryService:
             session = await self.dendrite.session
             per_req_timeout = _aio.ClientTimeout(total=5, sock_connect=1.0)
 
+            ok_lats = []  # latencies of successful deliveries, for timeout review
+
             async def _fire_one(uid, ip, port, url, headers, body):
                 nonlocal send_ok, send_fail
                 t0 = time.time()
@@ -693,7 +695,10 @@ class QueryService:
                                 pass
                     elapsed = time.time() - t0
                     if status == 200:
-                        bt.logging.debug(
+                        ok_lats.append(elapsed)
+                        # Every delivery logs its latency so per-miner timing is
+                        # reviewable from the standard logs (timeout tuning).
+                        bt.logging.info(
                             f"[GTX] deliver round={round_id} uid={uid} "
                             f"{ip}:{port} status={status} t={elapsed:.2f}s"
                         )
@@ -731,9 +736,18 @@ class QueryService:
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
             t_total = time.time() - t_start
+            if ok_lats:
+                s = sorted(ok_lats)
+                lat_summary = (
+                    f" ok_lat[med/p90/max]={s[len(s)//2]:.2f}/"
+                    f"{s[int(len(s)*0.9)]:.2f}/{s[-1]:.2f}s"
+                    f" ok>2.5s={sum(x > 2.5 for x in s)}"
+                )
+            else:
+                lat_summary = ""
             bt.logging.info(
                 f"[GTX] deliver round={round_id} n={len(deliveries)} "
-                f"ok={send_ok} fail={send_fail} t={t_total:.2f}s"
+                f"ok={send_ok} fail={send_fail} t={t_total:.2f}s{lat_summary}"
             )
             return {'success': True, 'ok': send_ok, 'fail': send_fail}
 

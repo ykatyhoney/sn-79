@@ -277,6 +277,15 @@ class GenTRXAgent(FinanceSimulationAgent):
         g.max_pending_rows_per_book = max(
             0, int(getattr(self.config, "gtx_max_pending_rows_per_book", 50_000))
         )
+        # Per-book on-disk retention. After each flush, the oldest parquets
+        # under <output_dir>/<book>/intervals/ are deleted until at most this
+        # many remain. The miner never reads these locally — they're either
+        # uploaded (validator) or terminal write (benchmark/standalone) — so
+        # bounding count is safe. 0 disables retention (unbounded growth).
+        # Default 12 ≈ 1h at the 5-min flush interval.
+        g.keep_intervals_per_book = max(
+            0, int(getattr(self.config, "gtx_keep_intervals_per_book", 12))
+        )
 
         # ---- Inference config ----
         g.n_trajectories = int(getattr(self.config, "gtx_n_trajectories", 0))
@@ -487,6 +496,12 @@ class GenTRXAgent(FinanceSimulationAgent):
             f"{'| gtx_collect_data=false (S3 only)' if not g.collect_data else ''}"
             f"{f' | {train_desc}' if train_desc else ''}"
         )
+
+        # Apply retention to any data already on disk from a previous run.
+        # Without this, a long-running miner restarted with a tighter cap (or
+        # an existing miner pulling this change) would only prune-on-next-
+        # flush, leaving the historical backlog to sit forever.
+        self._prune_existing_intervals()
 
         # Assignment delivery endpoint. Validator POSTs assignments here
         # (separate from /handle, mirrors dendrite pattern). Two modes:
@@ -956,6 +971,58 @@ class GenTRXAgent(FinanceSimulationAgent):
         manifest_path.write_text(json.dumps(existing, indent=2))
 
         gtx_log.info(f"Book {book_id}: flushed {n} events → {out_path.name}")
+
+        self._prune_intervals(out_dir)
+
+    def _prune_intervals(self, intervals_dir: Path) -> int:
+        """Keep at most `keep_intervals_per_book` parquets in `intervals_dir`,
+        deleting the oldest by mtime. No-op when retention is disabled (=0)
+        or the directory holds <= the cap. Returns the number removed."""
+        keep = self._gtx.keep_intervals_per_book
+        if keep <= 0:
+            return 0
+        try:
+            files = sorted(
+                intervals_dir.glob("*.parquet"), key=lambda p: p.stat().st_mtime
+            )
+        except OSError:
+            return 0
+        if len(files) <= keep:
+            return 0
+        removed = 0
+        for stale in files[: len(files) - keep]:
+            try:
+                stale.unlink()
+                removed += 1
+            except OSError as exc:
+                gtx_log.debug(f"prune skip {stale.name}: {exc}")
+        return removed
+
+    def _prune_existing_intervals(self) -> None:
+        """Walk every <output_dir>/<book>/intervals/ at startup and apply the
+        retention cap to whatever's already on disk. Called once from
+        `initialize()` after `keep_intervals_per_book` is resolved."""
+        if self._gtx.keep_intervals_per_book <= 0:
+            return
+        root = self._gtx.output_dir
+        if not root.exists():
+            return
+        total = 0
+        dirs = 0
+        for book_dir in root.iterdir():
+            if not book_dir.is_dir() or not book_dir.name.isdigit():
+                continue
+            intervals = book_dir / "intervals"
+            if intervals.exists():
+                removed = self._prune_intervals(intervals)
+                if removed:
+                    total += removed
+                    dirs += 1
+        if total:
+            gtx_log.info(
+                f"startup retention: pruned {total} stale parquet(s) across "
+                f"{dirs} book dir(s) (keep={self._gtx.keep_intervals_per_book})"
+            )
 
     # ------------------------------------------------------------------
     # Distributed training
@@ -1480,7 +1547,12 @@ class GenTRXAgent(FinanceSimulationAgent):
             lr=self._gtx.train_lr,
             window_id=self._gtx.train_window_id,
             miner_uid=self.uid,
-            model_version=int((assignment or {}).get("model_version", 0) or 0),
+            # Tag with the version we ACTUALLY trained against — not the
+            # assignment's target. When a model-download timeout falls back
+            # to the previously-loaded weights, the assignment's intended
+            # version is misleading; the aggregator needs the real one so
+            # its version-mismatch filter can drop stale-regime gradients.
+            model_version=int(self._gtx.model_version or 0),
             label_smooth_sigma=self._gtx.label_smooth_sigma,
         )
         delta = train_window(train_model, loader, win_cfg, self._gtx.device)

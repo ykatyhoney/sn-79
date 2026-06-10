@@ -662,6 +662,16 @@ BENCHMARK_ARGS="--benchmark.agents $BENCHMARK_AGENTS_CONFIG"
 VALIDATOR_EXTRA_ARGS="${VALIDATOR_EXTRA_ARGS:-}"
 
 # ── Launch validator ───────────────────────────────────────────────────────────
+# pm2 log rotation: cap each .log at 100 MB, keep 10 rotated copies, gzip
+# old ones. Idempotent — install is a no-op when already present, and `pm2
+# set` overwrites silently. Daemon-wide setting.
+if ! pm2 describe pm2-logrotate >/dev/null 2>&1; then
+    pm2 install pm2-logrotate >/dev/null 2>&1 || true
+fi
+pm2 set pm2-logrotate:max_size 100M >/dev/null 2>&1 || true
+pm2 set pm2-logrotate:retain 10 >/dev/null 2>&1 || true
+pm2 set pm2-logrotate:compress true >/dev/null 2>&1 || true
+
 echo "Starting Validator"
 pm2 start validator.py \
     --name=validator \

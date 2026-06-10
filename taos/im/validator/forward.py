@@ -179,6 +179,10 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
                     last_log_time = current_time
         bt.logging.info(f"Rewarding up to date, proceeding with query!")
 
+        # Mutual exclusion with GTX assignment delivery (deliver_gentrx): both
+        # use the same IPC request queue / notify pipe AND the same miner
+        # network — they must never overlap. Released in the finally below.
+        await self.miner_net_lock.acquire()
         self.querying = True
         query_start = time.time()
         try:
@@ -316,6 +320,7 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
         return responses
     finally:
         self.querying = False
+        self.miner_net_lock.release()
         bt.logging.debug("Query flag cleared")
 
     return responses

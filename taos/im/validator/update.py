@@ -52,7 +52,9 @@ def check_repo(self : Validator) -> Tuple[bool, bool, bool, bool]:
             for cht in diff.change_type:
                 changes = list(diff.iter_change_type(cht))
                 for c in changes:
-                    if str(self.repo_path / c.b_path) == self.simulator_config_file:
+                    # getattr: check_repo can run at startup before the engine
+                    # init has set simulator_config_file on the validator.
+                    if str(self.repo_path / c.b_path) == getattr(self, 'simulator_config_file', None):
                         simulator_config_changed = True
                     if c.b_path.endswith('.cpp'):
                         simulator_cpp_files_changed = True

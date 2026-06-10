@@ -453,10 +453,34 @@ def _soft_ordinal_targets(labels: torch.Tensor, n_bins: int, sigma: float) -> to
     return torch.softmax(-(dist ** 2) / (2.0 * sigma * sigma), dim=-1)
 
 
+def _finite_rows_loss(name, flat_logits, flat_labels, label_smooth_sigma):
+    """Per-field loss over only the rows whose loss is finite (drops degenerate
+    positions). Returns nan if every row is non-finite. Mirrors compute_loss's
+    reductions, including F.cross_entropy's weighted-mean normalisation."""
+    device = flat_logits.device
+    if name == "order_type":
+        weight = _ORDER_TYPE_WEIGHTS.to(device)
+        per_row = F.cross_entropy(flat_logits, flat_labels, weight=weight, reduction="none")
+        finite = torch.isfinite(per_row)
+        if not bool(finite.any()):
+            return per_row.new_tensor(float("nan"))
+        return per_row[finite].sum() / weight[flat_labels][finite].sum()
+    if label_smooth_sigma > 0 and name in _ORDINAL_FIELDS:
+        n_bins = flat_logits.size(-1)
+        soft_targets = _soft_ordinal_targets(flat_labels, n_bins, label_smooth_sigma)
+        log_probs = F.log_softmax(flat_logits, dim=-1)
+        per_row = -(soft_targets * log_probs).sum(dim=-1)
+    else:
+        per_row = F.cross_entropy(flat_logits, flat_labels, reduction="none")
+    finite = torch.isfinite(per_row)
+    return per_row[finite].mean() if bool(finite.any()) else per_row.new_tensor(float("nan"))
+
+
 def compute_loss(
     logits: dict[str, torch.Tensor],
     labels: dict[str, torch.Tensor],
     label_smooth_sigma: float = 0.0,
+    mask_nonfinite_rows: bool = False,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Weighted sum of per-field CE losses. Returns (total_loss, per_field_losses).
 
@@ -488,6 +512,12 @@ def compute_loss(
             loss = -(soft_targets * log_probs).sum(dim=-1).mean()
         else:
             loss = F.cross_entropy(flat_logits, flat_labels)
+        # Validators pass mask_nonfinite_rows=True: if a field's reduced loss is
+        # non-finite, recompute over only the finite rows so a few degenerate
+        # positions don't void the whole batch. Clean batches never enter here,
+        # so training stays bit-exact.
+        if mask_nonfinite_rows and not bool(torch.isfinite(loss)):
+            loss = _finite_rows_loss(name, flat_logits, flat_labels, label_smooth_sigma)
         field_weight = _FIELD_WEIGHTS.get(name, 1.0)
         total = total + loss * field_weight
         details[name] = loss.item()
