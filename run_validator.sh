@@ -76,26 +76,26 @@ while [ "$_ia" -le "$#" ]; do
 done
 set -- "${_norm_args[@]}"
 
-while getopts ":e:p:w:h:u:k:t:l:b:P:c:r:s:i:T:E:Q:G:" opt; do
+while getopts ":e:p:w:h:u:l:d:o:t:g:s:x:c:G:Q:E:P:M:" opt; do
     case "$opt" in
         e) ENDPOINT=${OPTARG};;
         p) WALLET_PATH=${OPTARG};;
         w) WALLET_NAME=${OPTARG};;
         h) HOTKEY_NAME=${OPTARG};;
         u) NETUID=${OPTARG};;
-        k) PD_KEY=${OPTARG};;
-        t) TIMEOUT=${OPTARG};;
         l) LOG_LEVEL=${OPTARG};;
-        b) PROM_PORT=${OPTARG};;
-        P) VALIDATOR_PORT=${OPTARG};;
+        d) PD_KEY=${OPTARG};;
+        o) PROM_PORT=${OPTARG};;
+        t) TIMEOUT=${OPTARG};;
+        g) SIMULATION_CONFIG=${OPTARG};;
+        s) PRESERVE_SIMULATOR=${OPTARG};;
+        x) USE_TMUX=${OPTARG};;
         c) CHECKPOINT=${OPTARG};;
-        s) SIMULATION_CONFIG=${OPTARG};;
-        i) MECHID=${OPTARG};;
-        r) PRESERVE_SIMULATOR=${OPTARG};;
-        T) USE_TMUX=${OPTARG};;
-        E) ;;  # already pre-parsed
-        Q) GRAD_URL=${OPTARG}; _EXPLICIT_GRAD_URL=1;;
         G) GENTRX_MODE=${OPTARG};;
+        Q) GRAD_URL=${OPTARG}; _EXPLICIT_GRAD_URL=1;;
+        E) ;;  # already pre-parsed
+        P) VALIDATOR_PORT=${OPTARG};;
+        M) MECHID=${OPTARG};;
         \?) echo "Invalid option: -$OPTARG" >&2; exit 1;;
     esac
 done

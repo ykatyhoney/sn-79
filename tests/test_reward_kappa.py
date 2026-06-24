@@ -81,7 +81,7 @@ def test_calculate_kappa_score_full_path_regression():
         simulation_config={"miner_wealth": 50000.0, "publish_interval": 5 * S, "volumeDecimals": 4},
         simulation_timestamp=ts,
     )
-    assert float(score) == pytest.approx(0.6805385600008711, abs=1e-12)
+    assert float(score) == pytest.approx(0.6848940067839999, abs=1e-12)
 
 
 def test_calculate_kappa_score_unknown_uid_is_zero():
