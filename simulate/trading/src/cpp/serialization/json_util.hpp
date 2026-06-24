@@ -114,7 +114,10 @@ void setOptionalMember(rapidjson::Document& json, const std::string& key, std::o
             if (!opt.has_value()) {
                 return std::move(rapidjson::Value{}.SetNull());
             }
-            if constexpr (std::constructible_from<rapidjson::Value, T>) {
+            if constexpr (std::same_as<T, decimal_t>) {
+                return rapidjson::Value{util::decimal2double(opt.value())};
+            }
+            else if constexpr (std::constructible_from<rapidjson::Value, T>) {
                 return rapidjson::Value{opt.value()};
             }
             else if constexpr (

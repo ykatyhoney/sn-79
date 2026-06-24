@@ -6,11 +6,33 @@ import msgpack
 import traceback
 import time
 import csv
+from datetime import datetime
+from typing import cast
 import bittensor as bt
 from threading import Thread
 from abc import ABC, abstractmethod
 from taos.common.agents import SimulationAgent
 from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse, FinanceEventNotification
+# taos.im.protocol.exchange is excluded from the public release (exchange-mode
+# only). Sentinel classes keep type hints and isinstance() checks valid; code
+# paths that operate on real instances are gated by self._exchange_mode and
+# never invoked in public sim-only deployments.
+try:
+    from taos.im.protocol.exchange import ExchangeStateUpdate, ExchangeAgentResponse
+    from taos.im.protocol.exchange.models import OrderCurrency as ExchangeOrderCurrency
+except ImportError:
+    # Sentinels inherit from pydantic.BaseModel (not plain classes) so FastAPI
+    # can register routes whose param/return types are Union[..., ExchangeStateUpdate]
+    # — a bare class fails get_dependant() with "Invalid args for response field".
+    from pydantic import BaseModel as _SentinelBase
+
+    class ExchangeStateUpdate(_SentinelBase):  # type: ignore[no-redef]
+        pass
+
+    class ExchangeAgentResponse(_SentinelBase):  # type: ignore[no-redef]
+        pass
+    class ExchangeOrderCurrency:  # type: ignore[no-redef]
+        ALPHA = None  # only referenced inside the exchange-mode market_order branch
 from taos.im.protocol.events import *
 from taos.im.protocol.models import *
 from taos.im.utils import duration_from_timestamp, timestamp_from_duration
@@ -89,8 +111,273 @@ class Signals(IntEnum):
     BEARISH=6
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Account proxy helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _BalanceProxy:
+    """Minimal Balance-like object wrapping a free float from an exchange account dict."""
+    def __init__(self, free: float, total: float | None = None):
+        self.free     = free
+        self.total    = total if total is not None else free
+        self.reserved = max(0.0, self.total - self.free)
+
+class _FeesProxy:
+    """Minimal Fees-like object wrapping exchange fee fields (or zero defaults)."""
+    def __init__(self, maker: float = 0.0, taker: float = 0.0):
+        self.maker_fee_rate = maker
+        self.taker_fee_rate = taker
+
+class _OrderProxy:
+    """Minimal Order-like object wrapping an open order dict from exchange mode."""
+    def __init__(self, raw: dict):
+        self.i    = raw.get('i', raw.get('id', 0))
+        self.s    = raw.get('s', raw.get('side', 0))
+        self.p    = raw.get('p', raw.get('price', 0.0))
+        self.q    = raw.get('q', raw.get('quantity', 0.0))
+
+    @property
+    def id(self) -> int:
+        return self.i
+
+    @property
+    def side(self) -> int:
+        return self.s
+
+    @property
+    def price(self) -> float:
+        return self.p
+
+    @property
+    def quantity(self) -> float:
+        return self.q
+
+class UnifiedAccount:
+    """
+    Normalises simulation Account Pydantic objects and exchange plain dicts to a
+    single interface so agents written for simulation work unchanged in exchange mode.
+
+    Simulation path:  wraps an Account object — delegates all attribute access to it.
+    Exchange path:    wraps a plain dict (rich: bb/qb/bl/ql/bc/qc/f/BASE/QUOTE,
+                      or fallback: BASE/QUOTE/WEALTH) via proxy objects.
+    """
+    def __init__(self, raw):
+        self._raw    = raw
+        self._is_dict = isinstance(raw, dict)
+
+    # ── Balance ───────────────────────────────────────────────────────────────
+
+    @property
+    def base_balance(self) -> _BalanceProxy:
+        if self._is_dict:
+            bb = self._raw.get('bb')
+            free = bb.get('f', 0.0) if isinstance(bb, dict) else self._raw.get('BASE', 0.0)
+            return _BalanceProxy(free)
+        return self._raw.base_balance
+
+    @property
+    def quote_balance(self) -> _BalanceProxy:
+        if self._is_dict:
+            qb = self._raw.get('qb')
+            free = qb.get('f', 0.0) if isinstance(qb, dict) else self._raw.get('QUOTE', 0.0)
+            return _BalanceProxy(free)
+        return self._raw.quote_balance
+
+    # ── Loans / collateral ────────────────────────────────────────────────────
+
+    @property
+    def base_loan(self) -> float:
+        return self._raw.get('bl', 0.0) if self._is_dict else self._raw.base_loan
+
+    @property
+    def quote_loan(self) -> float:
+        return self._raw.get('ql', 0.0) if self._is_dict else self._raw.quote_loan
+
+    @property
+    def base_collateral(self) -> float:
+        return self._raw.get('bc', 0.0) if self._is_dict else self._raw.base_collateral
+
+    @property
+    def quote_collateral(self) -> float:
+        return self._raw.get('qc', 0.0) if self._is_dict else self._raw.quote_collateral
+
+    # ── Orders / loans ────────────────────────────────────────────────────────
+
+    @property
+    def orders(self) -> list:
+        if self._is_dict:
+            raw_orders = self._raw.get('o', [])
+            return [_OrderProxy(o) for o in raw_orders if isinstance(o, dict)]
+        return self._raw.orders
+
+    @property
+    def loans(self) -> dict:
+        return {} if self._is_dict else self._raw.loans
+
+    # ── Fees ──────────────────────────────────────────────────────────────────
+
+    @property
+    def fees(self) -> _FeesProxy:
+        if self._is_dict:
+            f = self._raw.get('f', {})
+            if isinstance(f, dict):
+                return _FeesProxy(f.get('m', 0.0), f.get('t', 0.0))
+            return _FeesProxy()
+        return self._raw.fees
+
+    @property
+    def traded_volume(self) -> float:
+        if self._is_dict:
+            return self._raw.get('tv', 0.0)
+        return getattr(self._raw, 'traded_volume', 0.0)
+
+    @property
+    def raw(self):
+        """Escape hatch for mode-specific attribute access."""
+        return self._raw
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Unified response wrapper
+# ─────────────────────────────────────────────────────────────────────────────
+
+class UnifiedAgentResponse:
+    """
+    Mode-agnostic response wrapper with the simulation FinanceAgentResponse API.
+
+    Builds simulation or exchange Pydantic instruction objects depending on mode.
+    Call finalize() to obtain the correctly-typed Pydantic response for serialization.
+    """
+
+    def __init__(self, agent_id: int, exchange_mode: bool, delegate: str = ''):
+        self.agent_id       = agent_id
+        self._exchange_mode = exchange_mode
+        self._delegate      = delegate
+        self.instructions   = []
+
+    def limit_order(
+        self,
+        book_id,
+        direction,
+        quantity: float,
+        price: float,
+        delay: int = 0,
+        clientOrderId=None,
+        stp=STP.CANCEL_OLDEST,
+        postOnly: bool = False,
+        timeInForce=TimeInForce.GTC,
+        expiryPeriod=None,
+        leverage: float = 0.0,
+        settlement_option=LoanSettlementOption.NONE,
+    ) -> None:
+        if self._exchange_mode:
+            from taos.im.protocol.exchange.instructions import PlaceLimitOrderInstruction
+            self.instructions.append(PlaceLimitOrderInstruction(
+                agentId=self.agent_id, delay=delay, bookId=book_id,
+                delegate=self._delegate, direction=direction,
+                quantity=quantity, price=price, clientOrderId=clientOrderId,
+                stp=stp, postOnly=postOnly, timeInForce=timeInForce,
+                expiryPeriod=expiryPeriod, settleFlag=settlement_option,
+                # leverage silently dropped — exchange does not support margin
+            ))
+        else:
+            from taos.im.protocol.instructions import PlaceLimitOrderInstruction as _Sim
+            self.instructions.append(_Sim(
+                agentId=self.agent_id, delay=delay, bookId=book_id,
+                direction=direction, quantity=quantity, price=price,
+                clientOrderId=clientOrderId, stp=stp, postOnly=postOnly,
+                timeInForce=timeInForce, expiryPeriod=expiryPeriod,
+                leverage=leverage, settleFlag=settlement_option,
+            ))
+
+    def market_order(
+        self,
+        book_id,
+        direction,
+        quantity: float,
+        delay: int = 0,
+        clientOrderId=None,
+        stp=STP.CANCEL_OLDEST,
+        currency=None,
+        leverage: float = 0.0,
+        settlement_option=LoanSettlementOption.NONE,
+        max_slippage: float | None = None,
+    ) -> None:
+        if self._exchange_mode:
+            from taos.im.protocol.exchange.instructions import PlaceMarketOrderInstruction
+            self.instructions.append(PlaceMarketOrderInstruction(
+                agentId=self.agent_id, delay=delay, bookId=book_id,
+                delegate=self._delegate, direction=direction, quantity=quantity,
+                max_slippage=max_slippage if max_slippage is not None else 0.01,
+                clientOrderId=clientOrderId, stp=stp,
+                currency=currency if currency is not None else ExchangeOrderCurrency.ALPHA,
+                # leverage and settlement_option silently dropped
+            ))
+        else:
+            from taos.im.protocol.instructions import PlaceMarketOrderInstruction as _Sim
+            self.instructions.append(_Sim(
+                agentId=self.agent_id, delay=delay, bookId=book_id,
+                direction=direction, quantity=quantity,
+                clientOrderId=clientOrderId, stp=stp,
+                currency=currency if currency is not None else OrderCurrency.BASE,
+                leverage=leverage, settleFlag=settlement_option,
+                max_slippage=max_slippage,
+            ))
+
+    def cancel_order(self, book_id, order_id, quantity=None, delay: int = 0) -> None:
+        self.cancel_orders(book_id, [order_id], delay=delay)
+
+    def cancel_orders(self, book_id, order_ids, delay: int = 0) -> None:
+        if self._exchange_mode:
+            from taos.im.protocol.exchange.instructions import (
+                CancelOrdersInstruction, CancelOrderInstruction)
+            self.instructions.append(CancelOrdersInstruction(
+                agentId=self.agent_id, delay=delay, bookId=book_id,
+                cancellations=[CancelOrderInstruction(orderId=oid, volume=None)
+                               for oid in order_ids],
+            ))
+        else:
+            from taos.im.protocol.instructions import (
+                CancelOrdersInstruction as _Sim, CancelOrderInstruction as _SimC)
+            self.instructions.append(_Sim(
+                agentId=self.agent_id, delay=delay, bookId=book_id,
+                cancellations=[_SimC(orderId=oid, volume=None) for oid in order_ids],
+            ))
+
+    def close_position(self, book_id, order_id, quantity=None, delay: int = 0) -> None:
+        if self._exchange_mode:
+            bt.logging.warning("close_position is not supported in exchange mode — ignored")
+            return
+        from taos.im.protocol.instructions import ClosePositionsInstruction, ClosePositionInstruction
+        self.instructions.append(ClosePositionsInstruction(
+            agentId=self.agent_id, delay=delay, bookId=book_id,
+            positions=[ClosePositionInstruction(orderId=order_id, volume=quantity)],
+        ))
+
+    def add_instruction(self, instruction) -> None:
+        self.instructions.append(instruction)
+
+    def finalize(self) -> FinanceAgentResponse | ExchangeAgentResponse:
+        """Return the correctly-typed Pydantic response for serialization."""
+        if self._exchange_mode:
+            r = ExchangeAgentResponse(agent_id=self.agent_id)
+        else:
+            r = FinanceAgentResponse(agent_id=self.agent_id)
+        r.instructions = self.instructions
+        return r
+
+
 # Base class for agents operating in intelligent market simulations
 class FinanceSimulationAgent(SimulationAgent):
+    # Populated each tick from the (decompressed) state in update(). Declared here
+    # so subclasses see a concrete type instead of the synapse field's wire union
+    # (MarketSimulationConfig | str | ExchangeConfig | dict | None).
+    simulation_config: MarketSimulationConfig
+    # Per-tick event notices for this agent. Events are dispatched by their string
+    # `.type` tag (match/case), which the type system cannot correlate with the
+    # concrete event subclass, so the element type is intentionally untyped.
+    events: list
+
     def __init__(self, uid : int, config : object, log_dir : str | None = None) -> None:
         """
         Initializer method that sets up the agent's unique ID and configuration, and initializes common objects for storing agent data.
@@ -115,7 +402,7 @@ class FinanceSimulationAgent(SimulationAgent):
             config.lazy_load = bool(config.lazy_load)
         super().__init__(uid, config, log_dir)
 
-    def handle(self, state: MarketSimulationStateUpdate) -> FinanceAgentResponse:
+    def handle(self, state: MarketSimulationStateUpdate | ExchangeStateUpdate) -> FinanceAgentResponse | ExchangeAgentResponse:
         return super().handle(state)    
 
     def process(self, notification: FinanceEventNotification) -> FinanceEventNotification:
@@ -127,7 +414,7 @@ class FinanceSimulationAgent(SimulationAgent):
             self.onEnd(notification.event)
         return notification
     
-    def simulation_output_dir(self, state : MarketSimulationStateUpdate):
+    def simulation_output_dir(self, state : MarketSimulationStateUpdate | ExchangeStateUpdate):
         simulation_output_dir = os.path.join(self.output_dir, state.dendrite.hotkey, state.config.simulation_id)
         os.makedirs(simulation_output_dir, exist_ok=True)
         return simulation_output_dir
@@ -270,7 +557,7 @@ class FinanceSimulationAgent(SimulationAgent):
             )
         
     
-    def log_order_event(self, event : LimitOrderPlacementEvent | MarketOrderPlacementEvent, state : MarketSimulationStateUpdate):
+    def log_order_event(self, event : LimitOrderPlacementEvent | MarketOrderPlacementEvent, state : MarketSimulationStateUpdate | ExchangeStateUpdate):
         """Log LimitOrderPlacementEvent or MarketOrderPlacementEvent to CSV."""
         orders_log_file = os.path.join(self.simulation_output_dir(state), 'orders.csv')
         file_exists = os.path.exists(orders_log_file)
@@ -297,7 +584,7 @@ class FinanceSimulationAgent(SimulationAgent):
                 event.message
             ])
 
-    def log_cancellation_event(self, event : OrderCancellationEvent, state : MarketSimulationStateUpdate):
+    def log_cancellation_event(self, event : OrderCancellationEvent, state : MarketSimulationStateUpdate | ExchangeStateUpdate):
         """Log OrderCancellationEvent to CSV."""
         cancellations_log_file = os.path.join(self.simulation_output_dir(state), 'cancellations.csv')
         file_exists = os.path.exists(cancellations_log_file)
@@ -316,7 +603,7 @@ class FinanceSimulationAgent(SimulationAgent):
                 event.message
             ])
 
-    def log_trade_event(self, event : TradeEvent, state : MarketSimulationStateUpdate):
+    def log_trade_event(self, event : TradeEvent, state : MarketSimulationStateUpdate | ExchangeStateUpdate):
         """Log TradeEvent to CSV."""
         trades_log_file = os.path.join(self.simulation_output_dir(state), 'trades.csv')
         file_exists = os.path.exists(trades_log_file)
@@ -345,7 +632,7 @@ class FinanceSimulationAgent(SimulationAgent):
                 event.quantity
             ])
 
-    def update(self, state : MarketSimulationStateUpdate) -> None:
+    def update(self, state : MarketSimulationStateUpdate | ExchangeStateUpdate) -> None:
         """
         Method to update the stored agent data, print relevant state information and trigger handlers for reported events.
 
@@ -360,11 +647,11 @@ class FinanceSimulationAgent(SimulationAgent):
             self.history = self.history[-self.history_len:]
         else:
             self.history = []
-        self.simulation_config = state.config
+        self.simulation_config = cast(MarketSimulationConfig, state.config)
         self.accounts = state.accounts[self.uid]
-        self.events = state.notices[self.uid]
+        self.events = cast(list, state.notices[self.uid])
         
-        if not state.dendrite.hotkey in self.event_history or not self.event_history[state.dendrite.hotkey]:            
+        if state.dendrite.hotkey not in self.event_history or not self.event_history[state.dendrite.hotkey]:            
             self.load_event_history(state)        
         self.event_history[state.dendrite.hotkey].append(state)
         
@@ -409,7 +696,7 @@ class FinanceSimulationAgent(SimulationAgent):
             debug_text += '-' * 50 + "\n"
             for event in self.events:
                 if hasattr(event, 'bookId') and event.bookId == book_id:
-                    if not event.type in ["EVENT_TRADE", "ET"]:
+                    if event.type not in ["EVENT_TRADE", "ET"]:
                         debug_text += f"{event}" + "\n"
                         update_text += f"BOOK {book_id} : {event}" + "\n"
                     match event.type:
@@ -448,7 +735,7 @@ class FinanceSimulationAgent(SimulationAgent):
             debug_text += '-' * 50 + "\n"
             if not self.config.lazy_load:
                 account= self.accounts[book_id]
-                debug_text += f"TOP LEVELS" + "\n"
+                debug_text += "TOP LEVELS" + "\n"
                 debug_text += '-' * 50 + "\n"
                 debug_text += ' | '.join([f"{level.quantity:.4f}@{level.price}" for level in reversed(state.books[book_id].bids[:5])]) + '||' + ' | '.join([f"{level.quantity:.4f}@{level.price}" for level in state.books[book_id].asks[:5]]) + "\n"
                 debug_text += '-' * 50 + "\n"
@@ -598,7 +885,7 @@ class FinanceSimulationAgent(SimulationAgent):
         """
         pass
 
-    def respond(self, state : MarketSimulationStateUpdate) -> FinanceAgentResponse:
+    def respond(self, state : MarketSimulationStateUpdate | ExchangeStateUpdate) -> FinanceAgentResponse | ExchangeAgentResponse:
         """
         Abstract method for handling generation of response to new state update.  To be implemented by subclasses.
 
@@ -610,7 +897,7 @@ class FinanceSimulationAgent(SimulationAgent):
         """
         ...
 
-    def report(self, state : MarketSimulationStateUpdate, response : FinanceAgentResponse) -> None:
+    def report(self, state : MarketSimulationStateUpdate | ExchangeStateUpdate, response : FinanceAgentResponse | ExchangeAgentResponse) -> None:
         """
         Method for reporting the latest simulation state and the response generated by the agent.
 
@@ -623,14 +910,157 @@ class FinanceSimulationAgent(SimulationAgent):
         """
         update_text = '-' * 50 + "\n"
         if len(response.instructions) > 0:
-            update_text += 'INSTRUCTIONS' + "\n"
+            update_text += 'SIMULATION INSTRUCTIONS' + "\n"
             update_text += '-' * 50 + "\n"
             for instruction in response.instructions:
                 update_text += f"{instruction}" + "\n"
         else:
-            update_text += 'NO INSTRUCTIONS TO SUBMIT' + "\n"
+            update_text += 'NO SIMULATION INSTRUCTIONS' + "\n"
         update_text += '-' * 50
         bt.logging.info(".\n" + update_text)
+    
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Unified base class (simulation + exchange)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FinanceAgent(FinanceSimulationAgent):
+    """
+    Unified base class for agents that must operate in both simulation and
+    exchange modes without modification.
+
+    Extends FinanceSimulationAgent so all simulation event hooks, history,
+    and debug logging are preserved in simulation mode.  In exchange mode the
+    update() path is minimal (no event processing) and self.accounts is
+    populated with UnifiedAccount wrappers keyed by netuid.
+
+    Agents should:
+      - Call  make_response()         instead of constructing a response directly
+      - Loop  `for book_id, book in (state.books or {}).items()` to iterate books
+      - Access self.accounts[book_id] via .base_balance.free / .quote_balance.free
+      - For empty books in exchange mode, use self._pools[book_id]['price'] as fallback
+
+    Optional agent attributes (read in make_response):
+      self.delegate     (str, default '')   — exchange delegate hotkey; auto-resolved if empty
+    """
+
+    def __init__(self, uid, config, log_dir=None):
+        self._exchange_mode = False
+        self._pools: dict = {}
+        super().__init__(uid, config, log_dir)
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def handle(self, state: MarketSimulationStateUpdate | ExchangeStateUpdate) -> FinanceAgentResponse | ExchangeAgentResponse:
+        """
+        Override SimulationAgent.handle() to finalize UnifiedAgentResponse into
+        the correct Pydantic type before FastAPI serializes it.
+
+        Dispatches to respond_exchange() or respond_simulation() based on the
+        state type so that the exchange_mode flag is determined from the call
+        itself, not from a shared instance attribute that concurrent requests
+        could overwrite.
+        """
+        exchange_mode = isinstance(state, ExchangeStateUpdate)
+        if exchange_mode:
+            header = (
+                "\n" + '-' * 50 + "\n"
+                f"VALIDATOR : {state.dendrite.hotkey} | BLOCK : {state.block} | EXCHANGE TIME : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                + '-' * 50
+            )
+            bt.logging.info("." + header)
+        self.update(state)
+        if exchange_mode:
+            response = self.respond_exchange(state)
+        else:
+            response = self.respond_simulation(state)
+        self.report(state, response)
+        if isinstance(response, UnifiedAgentResponse):
+            return response.finalize()
+        return response
+
+    def report(self, state: MarketSimulationStateUpdate | ExchangeStateUpdate, response: FinanceAgentResponse | ExchangeAgentResponse) -> None:
+        exchange_mode = isinstance(state, ExchangeStateUpdate)
+        label = 'EXCHANGE' if exchange_mode else 'SIMULATION'
+        update_text = '-' * 50 + "\n"
+        if len(response.instructions) > 0:
+            update_text += f'{label} INSTRUCTIONS' + "\n"
+            update_text += '-' * 50 + "\n"
+            for instruction in response.instructions:
+                update_text += f"{instruction}" + "\n"
+        else:
+            update_text += f'NO {label} INSTRUCTIONS' + "\n"
+        update_text += '-' * 50
+        bt.logging.info(".\n" + update_text)
+
+    def respond_simulation(self, state) -> "FinanceAgentResponse":
+        """
+        Called for MarketSimulationStateUpdate requests.
+
+        Override in subclasses to handle simulation state.  Default delegates
+        to respond() for backward compatibility with agents that implement the
+        single-method API.
+        """
+        return self.respond(state)
+
+    def respond_exchange(self, state) -> "ExchangeAgentResponse":
+        """
+        Called for ExchangeStateUpdate requests.
+
+        Override in subclasses to handle exchange state.  Default delegates to
+        respond() for backward compatibility with agents that implement the
+        single-method API.
+        """
+        return self.respond(state)
+
+    def update(self, state) -> None:
+        if isinstance(state, ExchangeStateUpdate):
+            # Minimal exchange-mode setup — no simulation event processing
+            self.simulation_config = cast(MarketSimulationConfig, state.config)
+            raw = (state.accounts or {}).get(self.uid, {})
+            self.accounts = {bid: UnifiedAccount(a) for bid, a in raw.items()}
+            self.events   = list((state.notices or {}).get(self.uid, []))
+            self._exchange_mode = True
+            # Cache pools so empty-book fallback works even when state.pools is
+            # None (pools can be lost during bt.Synapse JSON serialisation).
+            # Prefer state.pools; fall back to 'price' embedded in each account.
+            if state.pools:
+                self._pools = {int(k): v for k, v in state.pools.items()}
+            else:
+                pools = {}
+                for bid, a in self.accounts.items():
+                    raw = a._raw if isinstance(a, UnifiedAccount) else a
+                    if isinstance(raw, dict):
+                        price = raw.get('price', 0.0)
+                    else:
+                        # LazyAccount: access underlying raw dict before it is consumed
+                        inner = getattr(raw, '_raw', None)
+                        price = inner.get('price', 0.0) if isinstance(inner, dict) else 0.0
+                    pools[int(bid)] = {'price': price}
+                self._pools = pools
+        else:
+            # Full simulation update: event hooks, history, debug logging
+            super().update(state)
+            # Re-wrap raw Account objects with UnifiedAccount
+            self.accounts = {bid: UnifiedAccount(a) for bid, a in self.accounts.items()}
+            self._exchange_mode = False
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def make_response(self, exchange_mode: "bool | None" = None) -> UnifiedAgentResponse:
+        """Return a mode-aware response object with the simulation-compatible API.
+
+        Pass exchange_mode explicitly from respond_simulation/respond_exchange to
+        avoid reading the shared instance attribute, which concurrent requests
+        can overwrite.  Falls back to self._exchange_mode when not provided.
+        """
+        return UnifiedAgentResponse(
+            agent_id=self.uid,
+            exchange_mode=self._exchange_mode if exchange_mode is None else exchange_mode,
+            delegate=getattr(self, 'delegate', ''),
+        )
+
+
 
 from taos.im.utils.history import history, batch_history
 class StateHistoryManager:

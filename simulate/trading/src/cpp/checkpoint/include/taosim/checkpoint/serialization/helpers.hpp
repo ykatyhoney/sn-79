@@ -14,8 +14,9 @@
 #include <taosim/checkpoint/serialization/agent/StylizedTraderAgent.hpp>
 #include <taosim/checkpoint/serialization/book/Book.hpp>
 #include <taosim/checkpoint/serialization/book/BookProcessManager.hpp>
-#include <taosim/checkpoint/serialization/exchange/ClearingManager.hpp>
-#include <taosim/checkpoint/serialization/exchange/ExchangeSignals.hpp>
+#include <taosim/checkpoint/serialization/matching/ClearingManager.hpp>
+#include <taosim/checkpoint/serialization/matching/ExchangeSignals.hpp>
+#include <taosim/checkpoint/serialization/matching/SLTPContainer.hpp>
 #include <taosim/event/serialization/L3RecordContainer.hpp>
 #include <taosim/filesystem/utils.hpp>
 #include <taosim/message/MessagePayload.hpp>
@@ -107,7 +108,7 @@ void packExchange(auto& o, const Simulation& simulation)
 {
     const auto exch = simulation.exchange();
 
-    o.pack_map(11);
+    o.pack_map(12);
 
     o.pack("accounts");
     o.pack(exch->accounts());
@@ -141,6 +142,9 @@ void packExchange(auto& o, const Simulation& simulation)
 
     o.pack("localTradeByOrderSubs");
     o.pack(exch->localTradeByOrderSubs());
+
+    o.pack("sltpContainer");
+    o.pack(exch->sltpContainer());
 }
 
 //-------------------------------------------------------------------------

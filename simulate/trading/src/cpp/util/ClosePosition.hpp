@@ -52,7 +52,7 @@ struct convert<ClosePosition>
     const msgpack::object& operator()(const msgpack::object& o, ClosePosition& v) const
     {
         if (o.type != msgpack::type::MAP) {
-            taosim::serialization::MsgPackError{};
+            throw taosim::serialization::MsgPackError{};
         }
 
         for (const auto& [k, val] : o.via.map) {

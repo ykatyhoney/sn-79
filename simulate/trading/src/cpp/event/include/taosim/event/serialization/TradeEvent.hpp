@@ -52,7 +52,7 @@ struct pack<taosim::event::TradeEvent>
         msgpack::packer<Stream>& o, const taosim::event::TradeEvent& v) const
     {
         if constexpr (std::same_as<Stream, taosim::serialization::HumanReadableStream>) {
-            o.pack_map(12);
+            o.pack_map(14);
 
             o.pack("y");
             o.pack("t");
@@ -89,6 +89,12 @@ struct pack<taosim::event::TradeEvent>
 
             o.pack("Mf");
             o.pack(v.ctx.fees.maker);
+
+            o.pack("cr");
+            o.pack(v.ctx.aggressingCloseReason);
+
+            o.pack("Toi");
+            o.pack(v.ctx.aggressingOriginatingOrderId);
         }
         else if constexpr (std::same_as<Stream, taosim::serialization::BinaryStream>) {
             o.pack_map(3);

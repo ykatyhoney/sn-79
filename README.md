@@ -1,27 +1,28 @@
 <div align="center">
 
-# **MVTRX** ☯ **‪ي‬N-79**<!-- omit in toc -->
-### **A New Kind of Exchange** <!-- omit in toc -->
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT) 
+# **MVTRX** — Bittensor SN79<!-- omit in toc -->
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 ---
 
 
-**MVTRX** is a [Bittensor](https://bittensor.com) subnet (netuid 79) for decentralised market research and AI model training. It comprises three integrated components:
+**MVTRX** operates as a [Bittensor](https://bittensor.com) subnet at netuid 79 for decentralised market research and AI model training. It comprises three integrated components:
 
-- **τaos** - agent-based simulation of automated trading strategies in intelligent markets, incentivising risk-managed, high-quality market participation
-- **GenTRX** - distributed training of a shared order-book generative model, built on top of τaos simulation data (and future exchange data)
-- **Exchange** *(coming)* - live market data and order routing, extending both components to real venues
+- **τaos** — agent-based simulation of automated trading strategies in intelligent markets, incentivising risk-managed, high-quality market participation
+- **GenTRX** — distributed training of a shared order-book generative model, built on top of τaos simulation data (and future exchange data)
+- **MVTRX Exchange** (coming) — live off-chain limit order book exchange for Bittensor alpha tokens, running the same C++ matching engine as the simulation
 
 [![Website](https://img.shields.io/badge/website-black?logo=googlechrome
 )](https://mvtrx.fi)
-[![τaos Whitepaper](https://img.shields.io/badge/whitepaper-white?logo=proton
-)](https://simulate.trading/taos-im-paper)
-[![Dashboard](https://img.shields.io/badge/dashboard-white?logo=grafana
+[![Exchange UI](https://img.shields.io/badge/exchange-black?logo=googlechrome
+)](https://mvtrx.exchange)
+[![Grafana](https://img.shields.io/badge/grafana-white?logo=grafana
 )](https://taos.simulate.trading)
 [![Simulation Terminal](https://img.shields.io/badge/dashboard-white?logo=grafana
 )](https://mvtrx.simulate.trading)
 [![Discord](https://img.shields.io/badge/discord-black?logo=discord
 )](https://discord.com/channels/799672011265015819/1353733356470276096)
+[![τaos Whitepaper](https://img.shields.io/badge/whitepaper-white?logo=proton
+)](https://simulate.trading/taos-im-paper)
 
 ---
 **_taos_ (/ˈtɑos/)** : To make things out of metal by heating it until it is soft and then bending and hitting it with a hammer to create the right shape.
@@ -44,10 +45,11 @@
     - [Miner](#requirements-miner)
 4. [Install](#install)
     - [Validator](#install-validator)
-    - [Miner](#install-miner)  
+    - [Miner](#install-miner)
     - [Docker](#install-docker)
 5. [Agents](#agents)
 6. [Run](#run)
+    - [Registration](#run-registration)
     - [Validator](#run-validator)
     - [Miner](#run-miner)
 7. [GenTRX Distributed Training](#gentrx)
@@ -62,8 +64,8 @@ For the τaos component: the mechanism is designed to promote intelligent, risk-
 
 **Two reward pools.** Miner rewards are split across two incentive pools that run in parallel:
 
-- **Trading pool** (~95% of rewards by default): scored on kappa and PnL from simulation trading. All registered miners participate.
-- **GenTRX training pool** (~5% by default, set by `--scoring.gentrx.simulation_share` on the validator): scored on gradient quality, assessed each round against held-out order-book data. Scales with active participation - unused training rewards return to the trading pool. Opt-in for both validators and miners; zero impact on trading rewards when not in use.
+- **Trading pool** (~95% of rewards by default): scored on kappa and PnL from simulation trading (and later, MVTRX Exchange activity). All registered miners participate.
+- **GenTRX training pool** (~5% by default, set by `--scoring.gentrx.simulation_share` on the validator): scored on gradient quality, assessed each round against held-out order-book data. Scales with active participation — unused training rewards return to the trading pool. Opt-in for both validators and miners; zero impact on trading rewards when not in use.
 
 ### Owner Role <span id="mechanism-owner"><span>
 The subnet owners are tasked with ensuring fair, equitable and correct operation of the subnet mechanisms (as in all other subnets), while also being responsible for the design, refinement, tuning and publishing of the simulation parameters and logic.  This involves consistent monitoring, testing and development to expand the capabilities of the simulator and determine parameters which result in the most useful possible outputs being generated through the subnet's operation.  The owner must also ensure that the metrics utilized in determining miner rewards are chosen such that miners are incentivized to act fairly and in such a way that outputs are of optimal value in research, trading strategy development, market surveillance and other applications.
@@ -176,7 +178,10 @@ cd sn-79
 ```
 
 ### Docker <span id="install-docker"><span>
-DOCKER DEPLOYMENT IMPLEMENTATION WILL BE COMPLETED IF REQUESTED BY VALIDATORS
+A containerised deployment is **not currently provided** — the native install
+below (`./install_validator.sh` / `./install_miner.sh`) is the supported path.
+If a Docker-based deploy would help your setup, please open an issue; it is on
+the roadmap but not yet shipped, so do not rely on it being available today.
 
 ### Validator <span id="install-validator"><span>
 To prepare your environment for running a validator (including the C++ simulator), simply run the included script **as root user** (if unable to execute as root, please reach out to us for assistance, but may need to await Docker-based deploy in this case):
@@ -193,7 +198,7 @@ This will install the following tools:
 - **Python 3.10.9** : This version of Python has been used in all testing; later versions will likely still work but have not been tested
 - **τaos** : The Python component of the apparatus, containing the base validator and miner logic
 - **vcpkg** : For C++ simulator dependency management
-- **g++-14** : If on Ubuntu 22.04 rather than the latest 24.04, g++ 13.1 must be installed and used for compilation of the simulator (g++ 14.2 is already included in Ubuntu 24.04 install)
+- **g++-14** : If on Ubuntu 22.04 rather than the latest 24.04, g++ 14.1 must be installed and used for compilation of the simulator (g++ 14.2 is already included in Ubuntu 24.04 install)
 - **cmake-3.29.7** : Required to build and run the simulator
 - **τaos.im simulator** : The C++/Pybind simulator application.
 
@@ -224,27 +229,50 @@ This will install the following tools:
 
 ## Run <span id="run"><span>
 We include simple shell scripts to facilitate running of a validator or miner; it is also possible to run the applications directly yourself in the case of miner processes, though validators are strongly recommended to use the provided script in order to ensure that all components are updated properly.
-If you wish to use the run scripts, first enter the directory where you have cloned this repo.  You will of course also need to register the hotkey with which you wish to mine/validate on the subnet.
+If you wish to use the run scripts, first enter the directory where you have cloned this repo.
+
+### Registration <span id="run-registration"><span>
+Before running, you must have a Bittensor wallet (coldkey + hotkey) and register
+that hotkey on the subnet. If you do not yet have a wallet:
+
+```console
+# Create a coldkey (keep this secured/offline — it controls funds) and a hotkey.
+btcli wallet new_coldkey --wallet.name <coldkey>
+btcli wallet new_hotkey  --wallet.name <coldkey> --wallet.hotkey <hotkey>
+```
+
+Then register the hotkey on the subnet (netuid **79** on mainnet/finney; use the
+testnet netuid with `--network test`). Registration burns a small amount of TAO:
+
+```console
+btcli subnet register --netuid 79 --wallet.name <coldkey> --wallet.hotkey <hotkey>
+# testnet: btcli subnet register --netuid <testnet-netuid> --network test \
+#          --wallet.name <coldkey> --wallet.hotkey <hotkey>
+```
+
+Operational notes:
+- The **coldkey** can stay on a secure/offline machine; only the **hotkey** needs
+  to be present on the validator/miner host that serves the axon.
+- Confirm registration with
+  `btcli subnet metagraph --netuid 79` (your hotkey should appear with a UID).
+- Wallets default to `~/.bittensor/wallets/`; pass `-p <path>` to the run scripts
+  if yours live elsewhere.
 
 ### Validator <span id="run-validator"><span>
-To run a validator, use the provided `run_validator.sh`:
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-e` | Subtensor endpoint | `wss://entrypoint-finney.opentensor.ai:443` |
-| `-p` | Wallet directory | `~/.bittensor/wallets/` |
-| `-w` | Coldkey name | `taos` |
-| `-h` | Hotkey name | `validator` |
-| `-u` | Netuid | `79` |
-| `-l` | Log level (`error`/`warning`/`info`/`debug`/`trace`) | `info` |
-| `-d` | PagerDuty integration key | `""` |
-| `-o` | Prometheus metrics port | `9001` |
-| `-t` | Miner query timeout (seconds) | `3.0` |
-| `-s` | Preserve simulator on update (`-s 1` to keep running) | `0` |
-| `-x` | Launch tmux monitoring session (`-x 0` to disable) | `1` |
-| `-c` | Resume simulation from checkpoint path or `latest` | `0` |
-| `-G` | Enable GenTRX distributed training | *(disabled)* |
-| `-Q` | Gradient server URL - skip auto-start and use this address (e.g. for a remote GPU machine) | *(auto)* |
+To run a validator, you can use the provided `run_validator.sh` which accepts the following arguments:
+- `-e` : The subtensor endpoint to which you will connect (default=`wss://entrypoint-finney.opentensor.ai:443`)
+- `-p` : The path where your wallets are stored (default=`~/.bittensor/wallets/`)
+- `-w` : The name of your coldkey (default=`taos`)
+- `-h` : The name of your hotkey (default=`validator`)
+- `-l` : Logging level for the validator, must be one of `error`, `warning`, `info`, `debug`, `trace` (default=`info`)
+- `-d` : Pagerduty integration key; if you have a Pagerduty subscription, this allows to trigger alerts for critical failure scenarios (default=`""`)
+- `-o` : Port on which Prometheus metrics will be published.  If you use a different port than the default, please let us know so that your data will still appear at [taos.simulate.trading](https://taos.simulate.trading/?orgId=1) (default=`9001`). Exchange market data is served via the MVTRX Data Service and UI at [mvtrx.fi](https://mvtrx.fi).
+- `-t` : Timeout for miner queries; this allows validators to tune the time allowed for miners to respond to account for differences in server geolocation or networking capability (default=`3.0`).
+- `-s` : Flag to indicate that the simulator should not be restarted when performing the update; this allows to easily execute updates which only affect the Python validator operation (default=`0`; append `-s 1` to command to preserve running simulator during update).
+- `-x` : Flag to indicate if wanting to launch tmux session for monitoring (default=`1`; append `-x 0` to command to disable tmux session creation).
+- `-c` : If you wish to resume a previous simulation rather than starting a new one, you can set this argument to the location of the output directory of the simulation, or to `latest` to resume the most recently started simulation. (default=`0` => start a new simulation)
+- `-G` : Enable GenTRX distributed training. Disabled when the flag is not passed; pass `-G` (no argument) to enable in `sibling` mode — auto-starts a local gradient server that scores miner gradients alongside the τaos validator. `-G aggregator` is reserved for the subnet owner who operates the canonical uid-0 aggregator that publishes checkpoints on-chain; regular validators should use sibling.
+- `-Q` : Gradient server URL — skip auto-start and use this address (e.g. for a remote GPU machine). Default *(auto)*.
 
 The script will:
 1. Pull and install the latest changes from the taos repository
@@ -263,7 +291,9 @@ The script will:
 ```bash
 ./run_validator.sh -G -w taos -h validator -u 79
 ```
-On first run with `-G`: prompts for your R2/Hippius bucket credentials, detects a local GPU and starts the gradient server automatically (or guides you through connecting a remote GPU machine), and saves all configuration to `.env`. Subsequent runs restore saved config with no flags needed. Pass `-Q <url>` to point at an already-running gradient server without auto-starting one. Full setup guide: [`doc/gentrx/validator_setup.md`](doc/gentrx/validator_setup.md).
+On first run with `-G`: prompts for your S3 bucket credentials, detects a local GPU and starts the gradient server automatically (or guides you through connecting a remote GPU machine), and saves all configuration to `.env`. Subsequent runs restore saved config with no flags needed. Pass `-Q <url>` to point at an already-running gradient server without auto-starting one. Full setup guide: [`doc/gentrx/validator_setup.md`](doc/gentrx/validator_setup.md).
+
+**S3 backend.** Each GenTRX validator needs its own writable S3 bucket for checkpoints, training data, and proposals; read-only credentials for the bucket are committed on-chain so miners and the aggregator can discover it. Supported providers are **Cloudflare R2**, **Storj**, and **Hippius S3** (auto-detected from the committed `account_id`; see [`GenTRX/src/chain.py`](GenTRX/src/chain.py)). The `-G` first-run wizard sets the required `GENTRX_VALIDATOR_S3_*` and `GENTRX_API_KEY` env vars into `.env` for you; for non-interactive setup, copy [`.env.example`](.env.example) to `.env` and fill in the values directly.
 
 **Running the gradient server on a separate GPU machine** (or locally but managed independently):
 
@@ -333,7 +363,9 @@ The script will:
 ```bash
 ./run_miner.sh -G -w taos -h miner -u 79 -a 8091
 ```
-On first run with `-G`: prompts for your R2/Hippius bucket credentials, commits the read key on-chain, and saves all configuration to `.env`. It prints a complete reusable command at the end - useful as a template when running multiple UIDs (adjust `-w`/`-h`/`-a`). Subsequent runs restore saved config with no flags needed. To override training params without changing saved config: `./run_miner.sh -t "gtx_train_steps=100 gtx_train_batch_size=8"`. The default agent is `HybridTrainingAgent` - a template, not a finished strategy; tune before deploying seriously. Full setup guide: [`doc/gentrx/miner_setup.md`](doc/gentrx/miner_setup.md).
+On first run with `-G`: prompts for your S3 bucket credentials, commits the read key on-chain, and saves all configuration to `.env`. It prints a complete reusable command at the end - useful as a template when running multiple UIDs (adjust `-w`/`-h`/`-a`). Subsequent runs restore saved config with no flags needed. To override training params without changing saved config: `./run_miner.sh -t "gtx_train_steps=100 gtx_train_batch_size=8"`. The default agent is `HybridTrainingAgent` - a template, not a finished strategy; tune before deploying seriously. Full setup guide: [`doc/gentrx/miner_setup.md`](doc/gentrx/miner_setup.md).
+
+**S3 backend.** Each miner needs their own writable S3 bucket for gradient uploads; read-only credentials for the bucket are committed on-chain at miner startup so the gradient server can fetch the uploads. Supported providers are **Cloudflare R2**, **Storj**, and **Hippius S3** (auto-detected from the committed `account_id`). The `-G` first-run wizard sets the required `GENTRX_AGENT_S3_*` env vars into `.env` for you; for non-interactive setup, copy [`.env.example`](.env.example) to `.env` and fill in the values directly.
 
 To run manually without pm2:
 ```bash

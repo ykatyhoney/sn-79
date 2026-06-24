@@ -1,760 +1,294 @@
 #!/bin/bash
-set -e
-# bittensor 10.3.2's LoggingMachine.config() returns an empty config when
-# BT_NO_PARSE_CLI_ARGS is not "false" at `import bittensor` time, which silently
-# disables the main process's logging. Set it here (before any python launch)
-# so it's in the env before the import-time logging singleton is built; pm2
-# captures it for restarts and spawned subprocesses inherit it. Pinned to
-# <10.3.2 in requirements.txt, but this keeps 10.3.2 usable if the pin is lifted.
-export BT_NO_PARSE_CLI_ARGS=false
-# run_validator.sh — launch MVTRX validator + simulator
+# Validator launcher: starts the C++ simulator and the validator process under
+# pm2, with an optional tmux dashboard.
 #
 # GenTRX distributed training (optional):
-#   -G              enable as sibling validator (default; scores and proposes)
-#   -G aggregator   enable as uid-0 aggregator (publishes canonical model; internal)
-#   -Q <url>        gradient server URL — skip auto-start and use this address
-#                   (e.g. http://gpu-host:8100/gentrx for a remote GPU machine)
-#
-# First run: prompts interactively for bucket credentials and gradient server
-# choice; saves all answers to .env.
-#
-# Subsequent update runs: run without -G — the saved mode is restored from .env,
-# all prompts are skipped, and the gradient server is restarted automatically.
-# Pass -G to override the saved mode, or -Q to change the gradient server URL.
-
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-ENDPOINT=wss://entrypoint-finney.opentensor.ai:443
+#   -G              enable as sibling validator
+#   -G aggregator   enable as uid-0 aggregator (subnet operator only)
+#   -Q <url>        gradient server URL — skip auto-start and use a remote GPU
+REPO_ROOT=$(pwd)
+ENDPOINT="wss://entrypoint-finney.opentensor.ai:443"
 WALLET_PATH=~/.bittensor/wallets/
 WALLET_NAME=taos
 HOTKEY_NAME=validator
-NETUID=79
+NETUID=""
 CHECKPOINT=0
 LOG_LEVEL=info
-PD_KEY=""
+PD_KEY="\"\""
 PROM_PORT=9001
+VALIDATOR_PORT=8000
 TIMEOUT=3.0
 SIMULATION_CONFIG=simulation_0
 PRESERVE_SIMULATOR=0
 USE_TMUX=1
-GENTRX_MODE=""    # aggregator | sibling  (empty = GenTRX disabled)
-GRAD_URL=""       # explicit gradient server URL; empty = auto-start or prompt
-GRAD_PORT=8100    # gradient server listen port (local or remote)
-# GRAD_CORES_COUNT: reserve the last N CPU cores exclusively for the gradient
-# server (CPU-only mode).  0 = no pinning (default; GPU mode or manual control).
-# 8 is comfortable for CPU scoring; 4 is the minimum within 5-min round windows.
-# Set in .env or export before running.  Validator + simulator are pinned to the
-# remaining cores automatically when this is > 0.
-GRAD_CORES_COUNT="${GRAD_CORES_COUNT:-0}"
+MECHID=0
 
-# Track explicit CLI flags so they override saved config
+# ── GenTRX distributed training ───────────────────────────────────────────────
+GENTRX_MODE=""
+GRAD_URL=""
+GRAD_PORT="${GRAD_PORT:-8100}"
+GRAD_CORES_COUNT="${GRAD_CORES_COUNT:-0}"
+export GRAD_CORES_COUNT
 _EXPLICIT_GRAD_URL=0
 
-# set -a auto-exports every var the sourced file sets, so pm2 (and any other
-# child process) inherits them. Plain `. .env` would only populate this
-# script's shell vars, leaving GENTRX_VALIDATOR_S3_* invisible to pm2 — which
-# silently skips the on-chain bucket commitment in validator.py and breaks
-# miner-side aggregator discovery.
-[ -f "$REPO_ROOT/.env" ] && { set -a; . "$REPO_ROOT/.env"; set +a; }
+# Pre-parse -E before getopts (env file sourced after defaults, before CLI flags).
+_ENV_FILE=""
+_prev=""
+for _a in "$@"; do
+    [ "$_prev" = "-E" ] && _ENV_FILE="$_a"
+    _prev="$_a"
+done
+if [ -n "$_ENV_FILE" ]; then
+    [ -f "$_ENV_FILE" ] || { echo "ERROR: env file '$_ENV_FILE' not found" >&2; exit 1; }
+    # shellcheck source=/dev/null
+    . "$_ENV_FILE"
+fi
 
-# Normalize -G: if passed without a recognised mode value, default to 'sibling'.
-# This allows `./run_validator.sh -G` without an explicit 'sibling' argument.
-# Only `-G aggregator` (or its aliases a/agg) selects aggregator mode.
+# Load machine-local secrets (~/.taos.env wins over -E env file).
+# shellcheck source=/dev/null
+[ -f "$HOME/.taos.env" ] && . "$HOME/.taos.env"
+
+# Restore saved GenTRX mode from $REPO_ROOT/.env.
+# shellcheck source=/dev/null
+[ -f "$REPO_ROOT/.env" ] && . "$REPO_ROOT/.env"
+
+# Normalize -G: allow `-G` with no argument to mean sibling mode.
 _norm_args=()
 _ia=1
 while [ "$_ia" -le "$#" ]; do
-    _arg="${!_ia}"
-    if [ "$_arg" = "-G" ]; then
-        _ia=$(( _ia + 1 ))
-        _nxt="${!_ia:-}"
-        case "$_nxt" in
-            aggregator|agg|a) _norm_args+=("-G" "$_nxt"); _ia=$(( _ia + 1 )) ;;
-            sibling|sib|s)    _norm_args+=("-G" "sibling"); _ia=$(( _ia + 1 )) ;;
-            *)                _norm_args+=("-G" "sibling") ;;  # default; don't consume _nxt
-        esac
+    _cur="${!_ia}"
+    if [ "$_cur" = "-G" ]; then
+        _next_idx=$((_ia + 1))
+        if [ "$_next_idx" -le "$#" ]; then
+            _next="${!_next_idx}"
+            case "$_next" in
+                aggregator|agg|a) _norm_args+=("-G" "aggregator"); _ia=$((_ia + 2));;
+                sibling|sib|s)    _norm_args+=("-G" "sibling");    _ia=$((_ia + 2));;
+                -*|"")            _norm_args+=("-G" "sibling");    _ia=$((_ia + 1));;
+                *)                _norm_args+=("-G" "sibling");    _ia=$((_ia + 1));;
+            esac
+        else
+            _norm_args+=("-G" "sibling"); _ia=$((_ia + 1))
+        fi
     else
-        _norm_args+=("$_arg"); _ia=$(( _ia + 1 ))
+        _norm_args+=("$_cur"); _ia=$((_ia + 1))
     fi
 done
-set -- "${_norm_args[@]+"${_norm_args[@]}"}"
+set -- "${_norm_args[@]}"
 
-while getopts e:p:w:h:u:l:d:o:t:g:s:x:c:G:Q: flag; do
-    case "${flag}" in
+while getopts ":e:p:w:h:u:k:t:l:b:P:c:r:s:i:T:E:Q:G:" opt; do
+    case "$opt" in
         e) ENDPOINT=${OPTARG};;
         p) WALLET_PATH=${OPTARG};;
         w) WALLET_NAME=${OPTARG};;
         h) HOTKEY_NAME=${OPTARG};;
         u) NETUID=${OPTARG};;
-        l) LOG_LEVEL=${OPTARG};;
-        d) PD_KEY=${OPTARG};;
-        o) PROM_PORT=${OPTARG};;
+        k) PD_KEY=${OPTARG};;
         t) TIMEOUT=${OPTARG};;
-        g) SIMULATION_CONFIG=${OPTARG};;
-        s) PRESERVE_SIMULATOR=${OPTARG};;
-        x) USE_TMUX=${OPTARG};;
+        l) LOG_LEVEL=${OPTARG};;
+        b) PROM_PORT=${OPTARG};;
+        P) VALIDATOR_PORT=${OPTARG};;
         c) CHECKPOINT=${OPTARG};;
-        G) GENTRX_MODE=${OPTARG};;
+        s) SIMULATION_CONFIG=${OPTARG};;
+        i) MECHID=${OPTARG};;
+        r) PRESERVE_SIMULATOR=${OPTARG};;
+        T) USE_TMUX=${OPTARG};;
+        E) ;;  # already pre-parsed
         Q) GRAD_URL=${OPTARG}; _EXPLICIT_GRAD_URL=1;;
+        G) GENTRX_MODE=${OPTARG};;
+        \?) echo "Invalid option: -$OPTARG" >&2; exit 1;;
     esac
 done
 
-# If -G not passed but we ran GenTRX before, restore saved mode so this
-# update run also restarts the gradient server and keeps GENTRX_VAL_ARGS.
+# GenTRX restore
 if [ -z "$GENTRX_MODE" ] && [ -n "${GENTRX_SAVED_MODE:-}" ]; then
     GENTRX_MODE="$GENTRX_SAVED_MODE"
 fi
-
-# -Q alone (no -G, no saved mode) still enables GenTRX; default to sibling.
 if [ -n "$GRAD_URL" ] && [ -z "$GENTRX_MODE" ]; then
     GENTRX_MODE="sibling"
 fi
 
-# Export GRAD_CORES_COUNT so run_gradients.sh (called for local gradient server)
-# inherits it, and so the validator Python process reads it via os.environ.
-export GRAD_CORES_COUNT
+# Default netuid from endpoint
+if [ -z "$NETUID" ]; then
+    case "$ENDPOINT" in
+        *entrypoint-finney*) NETUID=79 ;;
+        *test.finney*)       NETUID=366 ;;
+        *)                   NETUID=79 ;;
+    esac
+fi
+
+VALIDATOR_NAME="validator-sim"
+TMUX_SESSION="sim"
 
 echo "ENDPOINT: $ENDPOINT"
 echo "WALLET_PATH: $WALLET_PATH"
 echo "WALLET_NAME: $WALLET_NAME"
 echo "HOTKEY_NAME: $HOTKEY_NAME"
 echo "NETUID: $NETUID"
-echo "PAGERDUTY KEY: $PD_KEY"
+echo "VALIDATOR_PORT: $VALIDATOR_PORT"
 echo "PROMETHEUS PORT: $PROM_PORT"
-echo "TIMEOUT: $TIMEOUT"
 echo "SIMULATION_CONFIG: $SIMULATION_CONFIG"
-echo "PRESERVE_SIMULATOR: $PRESERVE_SIMULATOR"
-echo "USE_TMUX: $USE_TMUX"
 echo "CHECKPOINT: $CHECKPOINT"
-echo "GENTRX_MODE: ${GENTRX_MODE:-(disabled)}"
-echo "GRAD_URL: ${GRAD_URL:-(auto)}"
-echo "GENTRX_VAL_ARGS: ${GENTRX_VAL_ARGS:-<none>}"
+echo "TMUX_SESSION: $TMUX_SESSION"
 
-# ── process cleanup ────────────────────────────────────────────────────────────
-# Only kill gradient-server when it is managed locally by this script.
-# An external gradient server (run_gradients.sh on same or remote host) must
-# not be touched — it has its own lifecycle.
-_kill_grad=""
-if [ "${GENTRX_GRAD_LOCAL:-0}" = "1" ]; then
-    _kill_grad="gradient-server"
-fi
-if [ "$PRESERVE_SIMULATOR" = "0" ]; then
-    pm2 delete simulator validator ${_kill_grad} 2>/dev/null || true
-    if [ "$USE_TMUX" = "1" ]; then
-        tmux kill-session -t taos 2>/dev/null || true
+_pm2_clean() {
+    _ids=$(pm2 jlist 2>/dev/null | python3 -c "
+import sys, json
+try:
+    procs = json.load(sys.stdin)
+    names = set(sys.argv[1:])
+    print(' '.join(str(p['pm_id']) for p in procs if p['name'] in names))
+except Exception:
+    pass
+" "$@" 2>/dev/null)
+    if [ -n "$_ids" ]; then
+        pm2 stop    $_ids 2>/dev/null || true
+        pm2 delete  $_ids 2>/dev/null || true
     fi
-else
-    pm2 delete validator 2>/dev/null || true
+}
+
+if [ "$PRESERVE_SIMULATOR" = "0" ]; then
+    _pm2_clean simulator validator "$VALIDATOR_NAME"
+    [ "$USE_TMUX" = "1" ] && tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
 fi
 
 echo "Updating Validator"
-cd "$REPO_ROOT"
-git pull || { echo "WARNING: git pull failed (no tracking branch?). Continue without updating? [y/N]"; read -r _yn; [ "$_yn" = "y" ] || exit 1; }
+git pull
+git submodule sync
+git submodule update --init
 pip install -e .
 
-# scalecodec ↔ cyscale conflict: bittensor's transitive deps drag py-scale-codec
-# (PyPI package `scalecodec`) back in on every `pip install -e .`, even though
-# we want cyscale to provide the `scalecodec` namespace. Both installed at once
-# → async_substrate_interface raises a RuntimeError at `import bittensor` time
-# and the validator never starts. Detect by trying to import bittensor; on
-# failure, uninstall both and force-reinstall cyscale. Idempotent.
-if ! python -c "import bittensor" >/dev/null 2>&1; then
-    echo "Repairing scalecodec/cyscale conflict (bittensor import failed)"
-    pip uninstall -y scalecodec cyscale 2>/dev/null || true
-    pip install --force-reinstall --no-cache-dir cyscale
-fi
+# Strip orphaned packages bittensor ≥8 doesn't need.
+pip uninstall substrate-interface scalecodec py-scale-codec cyscale -y 2>/dev/null || true
+pip install cyscale --force-reinstall --quiet
 
-# ── simulator build ────────────────────────────────────────────────────────────
 if [ "$PRESERVE_SIMULATOR" = "0" ]; then
-    echo "Updating Simulator"
+    echo "Updating C++ Engine"
     export LD_LIBRARY_PATH="/usr/local/gcc-14.1.0/lib/../lib64:$LD_LIBRARY_PATH"
     cd simulate/trading
     cd vcpkg
     CURRENT_VCPKG_HASH=$(git rev-parse HEAD)
     EXPECTED_VCPKG_HASH="e140b1fde236eb682b0d47f905e65008a191800f"
-    echo "Current vcpkg commit:  $CURRENT_VCPKG_HASH"
-    echo "Expected vcpkg commit: $EXPECTED_VCPKG_HASH"
     if [ "$CURRENT_VCPKG_HASH" != "$EXPECTED_VCPKG_HASH" ]; then
-        echo "Updating vcpkg..."
         git fetch --all --quiet
         git reset --hard "$EXPECTED_VCPKG_HASH"
-        echo "Repo successfully reset to $EXPECTED_VCPKG_HASH."
         rm -r ../build
         mkdir ../build
         ./bootstrap-vcpkg.sh -disableMetrics
-    else
-        echo "Commit hash matches. No reset needed."
     fi
     cd ..
-    # Cap build parallelism by available RAM (g++ uses ~2 GB per translation
-    # unit for the simulator's heavy templates). Without this, -j$(nproc) on
-    # a low-memory box OOMs mid-build.
     MEM_MB=$(free -m | awk '/^Mem:/{print $7}')
     MEM_JOBS=$(( MEM_MB / 2048 ))
     MEM_JOBS=$(( MEM_JOBS < 1 ? 1 : MEM_JOBS ))
     NPROC=$(nproc)
     BUILD_JOBS=$(( MEM_JOBS < NPROC ? MEM_JOBS : NPROC ))
-    echo "Build parallelism: -j $BUILD_JOBS  (${MEM_MB}MB free, ${NPROC} cores)"
-    if ! g++ -dumpversion | grep -q "14"; then
-        cd build && cmake -DENABLE_TRACES=1 -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 .. && cmake --build . -j "$BUILD_JOBS"
-    else
-        cd build && cmake -DENABLE_TRACES=1 -DCMAKE_BUILD_TYPE=Release .. && cmake --build . -j "$BUILD_JOBS"
+    _TRADING_DIR="$REPO_ROOT/simulate/trading"
+    _build_ok=0
+    for _try in 1 2; do
+        cd "$_TRADING_DIR/build" || exit 1
+        if ! g++ -dumpversion | grep -q "14"; then
+            cmake -DENABLE_TRACES=1 -DCMAKE_BUILD_TYPE=Release -D CMAKE_CXX_COMPILER=g++-14 .. \
+                && cmake --build . -j "$BUILD_JOBS" \
+                && _build_ok=1
+        else
+            cmake -DENABLE_TRACES=1 -DCMAKE_BUILD_TYPE=Release .. \
+                && cmake --build . -j "$BUILD_JOBS" \
+                && _build_ok=1
+        fi
+        [ "$_build_ok" = "1" ] && break
+        echo "Simulator build attempt $_try failed — wiping vcpkg buildtrees/packages and retrying..."
+        cd "$_TRADING_DIR"
+        rm -rf vcpkg/buildtrees vcpkg/packages vcpkg/downloads/temp build
+        mkdir build
+    done
+    if [ "$_build_ok" = "0" ]; then
+        echo "ERROR: Simulator build failed after 2 attempts." >&2
+        exit 1
     fi
     cd "$REPO_ROOT/taos/im/neurons"
 else
-    cd "$REPO_ROOT/taos/im/neurons"
+    cd taos/im/neurons
 fi
 
-# ══════════════════════════════════════════════════════════════════════════════
-# GenTRX setup (runs when -G is passed; defaults to sibling mode)
-# ══════════════════════════════════════════════════════════════════════════════
-
-_hr()         { echo; printf '%s\n' "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; }
-_ok()         { printf ' \033[32m✓\033[0m  %s\n' "$*"; }
-_warn()       { printf ' \033[33m⚠\033[0m  %s\n' "$*"; }
-_step()       { printf '\n \033[1m─ %s\033[0m\n' "$*"; }
-_info()       { printf '   %s\n' "$*"; }
-
-# Write/update key=value in .env (handles special chars in value)
-_env_write() {
-    local key="$1" val="$2"
-    [ -f "$REPO_ROOT/.env" ] || touch "$REPO_ROOT/.env"
-    python3 -c "
-import sys, os, shlex
-path, key, val = sys.argv[1], sys.argv[2], sys.argv[3]
-lines = open(path).readlines() if os.path.exists(path) else []
-new = []; found = False
-quoted = shlex.quote(val) if val else \"''\"
-for l in lines:
-    if l.strip().startswith(key + '=') and not l.strip().startswith('#'):
-        new.append(key + '=' + quoted + '\n'); found = True
-    else:
-        new.append(l)
-if not found:
-    new.append(key + '=' + quoted + '\n')
-open(path, 'w').writelines(new)
-" "$REPO_ROOT/.env" "$key" "$val"
-}
-
-# Prompt for a value; skip if already set in current env; write to .env
-_prompt() {
-    local varname="$1" msg="$2" default="${3:-}"
-    local current="${!varname:-}"
-    if [ -n "$current" ]; then
-        _info "$varname: [already set — skipping]"; return
-    fi
-    if [ -n "$default" ]; then
-        read -r -p "    $msg [$default]: " _in
-        printf -v "$varname" '%s' "${_in:-$default}"
-    else
-        read -r -p "    $msg: " _in
-        printf -v "$varname" '%s' "$_in"
-    fi
-    [ -z "${!varname:-}" ] && { echo "ERROR: $varname is required."; exit 1; }
-    _env_write "$varname" "${!varname}"
-    export "$varname"
-}
-
-# Prompt for a secret (silent input)
-_prompt_secret() {
-    local varname="$1" msg="$2"
-    local current="${!varname:-}"
-    if [ -n "$current" ]; then
-        _info "$varname: [already set — skipping]"; return
-    fi
-    read -r -s -p "    $msg: " _in; echo
-    printf -v "$varname" '%s' "$_in"
-    [ -z "${!varname:-}" ] && { echo "ERROR: $varname is required."; exit 1; }
-    _env_write "$varname" "${!varname}"
-    export "$varname"
-}
-
-_gentrx_validator_setup() {
-    local mode="$1"
-
-    # Normalize mode name
-    case "$mode" in
-        a|agg|aggregator) mode=aggregator ;;
-        s|sib|sibling)    mode=sibling ;;
-        *)
-            echo "ERROR: -G mode must be 'aggregator' or 'sibling' (got '$mode')."
-            echo "  Use -G            for sibling mode (default, for uid 1+)."
-            echo "  Use -G aggregator if you are uid 0 (publishes the canonical model)."
-            exit 1 ;;
-    esac
-
-    # Persist mode so subsequent update runs (no -G flag) reuse same mode
-    _env_write "GENTRX_SAVED_MODE" "$mode"
-
-    _hr
-    printf ' \033[1mGenTRX Validator Setup — %s\033[0m\n' "$mode"
-    _hr
-    echo
-    _info "Docs: doc/gentrx/validator_setup.md"
-    echo
-
-    # ── Validator S3 bucket ──────────────────────────────────────────────────
-    _step "Validator S3 bucket"
-    # Write credentials live on the gradient server host, not necessarily here.
-    # Skip the wizard if:
-    #   (a) write creds + bucket are all present (local gradient server setup), OR
-    #   (b) an external gradient server URL is given (-Q) and the bucket is known
-    #       (write creds stay on the remote GPU host; we only need read creds here).
-    if ( [ -n "$GRAD_URL" ] && [ -n "${GENTRX_VALIDATOR_S3_BUCKET:-}" ] ) || \
-       ( [ -n "${GENTRX_VALIDATOR_S3_WRITE_ACCESS_KEY:-}" ] && \
-         [ -n "${GENTRX_VALIDATOR_S3_WRITE_SECRET_KEY:-}" ] && \
-         [ -n "${GENTRX_VALIDATOR_S3_BUCKET:-}" ] ); then
-        _ok "Validator S3 bucket: ${GENTRX_VALIDATOR_S3_BUCKET} [already configured — skipping]"
-    else
-        _info "Each validator needs one R2, Storj, or Hippius bucket."
-        _info "In your provider's dashboard, create a bucket and generate TWO keys:"
-        _info "  • Write key  (Object Read & Write) — stays on this host"
-        _info "  • Read key   (Object Read only)    — committed on-chain"
-        _info "Copy the Access Key ID and Secret Access Key from each."
-        echo
-
-        # Provider selection
-        local _provider
-        if [ "${GENTRX_VALIDATOR_S3_PROVIDER:-}" = "storj" ]; then
-            _provider="3"               # Storj: provider hint already in env
-        elif [ -n "${GENTRX_VALIDATOR_S3_ACCOUNT_ID:-}" ]; then
-            _provider="configured-r2"   # R2: account_id present
-        elif [ -n "${GENTRX_VALIDATOR_S3_ENDPOINT_URL:-}" ]; then
-            _provider="2"               # custom endpoint (MinIO/Hippius): no account_id
-        else
-            printf '    Provider: (1) Cloudflare R2  (2) Hippius  (3) Storj  [1]: '
-            read -r _provider; _provider="${_provider:-1}"
-        fi
-
-        case "$_provider" in
-            2|hippius|Hippius)
-                _prompt GENTRX_VALIDATOR_S3_ENDPOINT_URL \
-                    "Hippius endpoint URL" "https://s3.hippius.com"
-                _prompt GENTRX_VALIDATOR_S3_BUCKET "Bucket name"
-                ;;
-            3|storj|Storj)
-                GENTRX_VALIDATOR_S3_PROVIDER="storj"
-                _env_write "GENTRX_VALIDATOR_S3_PROVIDER" "storj"
-                export GENTRX_VALIDATOR_S3_PROVIDER
-                _prompt GENTRX_VALIDATOR_S3_ENDPOINT_URL \
-                    "Storj gateway URL" "https://gateway.storjshare.io"
-                _prompt GENTRX_VALIDATOR_S3_BUCKET "Bucket name"
-                _info "Storj read grant needs only GetObject scope; ListBucket is not required."
-                ;;
-            *)
-                _prompt GENTRX_VALIDATOR_S3_ACCOUNT_ID \
-                    "Cloudflare R2 account ID (32-char hex, from R2 dashboard)"
-                local _default_bucket="${GENTRX_VALIDATOR_S3_ACCOUNT_ID:-}"
-                _prompt GENTRX_VALIDATOR_S3_BUCKET "Bucket name" "$_default_bucket"
-                # Derive endpoint URL from account ID if not set
-                if [ -z "${GENTRX_VALIDATOR_S3_ENDPOINT_URL:-}" ]; then
-                    GENTRX_VALIDATOR_S3_ENDPOINT_URL="https://${GENTRX_VALIDATOR_S3_ACCOUNT_ID}.r2.cloudflarestorage.com"
-                    _env_write "GENTRX_VALIDATOR_S3_ENDPOINT_URL" "$GENTRX_VALIDATOR_S3_ENDPOINT_URL"
-                    export GENTRX_VALIDATOR_S3_ENDPOINT_URL
-                    _info "Endpoint URL derived: $GENTRX_VALIDATOR_S3_ENDPOINT_URL"
-                fi
-                ;;
-        esac
-        echo
-        _step "Write token — gradient server (stays on this host)"
-        _prompt_secret GENTRX_VALIDATOR_S3_WRITE_ACCESS_KEY "Write access key ID"
-        _prompt_secret GENTRX_VALIDATOR_S3_WRITE_SECRET_KEY "Write secret access key"
-    fi
-
-    _step "Read-only token — committed on-chain so miners can find your bucket"
-    _prompt_secret GENTRX_VALIDATOR_S3_READ_ACCESS_KEY  "Read-only access key ID"
-    _prompt_secret GENTRX_VALIDATOR_S3_READ_SECRET_KEY  "Read-only secret access key"
-    echo
-    _ok "Validator S3 credentials saved to .env"
-
-    # ── Validator UID lookup ─────────────────────────────────────────────────
-    _step "Looking up validator UID on chain"
-    _info "Querying metagraph (netuid=$NETUID, network=$ENDPOINT)..."
-    local _uid
-    _uid=$(python3 -c "
-import bittensor as bt, sys
-try:
-    sub = bt.Subtensor(network='$ENDPOINT')
-    meta = sub.metagraph($NETUID)
-    w = bt.Wallet(name='$WALLET_NAME', hotkey='$HOTKEY_NAME', path='$WALLET_PATH')
-    print(list(meta.hotkeys).index(w.hotkey.ss58_address))
-except Exception:
-    print('')
-" 2>/dev/null)
-    if [ -n "$_uid" ]; then
-        VALIDATOR_UID="$_uid"
-        _env_write "VALIDATOR_UID" "$VALIDATOR_UID"
-        export VALIDATOR_UID
-        _ok "Validator UID: $VALIDATOR_UID"
-    else
-        _warn "Could not determine validator UID (chain unreachable or not yet registered)."
-        _warn "Prometheus labels will lack validator_uid; re-run after chain sync."
-        VALIDATOR_UID="${VALIDATOR_UID:-}"
-    fi
-
-    # ── Gradient server ──────────────────────────────────────────────────────
-    _step "Gradient server"
-
-    _start_local_gradients() {
-        "$REPO_ROOT/run_gradients.sh" \
-            -m "$mode" \
-            -e "$ENDPOINT" \
-            -u "$NETUID" \
-            -V "${VALIDATOR_UID:-}" \
-            -p "$GRAD_PORT" \
-            -b 127.0.0.1 \
-            -l "$LOG_LEVEL" \
-            -x 0 \
-            -n
-        GRAD_URL="http://127.0.0.1:${GRAD_PORT}/gentrx"
-        _env_write "GENTRX_GRAD_LOCAL" "1"
-        _env_write "GENTRX_GRAD_HOST"  ""
-        export GENTRX_GRAD_LOCAL=1
-    }
-
-    if [ -n "$GRAD_URL" ]; then
-        # Explicit -Q override — trust the operator
-        _ok "Gradient server URL: $GRAD_URL  (from -Q, not auto-starting)"
-        _info "Ensure the gradient server is already running at that address before continuing."
-        # Persist -Q so future runs without -Q still use the same server
-        if [ "$_EXPLICIT_GRAD_URL" = "1" ]; then
-            local _netloc
-            _netloc=$(python3 -c "from urllib.parse import urlparse; print(urlparse('$GRAD_URL').netloc)" 2>/dev/null || true)
-            if [ -n "$_netloc" ]; then
-                GENTRX_GRAD_HOST="$_netloc"
-                _env_write "GENTRX_GRAD_HOST"  "$GENTRX_GRAD_HOST"
-                _env_write "GENTRX_GRAD_LOCAL" "0"
-                export GENTRX_GRAD_HOST
-            fi
-        fi
-        # Prompt for API key if not already set (printed by run_vast/run_gradients after first launch)
-        if [ -z "${GENTRX_API_KEY:-}" ]; then
-            _step "API key"
-            _info "The gradient server requires an API key. Copy it from the GPU host"
-            _info "(printed at the end of run_vast.sh / run_gradients.sh on first launch,"
-            _info "or found in .env on that host as GENTRX_API_KEY)."
-            _prompt_secret GENTRX_API_KEY "API key"
-            export GENTRX_API_KEY
-        else
-            _ok "API key: already set"
-        fi
-
-    elif [ "${GENTRX_GRAD_LOCAL:-0}" = "1" ]; then
-        # Previously chose local — restart it
-        _ok "Restarting local gradient server (saved config)"
-        # Backfill GENTRX_GRAD_CPU if not yet written (first run with new code)
-        if [ -z "${GENTRX_GRAD_CPU:-}" ]; then
-            local _gpu=""
-            command -v nvidia-smi > /dev/null 2>&1 && \
-                _gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)
-            [ -z "$_gpu" ] && GENTRX_GRAD_CPU=1 || GENTRX_GRAD_CPU=0
-            _env_write "GENTRX_GRAD_CPU" "$GENTRX_GRAD_CPU"
-            export GENTRX_GRAD_CPU
-        fi
-        _start_local_gradients
-
-    elif [ -n "${GENTRX_GRAD_HOST:-}" ]; then
-        # Previously chose remote — update GRAD_URL and print the update command
-        local _gport="${GENTRX_GRAD_HOST##*:}"
-        local _ghost="${GENTRX_GRAD_HOST%%:*}"
-        [ "$_ghost" = "$_gport" ] && _gport="$GRAD_PORT"
-        GRAD_URL="http://${GENTRX_GRAD_HOST}/gentrx"
-        _ok "Gradient server: $GRAD_URL (remote, saved config)"
-        _info "To restart / update the gradient server on the GPU machine, run:"
-        echo
-        _print_remote_run_cmd "$mode"
-        echo
-
-    else
-        # First run — detect GPU and always prompt for gradient server placement.
-        local _gpu=""
-        if command -v nvidia-smi > /dev/null 2>&1; then
-            _gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)
-        fi
-
-        _info "The gradient server scores miner gradients via forward passes on held-out data."
-        echo
-        local _gs_choice
-        if [ -n "$_gpu" ]; then
-            _ok "GPU detected: $_gpu"
-            printf '    Gradient server options:\n'
-            printf '      (1) This machine — GPU [recommended]\n'
-            printf '      (2) This machine — CPU (frees GPU for other workloads; ~5× slower)\n'
-            printf '      (3) Separate GPU machine\n'
-            printf '    Choice [1/2/3, default 1]: '
-            read -r _gs_choice; _gs_choice="${_gs_choice:-1}"
-        else
-            _warn "No NVIDIA GPU detected."
-            _info "CPU-only is supported but ~5× slower and may miss round deadlines at scale."
-            echo
-            printf '    Gradient server options:\n'
-            printf '      (1) This machine (CPU-only, may be slow)\n'
-            printf '      (2) Separate GPU machine [recommended]\n'
-            printf '    Choice [1/2, default 1]: '
-            read -r _gs_choice; _gs_choice="${_gs_choice:-1}"
-        fi
-
-        # Remote option: 3 when GPU present, 2 when no GPU
-        local _remote_opt="3"
-        [ -z "$_gpu" ] && _remote_opt="2"
-
-        if [ "$_gs_choice" = "$_remote_opt" ]; then
-            _gentrx_setup_remote_gradients "$mode"
-        else
-            # Local — CPU if: no GPU, or GPU+choice=2
-            local _local_cpu=0
-            { [ -n "$_gpu" ] && [ "$_gs_choice" = "2" ]; } && _local_cpu=1
-            [ -z "$_gpu" ] && _local_cpu=1
-
-            if [ "$_local_cpu" = "1" ]; then
-                _warn "Starting gradient server on CPU. Monitor round completion in pm2 logs."
-                if [ "${GRAD_CORES_COUNT:-0}" = "0" ]; then
-                    read -r -p "    CPU cores to reserve for gradient server [8]: " _gc
-                    GRAD_CORES_COUNT="${_gc:-8}"
-                    _env_write "GRAD_CORES_COUNT" "$GRAD_CORES_COUNT"
-                    export GRAD_CORES_COUNT
-                    _ok "Gradient server will use the last $GRAD_CORES_COUNT CPU cores; validator + simulator use the rest"
-                else
-                    _info "GRAD_CORES_COUNT=$GRAD_CORES_COUNT [from .env — skipping]"
-                fi
-                _env_write "GENTRX_GRAD_CPU" "1"; export GENTRX_GRAD_CPU=1
-            else
-                _ok "Starting gradient server on GPU: $_gpu"
-                _env_write "GENTRX_GRAD_CPU" "0"; export GENTRX_GRAD_CPU=0
-            fi
-            _start_local_gradients
-        fi
-    fi
-
-    # ── Build GENTRX_VAL_ARGS ────────────────────────────────────────────────
-    GENTRX_VAL_ARGS="--gentrx.enabled --gentrx.gradient_server_url $GRAD_URL"
-    [ -n "${GENTRX_API_KEY:-}" ] && \
-        GENTRX_VAL_ARGS="$GENTRX_VAL_ARGS --gentrx.api_key $GENTRX_API_KEY"
-    _env_write "GENTRX_VAL_ARGS" "$GENTRX_VAL_ARGS"
-    export GENTRX_VAL_ARGS
-
-    _ok "GenTRX setup complete."
-    _info "Prometheus scrape targets:"
-    _info "  Validator:       http://localhost:$PROM_PORT/metrics/gentrx"
-    _info "  Gradient server: http://localhost:${GRAD_PORT}/gentrx/metrics"
-
-    _print_validator_cmd "$mode"
-}
-
-_print_validator_cmd() {
-    local _mode="$1"
-    _hr
-    printf ' \033[1mSave this command — run it for future updates and new deployments:\033[0m\n'
-    _hr
-    echo
-    printf '    \033[1m./run_validator.sh\033[0m \\\n'
-    printf '        -G %s \\\n'    "$_mode"
-    printf '        -e %s \\\n'    "$ENDPOINT"
-    printf '        -w %s \\\n'    "$WALLET_NAME"
-    printf '        -h %s \\\n'    "$HOTKEY_NAME"
-    printf '        -u %s \\\n'    "$NETUID"
-    printf '        -o %s \\\n'    "$PROM_PORT"
-    printf '        -t %s'         "$TIMEOUT"
-    [ "$SIMULATION_CONFIG" != "simulation_0" ] && \
-        printf ' \\\n        -g %s' "$SIMULATION_CONFIG"
-    [ -n "${GENTRX_GRAD_HOST:-}" ] && \
-        printf ' \\\n        -Q http://%s/gentrx' "$GENTRX_GRAD_HOST"
-    printf '\n'
-    echo
-    printf '  Note: bucket credentials and API key are in .env.\n'
-    printf '  Back up .env alongside this command for any new deployment.\n'
-    _hr
-    echo
-    printf ' \033[33m⚠\033[0m  Copy the command above, then press Enter to continue... '
-    read -r
-    echo
-}
-
-_print_remote_run_cmd() {
-    local _mode="$1"
-    local _s3_ep="${GENTRX_VALIDATOR_S3_ENDPOINT_URL:-https://${GENTRX_VALIDATOR_S3_ACCOUNT_ID:-<account_id>}.r2.cloudflarestorage.com}"
-    local _h="${GENTRX_GRAD_HOST%%:*}"
-    local _p="${GENTRX_GRAD_HOST##*:}"
-    [ "$_h" = "$_p" ] && _p="$GRAD_PORT"
-    printf '    \033[1m./run_gradients.sh\033[0m \\\n'
-    printf '        -m %s \\\n'   "$_mode"
-    printf '        -e %s \\\n'   "$ENDPOINT"
-    printf '        -u %s \\\n'   "$NETUID"
-    printf '        -V %s \\\n'   "${VALIDATOR_UID:-0}"
-    printf '        -p %s \\\n'   "$_p"
-    printf '        -b 0.0.0.0 \\\n'
-    printf '        -E %s \\\n'   "$_s3_ep"
-    printf '        -B %s \\\n'   "${GENTRX_VALIDATOR_S3_BUCKET:-<bucket>}"
-    printf '        -w %s \\\n'   "${GENTRX_VALIDATOR_S3_WRITE_ACCESS_KEY:-<write-key>}"
-    printf '        -W %s \\\n'   "${GENTRX_VALIDATOR_S3_WRITE_SECRET_KEY:-<write-secret>}"
-    printf '        -k %s\n'      "${GENTRX_API_KEY:-<api-key>}"
-}
-
-_gentrx_setup_remote_gradients() {
-    local mode="$1"
-
-    _step "Remote gradient server setup"
-    _info "You will run the gradient server on a GPU machine."
-    echo
-
-    # Generate / use API key (required for non-loopback)
-    if [ -z "${GENTRX_API_KEY:-}" ]; then
-        _info "Generating shared API key for validator ↔ gradient server auth..."
-        GENTRX_API_KEY=$(openssl rand -hex 32 2>/dev/null || \
-            python3 -c "import secrets; print(secrets.token_hex(32))")
-        _env_write "GENTRX_API_KEY" "$GENTRX_API_KEY"
-        export GENTRX_API_KEY
-        _ok "API key generated and saved to .env"
-    else
-        _ok "Using existing GENTRX_API_KEY from .env"
-    fi
-
-    # Get host:port — skip if already saved
-    local _host _port
-    if [ -n "${GENTRX_GRAD_HOST:-}" ]; then
-        _host="${GENTRX_GRAD_HOST%%:*}"
-        _port="${GENTRX_GRAD_HOST##*:}"
-        [ "$_host" = "$_port" ] && _port="$GRAD_PORT"
-        _ok "GPU host: $_host:$_port (from .env — skipping)"
-    else
-        read -r -p "    Gradient server address (host or IP, e.g. gpu.example.com): " _host
-        [ -z "$_host" ] && { echo "ERROR: host required."; exit 1; }
-        read -r -p "    Port [$GRAD_PORT]: " _port; _port="${_port:-$GRAD_PORT}"
-        GENTRX_GRAD_HOST="${_host}:${_port}"
-        _env_write "GENTRX_GRAD_HOST"  "$GENTRX_GRAD_HOST"
-        _env_write "GENTRX_GRAD_LOCAL" "0"
-        export GENTRX_GRAD_HOST
-    fi
-    GRAD_URL="http://${_host}:${_port}/gentrx"
-
-    _hr
-    printf '\033[1m  Copy run_gradients.sh to the GPU machine and run:\033[0m\n'
-    echo
-    printf '    scp %s/run_gradients.sh %s:/path/to/\n' "$REPO_ROOT" "$_host"
-    echo
-    _print_remote_run_cmd "$mode"
-    echo
-    printf '  No .env needed on the GPU machine — all credentials are in the command above.\n'
-    printf '  Open firewall: allow TCP port %s from this validator host only.\n' "$_port"
-    echo
-    printf '  Once the gradient server is running at %s, press Enter...\n' "$GRAD_URL"
-    read -r
-    _hr
-}
-
-# Run GenTRX setup if requested
+# ── GenTRX gradient server (optional sibling) ─────────────────────────────────
+GENTRX_VAL_ARGS=""
 if [ -n "$GENTRX_MODE" ]; then
-    _gentrx_validator_setup "$GENTRX_MODE"
+    _GRAD_URL="${GRAD_URL:-http://127.0.0.1:${GRAD_PORT}/gentrx}"
+    if [ "$_EXPLICIT_GRAD_URL" = "0" ]; then
+        _GRAD_SKIP_UPDATE=""
+        [ "$PRESERVE_SIMULATOR" = "1" ] && _GRAD_SKIP_UPDATE="-S 1"
+        "$REPO_ROOT/run_gradients.sh" -m "$GENTRX_MODE" -e "$ENDPOINT" -u "$NETUID" -V 1 -p "$GRAD_PORT" -x 0 $_GRAD_SKIP_UPDATE \
+            || { echo "ERROR: gradient server start failed" >&2; exit 1; }
+        echo " ✓  Gradient server started locally (mode=$GENTRX_MODE, port=$GRAD_PORT)"
+    fi
+    GENTRX_VAL_ARGS="--gentrx.enabled --gentrx.gradient_server_url $_GRAD_URL"
+    if grep -q '^GENTRX_SAVED_MODE=' "$REPO_ROOT/.env" 2>/dev/null; then
+        sed -i "s|^GENTRX_SAVED_MODE=.*|GENTRX_SAVED_MODE=$GENTRX_MODE|" "$REPO_ROOT/.env"
+    else
+        echo "GENTRX_SAVED_MODE=$GENTRX_MODE" >> "$REPO_ROOT/.env"
+    fi
 fi
 
-# Fall back to env value if no GenTRX mode (allows GENTRX_VAL_ARGS from .env)
-GENTRX_VAL_ARGS="${GENTRX_VAL_ARGS:-}"
+MECHID_ARG="--neuron.mechid $MECHID"
+ENGINE_ARGS="--engine simulation --simulation.xml_config ../../../simulate/trading/run/config/$SIMULATION_CONFIG.xml"
 
-# ── Benchmark agents ──────────────────────────────────────────────────────────
-# Defaults to the production config. Override in .env for local testing:
-#   BENCHMARK_AGENTS_CONFIG=$REPO_ROOT/taos/im/config/benchmark_agents_test.json
-BENCHMARK_AGENTS_CONFIG="${BENCHMARK_AGENTS_CONFIG:-$REPO_ROOT/taos/im/config/benchmark_agents.json}"
-BENCHMARK_ARGS="--benchmark.agents $BENCHMARK_AGENTS_CONFIG"
+VALIDATOR_CMD="python $(pwd)/validator.py \
+  --netuid $NETUID \
+  --subtensor.chain_endpoint $ENDPOINT \
+  --wallet.path $WALLET_PATH \
+  --wallet.name $WALLET_NAME \
+  --wallet.hotkey $HOTKEY_NAME \
+  --logging.$LOG_LEVEL \
+  --alerting.pagerduty.integration_key $PD_KEY \
+  --port $VALIDATOR_PORT \
+  --prometheus.port $PROM_PORT \
+  --neuron.timeout $TIMEOUT \
+  $MECHID_ARG \
+  $ENGINE_ARGS \
+  $GENTRX_VAL_ARGS"
+GENTRX_API_KEY="${GENTRX_API_KEY:-}" \
+GENTRX_VALIDATOR_S3_ENDPOINT_URL="${GENTRX_VALIDATOR_S3_ENDPOINT_URL:-}" \
+GENTRX_VALIDATOR_S3_BUCKET="${GENTRX_VALIDATOR_S3_BUCKET:-}" \
+GENTRX_VALIDATOR_S3_WRITE_ACCESS_KEY="${GENTRX_VALIDATOR_S3_WRITE_ACCESS_KEY:-}" \
+GENTRX_VALIDATOR_S3_WRITE_SECRET_KEY="${GENTRX_VALIDATOR_S3_WRITE_SECRET_KEY:-}" \
+GENTRX_VALIDATOR_S3_READ_ACCESS_KEY="${GENTRX_VALIDATOR_S3_READ_ACCESS_KEY:-${GENTRX_VALIDATOR_S3_WRITE_ACCESS_KEY:-}}" \
+GENTRX_VALIDATOR_S3_READ_SECRET_KEY="${GENTRX_VALIDATOR_S3_READ_SECRET_KEY:-${GENTRX_VALIDATOR_S3_WRITE_SECRET_KEY:-}}" \
+pm2 start --name=$VALIDATOR_NAME bash -- -c "$VALIDATOR_CMD"
 
-# ── Extra validator args ───────────────────────────────────────────────────────
-# Pass arbitrary additional flags not covered by run_validator.sh CLI options.
-# Set in .env or as an environment variable before running.  Example:
-#   VALIDATOR_EXTRA_ARGS="--neuron.axon_off --neuron.epoch_length 10 --repo.remote dev --simulation.data_service_url http://localhost:8084"
-VALIDATOR_EXTRA_ARGS="${VALIDATOR_EXTRA_ARGS:-}"
-
-# ── Launch validator ───────────────────────────────────────────────────────────
-# pm2 log rotation: cap each .log at 100 MB, keep 10 rotated copies, gzip
-# old ones. Idempotent — install is a no-op when already present, and `pm2
-# set` overwrites silently. Daemon-wide setting.
-if ! pm2 describe pm2-logrotate >/dev/null 2>&1; then
-    pm2 install pm2-logrotate >/dev/null 2>&1 || true
-fi
-pm2 set pm2-logrotate:max_size 100M >/dev/null 2>&1 || true
-pm2 set pm2-logrotate:retain 10 >/dev/null 2>&1 || true
-pm2 set pm2-logrotate:compress true >/dev/null 2>&1 || true
-
-echo "Starting Validator"
-pm2 start validator.py \
-    --name=validator \
-    --interpreter python \
-    --cwd "$REPO_ROOT/taos/im/neurons" \
-    -- \
-    --netuid "$NETUID" \
-    --subtensor.chain_endpoint "$ENDPOINT" \
-    $( case "$ENDPOINT" in
-        *entrypoint-finney.opentensor.ai*) echo "--subtensor.network finney" ;;
-        *test.finney.opentensor.ai*)       echo "--subtensor.network test"   ;;
-        *) ;;  # custom endpoint → don't set network at all; chain_endpoint drives connection
-    esac ) \
-    --wallet.path "$WALLET_PATH" \
-    --wallet.name "$WALLET_NAME" \
-    --wallet.hotkey "$HOTKEY_NAME" \
-    --logging."$LOG_LEVEL" \
-    --alerting.pagerduty.integration_key "$PD_KEY" \
-    --prometheus.port "$PROM_PORT" \
-    --neuron.timeout "$TIMEOUT" \
-    --simulation.xml_config "$REPO_ROOT/simulate/trading/run/config/$SIMULATION_CONFIG.xml" \
-    ${BENCHMARK_ARGS:+$BENCHMARK_ARGS} \
-    ${GENTRX_VAL_ARGS:+$GENTRX_VAL_ARGS} \
-    ${VALIDATOR_EXTRA_ARGS:+$VALIDATOR_EXTRA_ARGS}
-
-# ── Launch simulator ───────────────────────────────────────────────────────────
+# ── C++ Simulator ─────────────────────────────────────────────────────────────
 if [ "$PRESERVE_SIMULATOR" = "0" ]; then
+    cd ../../../simulate/trading/run
     echo "Starting Simulator"
     if [ "$CHECKPOINT" = "0" ]; then
-        pm2 start --no-autorestart --name=simulator \
-            --cwd "$REPO_ROOT/simulate/trading/run" \
-            "../build/src/cpp/taosim" \
-            -- -f "config/$SIMULATION_CONFIG.xml"
+        pm2 start --no-autorestart --name=simulator "../build/src/cpp/taosim -f config/$SIMULATION_CONFIG.xml"
     else
-        pm2 start --no-autorestart --name=simulator \
-            --cwd "$REPO_ROOT/simulate/trading/run" \
-            "../build/src/cpp/taosim" \
-            -- -c "$CHECKPOINT"
-    fi
-    pm2 save
-    pm2 startup
-
-    if [ "$USE_TMUX" = "1" ]; then
-        echo "Setting Up Tmux Session"
-        tmux new-session -d -s taos -n 'validator' 'htop -F validator.py'
-        # Enable mouse: click window tabs in the status bar to switch windows
-        tmux set-option -t taos mouse on
-        tmux split-window -h -t taos:validator 'htop -F taosim'
-        tmux select-pane -t 0
-        tmux split-window -v -t taos:validator 'pm2 logs validator'
-        tmux select-pane -t 2
-        tmux split-window -v -t taos:validator 'pm2 logs simulator'
-
-        if [ -n "$GENTRX_MODE" ] && [ "${GENTRX_GRAD_LOCAL:-0}" = "1" ]; then
-            # GenTRX window: resource monitor (top row) + gradient-server logs (bottom).
-            # Only created when validator manages the gradient server locally.
-            # External servers (run_gradients.sh) have their own gentrx tmux session.
-            tmux new-window -t taos -n 'gentrx'
-            if [ "${GENTRX_GRAD_CPU:-0}" = "1" ]; then
-                # CPU mode: htop (left) | logs (right)
-                tmux send-keys -t taos:gentrx 'htop' Enter
-                tmux split-window -h -t taos:gentrx
-                tmux send-keys -t taos:gentrx 'pm2 logs gradient-server' Enter
-            else
-                # GPU mode: htop | nvitop (top row) + logs (bottom)
-                command -v nvitop > /dev/null 2>&1 || pip install nvitop -q || true
-                tmux send-keys -t taos:gentrx 'htop' Enter
-                tmux split-window -h -t taos:gentrx
-                tmux send-keys -t taos:gentrx 'nvitop 2>/dev/null || watch -n2 nvidia-smi' Enter
-                tmux select-pane -t taos:gentrx.0
-                tmux split-window -v -t taos:gentrx
-                tmux send-keys -t taos:gentrx 'pm2 logs gradient-server' Enter
-            fi
-            # Return to validator window; click tabs or use Ctrl+b l to toggle
-            tmux select-window -t taos:validator
-        fi
+        pm2 start --no-autorestart --name=simulator "../build/src/cpp/taosim -c $CHECKPOINT"
     fi
 fi
+pm2 save
+pm2 startup
 
-# ── sysctl tuning ──────────────────────────────────────────────────────────────
-setting_exists() {
-    grep -q "^${1}=" /etc/sysctl.conf
-}
+if [ "$USE_TMUX" = "1" ]; then
+    echo "Setting Up Tmux Session"
+    tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+    _HTOP='P=$(pgrep -d, -f "validator.py|taosim" 2>/dev/null); [ -n "$P" ] && exec htop -p "$P" || exec htop'
+    P0=$(tmux new-session -d -s "$TMUX_SESSION" -n 'monitor' -P -F '#{pane_id}' "$_HTOP")
+    tmux set-option -t "$TMUX_SESSION" mouse on
+    P1=$(tmux split-window -v -p 75 -t "$P0" -P -F '#{pane_id}' "pm2 logs $VALIDATOR_NAME")
+    tmux split-window -h -p 50 -t "$P1" 'pm2 logs simulator'
+    if [ -n "$GENTRX_MODE" ]; then
+        tmux new-window -t "$TMUX_SESSION:" -n 'gentrx'
+        _GTX_HTOP='P=$(pgrep -d, -f "gradient_server" 2>/dev/null); [ -n "$P" ] && exec htop -p "$P" || exec htop'
+        tmux send-keys -t "$TMUX_SESSION:gentrx" "$_GTX_HTOP" Enter
+        PG=$(tmux split-window -v -p 67 -t "$TMUX_SESSION:gentrx" -P -F '#{pane_id}')
+        tmux send-keys -t "$PG" 'pm2 logs gradient-server' Enter
+    fi
+    tmux select-window -t "$TMUX_SESSION:monitor"
+    tmux select-pane -t "$P0"
+fi
+
+# Network sysctl tuning (idempotent).
+setting_exists() { grep -q "^${1}=" /etc/sysctl.conf; }
 SETTINGS="net.core.rmem_max=134217728
 net.core.wmem_max=134217728
 net.core.rmem_default=8388608
@@ -763,38 +297,19 @@ net.ipv4.tcp_rmem=4096 87380 67108864
 net.ipv4.tcp_wmem=4096 87380 67108864
 net.ipv4.tcp_tw_reuse=1
 net.ipv4.tcp_fin_timeout=30"
-echo "Checking and applying sysctl settings..."
 echo "$SETTINGS" | while IFS= read -r line; do
-    setting="${line%%=*}"
-    value="${line#*=}"
-    echo "Applying: ${setting}=${value}"
-    sudo sysctl -w "${setting}=${value}"
+    sudo sysctl -w "${line}" >/dev/null 2>&1 || true
 done
 needs_update=false
 echo "$SETTINGS" | while IFS= read -r line; do
     setting="${line%%=*}"
-    if ! setting_exists "$setting"; then
-        echo "needs_update"
-        break
-    fi
-done | grep -q "needs_update" && needs_update=true || true
+    setting_exists "$setting" || { echo "needs_update"; break; }
+done | grep -q "needs_update" && needs_update=true
 if [ "$needs_update" = true ]; then
     echo "$SETTINGS" | while IFS= read -r line; do
         setting="${line%%=*}"
-        value="${line#*=}"
         if ! setting_exists "$setting"; then
-            echo "Adding: ${setting}=${value}"
-            echo "${setting}=${value}" | sudo tee -a /etc/sysctl.conf > /dev/null
-        else
-            echo "Already present: ${setting}"
+            echo "$line" | sudo tee -a /etc/sysctl.conf >/dev/null
         fi
     done
-    echo "Settings added to /etc/sysctl.conf."
-fi
-echo "Current settings:"
-sysctl net.core.rmem_max net.core.wmem_max net.core.rmem_default net.core.wmem_default \
-    net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_tw_reuse net.ipv4.tcp_fin_timeout
-
-if [ "$USE_TMUX" = "1" ]; then
-    tmux attach-session -t taos
 fi

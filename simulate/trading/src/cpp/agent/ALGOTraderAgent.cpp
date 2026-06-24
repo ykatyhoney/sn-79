@@ -597,7 +597,7 @@ void ALGOTraderAgent::handleWakeup(Message::Ptr msg)
             if (fundamental >= lastPrice) {
                 state.direction = OrderDirection::BUY;
                 state.volumeToBeExecuted = std::min(volumeToBeExecuted,
-                    balances.quote.getFree()*decimal_t{0.99}/m_lastPrice.at(bookId));
+                    balances.quote->getFree()*decimal_t{0.99}/m_lastPrice.at(bookId));
             } else if (fundamental <= lastPrice) {
                 state.direction = OrderDirection::SELL;
                 state.volumeToBeExecuted = std::min(volumeToBeExecuted,
@@ -683,7 +683,7 @@ void ALGOTraderAgent::execute(BookId bookId, ALGOTraderState& state)
     const decimal_t volume = std::min(drawnQty,
                                          state.volumeToBeExecuted);
     const decimal_t volumeToExecute = state.direction == OrderDirection::BUY ? 
-    std::min(volume, (balances.quote.getFree()* decimal_t{0.99}) /m_lastPrice.at(bookId))
+    std::min(volume, (balances.quote->getFree()* decimal_t{0.99}) /m_lastPrice.at(bookId))
         : std::min(volume, (baseBalance.getFree() * (decimal_t{0.99}) ));
 
     simulation()->logDebug(

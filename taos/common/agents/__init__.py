@@ -26,7 +26,12 @@ class SimulationAgent(ABC):
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
         self.state_file = os.path.join(log_dir, 'state.mp')
         self.router = APIRouter()
-        self.router.add_api_route("/handle", self.handle, methods=["POST"])
+        # response_model=None: handle() returns a Pydantic union FinanceAgentResponse | ExchangeAgentResponse,
+        # but ExchangeAgentResponse is a sentinel-stub class on the public sim-only surface (the real
+        # Pydantic class lives in the excluded taos.im.protocol.exchange). FastAPI rejects sentinel classes
+        # as response_models. Disable response-model generation; serialization still happens via Pydantic
+        # on the returned object itself.
+        self.router.add_api_route("/handle", self.handle, methods=["POST"], response_model=None)
         self.initialize()  # Calling the abstract method to perform any agent-specific setup
 
     def handle(self, state: SimulationStateUpdate) -> AgentResponse:

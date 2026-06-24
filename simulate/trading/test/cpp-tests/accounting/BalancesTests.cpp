@@ -33,7 +33,7 @@ struct BalancesCreationDesc
 {
     return Balances({
         .base = Balance(desc.base, "", s_roundParams.baseDecimals),
-        .quote = Balance(desc.quote, "", s_roundParams.quoteDecimals),
+        .quote = std::make_shared<Balance>(desc.quote, "", s_roundParams.quoteDecimals),
         .roundParams = s_roundParams
     });
 }
@@ -189,7 +189,7 @@ TEST_P(FreeReservationTest, WorksCorrectly)
         balances.getReservationInBase(params.orderId, params.reservationPrice),
         balances.getReservationInQuote(params.orderId, params.reservationPrice),
         balances.base.getReservation(params.orderId).value_or(0_dec),
-        balances.quote.getReservation(params.orderId).value_or(0_dec),
+        balances.quote->getReservation(params.orderId).value_or(0_dec),
         params.reservationPrice,
         params.freePrice,
         params.freeAmount.value_or(0_dec)
@@ -207,7 +207,7 @@ TEST_P(FreeReservationTest, WorksCorrectly)
         balances.getReservationInBase(params.orderId, params.reservationPrice),
         balances.getReservationInQuote(params.orderId, params.reservationPrice),
         balances.base.getReservation(params.orderId).value_or(0_dec),
-        balances.quote.getReservation(params.orderId).value_or(0_dec),
+        balances.quote->getReservation(params.orderId).value_or(0_dec),
         params.reservationPrice,
         params.freePrice,
         params.freeAmount.value_or(0_dec)
@@ -216,7 +216,7 @@ TEST_P(FreeReservationTest, WorksCorrectly)
     EXPECT_EQ(freedAmount.base, params.refFreedAmountBase);
     EXPECT_EQ(freedAmount.quote, params.refFreedAmountQuote);
     EXPECT_EQ(balances.base.getReserved(), params.refBaseReservedAfterFree);
-    EXPECT_EQ(balances.quote.getReserved(), params.refQuoteReservedAfterFree);
+    EXPECT_EQ(balances.quote->getReserved(), params.refQuoteReservedAfterFree);
 }
 
 INSTANTIATE_TEST_SUITE_P(
@@ -353,7 +353,7 @@ TEST_P(MakeReservationTest, WorksCorrectly)
         params.amount, params.leverage, params.direction, 0
     );
     EXPECT_EQ(balances.base.getReservation(params.orderId), params.refBaseReservation);
-    EXPECT_EQ(balances.quote.getReservation(params.orderId), params.refQuoteReservation);
+    EXPECT_EQ(balances.quote->getReservation(params.orderId), params.refQuoteReservation);
     if (params.amount > 0_dec){
         EXPECT_EQ(balances.getLeverage(params.orderId, params.direction), params.leverage);
     } else {
@@ -508,7 +508,7 @@ INSTANTIATE_TEST_SUITE_P(
     
 //     const decimal_t leverage = balances.getLeverage(params.orderId, params.direction);
 //     const decimal_t baseTotal = balances.base.getTotal();
-//     const decimal_t quoteTotal = balances.quote.getTotal();
+//     const decimal_t quoteTotal = balances.quote->getTotal();
     
 //     if (leverage == 0_dec) {
 //         if (params.direction == OrderDirection::BUY) {

@@ -109,7 +109,7 @@ public:
     [[nodiscard]] Timestamp currentTimestamp() const noexcept;
     [[nodiscard]] Timestamp duration() const noexcept;
     [[nodiscard]] MultiBookExchangeAgent* exchange() const noexcept { return m_exchange; }
-    [[nodiscard]] DistributedProxyAgent* proxy() const noexcept { return m_proxy; }
+    [[nodiscard]] taosim::agent::DistributedProxyAgent* proxy() const noexcept { return m_proxy; }
     [[nodiscard]] taosim::simulation::SimulationSignals& signals() const noexcept;
     [[nodiscard]] std::mt19937& rng() const noexcept;
     [[nodiscard]] const taosim::simulation::SimulationConfig& config() const noexcept { return m_config2; }
@@ -154,6 +154,13 @@ public:
         }
     }
     
+    void logDebug(std::string_view sv) const noexcept
+    {
+        if (m_debug) {
+            fmt::println("[DEBUG] {}", sv);
+        }
+    }
+
     void setDebug(bool flag) noexcept { m_debug = flag; }
     [[nodiscard]] bool debug() const noexcept { return m_debug; }
 
@@ -176,13 +183,14 @@ public:
         uint64_t seed, double S0, double mu, double sigma, uint32_t N);
 
     void step();
+    void clearFilledOrders() noexcept;
+    void deliverMessage(Message::Ptr msg);
 
     [[nodiscard]] static std::unique_ptr<Simulation> fromXML(pugi::xml_node node);
 
 private:
     void configureAgents(pugi::xml_node node);
     void configureLogging(pugi::xml_node node);
-    void deliverMessage(Message::Ptr msg);
     void start();
     void stop();
 
@@ -199,7 +207,7 @@ private:
     mutable taosim::simulation::SimulationSignals m_signals;
     std::unique_ptr<LocalAgentManager> m_localAgentManager;
     MultiBookExchangeAgent* m_exchange{};
-    DistributedProxyAgent* m_proxy;
+    taosim::agent::DistributedProxyAgent* m_proxy;
     mutable std::mt19937 m_rng;
     std::string m_id;
     std::string m_config;

@@ -14,9 +14,12 @@
 #include <taosim/serialization/msgpack/utils.hpp>
 #include <taosim/simulation/SimulationError.hpp>
 #include <taosim/simulation/SimulationManager.hpp>
+#include <taosim/simulation/helpers.hpp>
 #include <taosim/simulation/serialization/ValidatorRequest.hpp>
 #include <taosim/simulation/util.hpp>
+#include <taosim/util/SLTPDebug.hpp>
 #include <taosim/xml/helpers.hpp>
+
 
 #include <boost/algorithm/string.hpp>
 #include <boost/uuid/random_generator.hpp>
@@ -36,30 +39,11 @@
 
 //-------------------------------------------------------------------------
 
-namespace
+namespace taosim::simulation
 {
-
-void printProgress(size_t cur, size_t tot, std::string_view label)
-{
-    constexpr int W = 30;
-    const int filled = tot > 0 ? static_cast<int>(W * cur / tot) : 0;
-    const std::string bar =
-        std::string(filled > 0 ? filled - 1 : 0, '=')
-        + (filled > 0 ? ">" : "")
-        + std::string(W - filled, ' ');
-    fmt::print(
-        "\r  {:<20} [{}] {:>3}%  {}/{}",
-        label, bar, tot > 0 ? 100 * cur / tot : 0, cur, tot);
-    std::fflush(stdout);
-    if (cur == tot) fmt::println("");
-}
-
-}  // namespace
 
 //-------------------------------------------------------------------------
 
-namespace taosim::simulation
-{
 
 //-------------------------------------------------------------------------
 
@@ -68,6 +52,9 @@ void SimulationManager::runSimulations()
     std::barrier barrier{
         m_blockInfo.count,
         [&] {
+            for (auto& simulation : m_simulations) {
+                simulation->clearFilledOrders();
+            }
             publishState();
             m_stepSignal();
         }};
@@ -108,7 +95,7 @@ void SimulationManager::runReplay()
                     taosim::json::getDecimal(balsJson["base"]),
                     "",
                     bals.m_roundParams.baseDecimals);
-                bals.quote = taosim::accounting::Balance(
+                bals.quote = std::make_shared<taosim::accounting::Balance>(
                     taosim::json::getDecimal(balsJson["quote"]),
                     "",
                     bals.m_roundParams.quoteDecimals);
@@ -161,7 +148,7 @@ void SimulationManager::runReplayAdvanced()
                     taosim::json::getDecimal(balsJson["base"]),
                     "",
                     bals.m_roundParams.baseDecimals);
-                bals.quote = taosim::accounting::Balance(
+                bals.quote = std::make_shared<taosim::accounting::Balance>(
                     taosim::json::getDecimal(balsJson["quote"]),
                     "",
                     bals.m_roundParams.quoteDecimals);
@@ -272,9 +259,17 @@ void SimulationManager::publishStartInfo()
     }();
     rapidjson::Document res;
 
-    net::io_context ctx;
-    net::co_spawn(
-        ctx, asyncSendOverNetwork(json, m_netInfo.generalMsgEndpoint, res), net::detached);
+    net::asio::io_context ctx;
+    net::asio::co_spawn(
+        ctx,
+        net::asyncSendOverNetwork(net::AsyncSendContext{
+            .logger = *m_simulations.front(),
+            .netInfo = m_netInfo,
+            .reqBody = json,
+            .endpoint = m_generalMsgEndpoint,
+            .resJson = res
+        }),
+        net::asio::detached);
     ctx.run();
 }
 
@@ -309,9 +304,17 @@ void SimulationManager::publishEndInfo()
     }();
     rapidjson::Document res;
 
-    net::io_context ctx;
-    net::co_spawn(
-        ctx, asyncSendOverNetwork(json, m_netInfo.generalMsgEndpoint, res), net::detached);
+    net::asio::io_context ctx;
+    net::asio::co_spawn(
+        ctx,
+        net::asyncSendOverNetwork(net::AsyncSendContext{
+            .logger = *m_simulations.front(),
+            .netInfo = m_netInfo,
+            .reqBody = json,
+            .endpoint = m_generalMsgEndpoint,
+            .resJson = res
+        }),
+        net::asio::detached);
     ctx.run();
 }
 
@@ -335,9 +338,17 @@ void SimulationManager::publishStateJson()
     rapidjson::Document stateJson = makeStateJson();
     rapidjson::Document resJson;
 
-    net::io_context ctx;
-    net::co_spawn(
-        ctx, asyncSendOverNetwork(stateJson, m_netInfo.bookStateEndpoint, resJson), net::detached);
+    net::asio::io_context ctx;
+    net::asio::co_spawn(
+        ctx,
+        net::asyncSendOverNetwork(net::AsyncSendContext{
+            .logger = *m_simulations.front(),
+            .netInfo = m_netInfo,
+            .reqBody = stateJson,
+            .endpoint = m_bookStateEndpoint,
+            .resJson = resJson
+        }),
+        net::asio::detached);
     ctx.run();
 
     const auto& reprSimu = m_simulations.front();
@@ -570,9 +581,17 @@ void SimulationManager::publishStateMessagePack()
             }().Move(),
             allocator);
         rapidjson::Document res;
-        net::io_context io;
-        net::co_spawn(
-            io, asyncSendOverNetwork(json, m_netInfo.generalMsgEndpoint, res), net::detached);
+        net::asio::io_context io;
+        net::asio::co_spawn(
+            io,
+            net::asyncSendOverNetwork(net::AsyncSendContext{
+                .logger = *m_simulations.front(),
+                .netInfo = m_netInfo,
+                .reqBody = json,
+                .endpoint = m_generalMsgEndpoint,
+                .resJson = res
+            }),
+            net::asio::detached);
         io.run();
         if (res.HasMember("continue") && res["continue"].GetBool() == false) {
             throw std::runtime_error{fmt::format(
@@ -704,13 +723,16 @@ std::unique_ptr<SimulationManager> SimulationManager::fromConfig(
     mngr->m_netInfo = {
         .host = node.attribute("host").as_string(),
         .port = node.attribute("port").as_string(),
-        .bookStateEndpoint = node.attribute("bookStateEndpoint").as_string("/"),
-        .generalMsgEndpoint = node.attribute("generalMsgEndpoint").as_string("/"),
         .resolveTimeout = node.attribute("resolveTimeout").as_llong(1),
         .connectTimeout = node.attribute("connectTimeout").as_llong(3),
         .writeTimeout = node.attribute("writeTimeout").as_llong(15),
         .readTimeout = node.attribute("readTimeout").as_llong(60)
     };
+    mngr->m_bookStateEndpoint = node.attribute("bookStateEndpoint").as_string("/");
+    mngr->m_generalMsgEndpoint = node.attribute("generalMsgEndpoint").as_string("/");
+
+    taosim::util::SLTPDebugger::enabled = node.attribute("sltpDebug").as_bool();
+
 
     mngr->m_stepSignal.connect([&] {
         for (auto& simulation : mngr->m_simulations) {
@@ -1135,14 +1157,13 @@ rapidjson::Document SimulationManager::makeCollectiveBookStateJson() const
                             side == OrderDirection::BUY ? book->buyQueue() : book->sellQueue();
                         for (const auto& level : levels) {
                             for (const auto& tick : level) {
-                                const auto [agentId, clientOrderId] =
-                                    books[book->id()]->orderToClientInfo().at(tick->id());
-                                if (agentId < 0) continue;
-                                const auto agentIdStr = std::to_string(agentId);
+                                const auto ctx = books[book->id()]->orderToClientInfo().at(tick->id());
+                                if (ctx.agentId < 0) { continue; }
+                                const auto agentIdStr = std::to_string(ctx.agentId);
                                 const char* agentIdCStr = agentIdStr.c_str();
                                 rapidjson::Document orderJson{&allocator};
                                 tick->jsonSerialize(orderJson);
-                                json::setOptionalMember(orderJson, "clientOrderId", clientOrderId);
+                                json::setOptionalMember(orderJson, "clientOrderId", ctx.clientOrderId);
                                 json[agentIdCStr]["orders"][bookIdCanon].PushBack(orderJson, allocator);
                             }
                         }
@@ -1158,124 +1179,6 @@ rapidjson::Document SimulationManager::makeCollectiveBookStateJson() const
     rapidjson::Document json{rapidjson::kObjectType};
     serialize(json);
     return json;
-}
-
-//-------------------------------------------------------------------------
-
-net::awaitable<void> SimulationManager::asyncSendOverNetwork(
-    const rapidjson::Value& reqBody, const std::string& endpoint, rapidjson::Document& resJson)
-{
-    const auto& reprSimu = m_simulations.front();
-
-retry:
-    auto resolver =
-        use_nothrow_awaitable.as_default_on(tcp::resolver{co_await this_coro::executor});
-    auto tcp_stream =
-        use_nothrow_awaitable.as_default_on(beast::tcp_stream{co_await this_coro::executor});
-
-    int attempts = 0;
-    // Resolve.
-    auto endpointsVariant = co_await (
-        resolver.async_resolve(m_netInfo.host, m_netInfo.port) || timeout(m_netInfo.resolveTimeout));
-    while (endpointsVariant.index() == 1) {
-        fmt::println("tcp::resolver timed out on {}:{}", m_netInfo.host, m_netInfo.port);
-        std::this_thread::sleep_for(10s);
-        endpointsVariant = co_await (
-            resolver.async_resolve(m_netInfo.host, m_netInfo.port) || timeout(m_netInfo.resolveTimeout));
-    }
-    auto [e1, endpoints] = std::get<0>(endpointsVariant);
-    while (e1) {
-        const auto loc = std::source_location::current();
-        reprSimu->logDebug("{}#L{}: {}:{}: {}", loc.file_name(), loc.line(), m_netInfo.host, m_netInfo.port, e1.what());
-        attempts++;
-        fmt::println("Unable to resolve connection to validator at {}:{}{} - Retrying (Attempt {})", m_netInfo.host, m_netInfo.port, endpoint, attempts);
-        std::this_thread::sleep_for(10s);
-        endpointsVariant = co_await (resolver.async_resolve(m_netInfo.host, m_netInfo.port) || timeout(m_netInfo.resolveTimeout));
-        auto [e11, endpoints1] = std::get<0>(endpointsVariant);
-        e1 = e11;
-        endpoints = endpoints1;
-    }
-
-    // Connect.
-    attempts = 0;
-    auto connectVariant = co_await (tcp_stream.async_connect(endpoints) || timeout(m_netInfo.connectTimeout));
-    while (connectVariant.index() == 1) {
-        fmt::println("tcp_stream::async_connect timed out on {}:{}", m_netInfo.host, m_netInfo.port);
-        std::this_thread::sleep_for(10s);
-        connectVariant = co_await (tcp_stream.async_connect(endpoints) || timeout(m_netInfo.connectTimeout));
-    }
-    auto [e2, _2] = std::get<0>(connectVariant);
-    while (e2) {
-        const auto loc = std::source_location::current();
-        reprSimu->logDebug("{}#L{}: {}:{}: {}", loc.file_name(), loc.line(), m_netInfo.host, m_netInfo.port, e2.what());
-        attempts++;
-        fmt::println("Unable to connect to validator at {}:{}{} - Retrying (Attempt {})", m_netInfo.host, m_netInfo.port, endpoint, attempts);
-        std::this_thread::sleep_for(10s);
-        connectVariant = co_await (tcp_stream.async_connect(endpoints) || timeout(m_netInfo.connectTimeout));
-        auto [e21, _21] = std::get<0>(connectVariant);
-        e2 = e21;
-        _2 = _21;
-    }
-
-    // Create the request.
-    const auto req = makeHttpRequest(endpoint, taosim::json::json2str(reqBody));
-
-    // Send the request.
-    attempts = 0;
-    auto writeVariant = co_await (http::async_write(tcp_stream, req) || timeout(m_netInfo.writeTimeout));
-    while (writeVariant.index() == 1) {
-        fmt::println("http::async_write timed out on {}:{}", m_netInfo.host, m_netInfo.port);
-        std::this_thread::sleep_for(5s);
-        writeVariant = co_await (http::async_write(tcp_stream, req) || timeout(m_netInfo.writeTimeout));
-    }
-    auto [e3, _3] = std::get<0>(writeVariant);
-    while (e3) {
-        const auto loc = std::source_location::current();
-        reprSimu->logDebug("{}#L{}: {}:{}: {}", loc.file_name(), loc.line(), m_netInfo.host, m_netInfo.port, e3.what());
-        attempts++;
-        fmt::println("Unable to send request to validator at {}:{}{} - Retrying (Attempt {})", m_netInfo.host, m_netInfo.port, endpoint, attempts);
-        goto retry;
-    }
-
-    // Receive the response.
-    attempts = 0;
-    beast::flat_buffer buf;
-    http::response_parser<http::string_body> parser{http::response<http::string_body>{}};
-    parser.eager(true);
-    parser.body_limit(std::numeric_limits<size_t>::max());
-    auto readVariant = co_await (http::async_read(tcp_stream, buf, parser) || timeout(m_netInfo.readTimeout));
-    if (readVariant.index() == 1) {
-        fmt::println("http::async_read timed out on {}:{}", m_netInfo.host, m_netInfo.port);
-        goto retry;
-    }
-    auto [e4, _4] = std::get<0>(readVariant);
-    while (e4) {
-        const auto loc = std::source_location::current();
-        reprSimu->logDebug("{}#L{}: {}:{}: {}", loc.file_name(), loc.line(), m_netInfo.host, m_netInfo.port, e4.what());
-        attempts++;          
-        fmt::println("Unable to read response from validator at {}:{}{} : {} - re-sending request.", m_netInfo.host, m_netInfo.port, endpoint, e4.what(), attempts);
-        goto retry;
-    }
-
-    http::response<http::string_body> res = parser.release();
-    resJson.Parse(res.body().c_str());
-    fmt::println("SIMULATOR RECEIVED RESPONSE: {}", res.body().c_str());
-}
-
-//-------------------------------------------------------------------------
-
-http::request<http::string_body> SimulationManager::makeHttpRequest(
-    const std::string& target, const std::string& body)
-{
-    http::request<http::string_body> req;
-    req.method(http::verb::get);
-    req.target(target);
-    req.version(11);
-    req.set(http::field::host, m_netInfo.host);
-    req.set(http::field::content_type, "application/json");
-    req.body() = body;
-    req.prepare_payload();
-    return req;
 }
 
 //-------------------------------------------------------------------------

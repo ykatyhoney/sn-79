@@ -22,7 +22,6 @@ Weight conversion utilities: normalise and clamp reward weight tensors, convert
 between float representations and the u16 on-chain encoding.
 """
 
-import logging
 import typing
 from typing import Union, Optional
 
@@ -126,7 +125,7 @@ def convert_weights_and_uids_for_emit(
 
     weight_vals = []
     weight_uids = []
-    for i, (weight_i, uid_i) in enumerate(list(zip(weights, uids))):
+    for _i, (weight_i, uid_i) in enumerate(list(zip(weights, uids))):
         uint16_val = round(
             float(weight_i) * int(U16_MAX)
         )  # convert to int representation.

@@ -6,7 +6,7 @@ cancellations) into the AgentResponse synapse format consumed by the validator.
 """
 import bittensor as bt
 from pydantic import Field
-from typing import Annotated, Union, List
+from typing import Annotated, Union
 from annotated_types import Len
 from taos.im.protocol.instructions import UInt32
 from taos.im.protocol.simulator import *
@@ -39,16 +39,19 @@ class FinanceAgentResponse(AgentResponse):
     ] = []
 
     def market_order(
-        self, 
-        book_id: UInt32, 
-        direction: OrderDirection, 
-        quantity: float, 
-        delay: int = 0, 
-        clientOrderId: UInt32 | None = None, 
-        stp: STP = STP.CANCEL_OLDEST, 
+        self,
+        book_id: UInt32,
+        direction: OrderDirection,
+        quantity: float,
+        delay: int = 0,
+        clientOrderId: UInt32 | None = None,
+        stp: STP = STP.CANCEL_OLDEST,
         currency: OrderCurrency = OrderCurrency.BASE,
         leverage: float = 0.0,
-        settlement_option: LoanSettlementOption | int = LoanSettlementOption.NONE
+        settlement_option: LoanSettlementOption | int = LoanSettlementOption.NONE,
+        max_slippage: float | None = None,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
     ) -> None:
         """
         Add a market order instruction to the agent response.
@@ -83,33 +86,38 @@ class FinanceAgentResponse(AgentResponse):
         """
         self.add_instruction(
             PlaceMarketOrderInstruction(
-                agentId=self.agent_id, 
-                delay=delay, 
-                bookId=book_id, 
-                direction=direction, 
-                quantity=quantity, 
-                clientOrderId=clientOrderId, 
-                stp=stp, 
+                agentId=self.agent_id,
+                delay=delay,
+                bookId=book_id,
+                direction=direction,
+                quantity=quantity,
+                clientOrderId=clientOrderId,
+                stp=stp,
                 currency=currency,
                 leverage=leverage,
-                settleFlag=settlement_option
+                settleFlag=settlement_option,
+                max_slippage=max_slippage,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
             )
         )
 
     def limit_order(
-        self, 
-        book_id: UInt32, 
-        direction: OrderDirection, 
-        quantity: float, 
-        price: float, 
-        delay: int = 0, 
-        clientOrderId: UInt32 | None = None, 
-        stp: STP = STP.CANCEL_OLDEST, 
-        postOnly: bool = False, 
-        timeInForce: TimeInForce = TimeInForce.GTC, 
+        self,
+        book_id: UInt32,
+        direction: OrderDirection,
+        quantity: float,
+        price: float,
+        delay: int = 0,
+        clientOrderId: UInt32 | None = None,
+        stp: STP = STP.CANCEL_OLDEST,
+        postOnly: bool = False,
+        timeInForce: TimeInForce = TimeInForce.GTC,
         expiryPeriod: int | None = None,
         leverage: float = 0.0,
-        settlement_option: LoanSettlementOption | int = LoanSettlementOption.NONE
+        settlement_option: LoanSettlementOption | int = LoanSettlementOption.NONE,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
     ) -> None:
         """
         Add a limit order instruction to the agent response.
@@ -172,19 +180,21 @@ class FinanceAgentResponse(AgentResponse):
 
         self.add_instruction(
             PlaceLimitOrderInstruction(
-                agentId=self.agent_id, 
-                delay=delay, 
-                bookId=book_id, 
-                direction=direction, 
-                quantity=quantity, 
-                price=price, 
-                clientOrderId=clientOrderId, 
-                stp=stp, 
-                postOnly=postOnly, 
-                timeInForce=timeInForce, 
+                agentId=self.agent_id,
+                delay=delay,
+                bookId=book_id,
+                direction=direction,
+                quantity=quantity,
+                price=price,
+                clientOrderId=clientOrderId,
+                stp=stp,
+                postOnly=postOnly,
+                timeInForce=timeInForce,
                 expiryPeriod=expiryPeriod,
                 leverage=leverage,
-                settleFlag=settlement_option
+                settleFlag=settlement_option,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
             )
         )
 

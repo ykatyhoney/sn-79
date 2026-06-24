@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import Iterator
 
 import numpy as np
-import polars as pl
 import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset, DataLoader, Sampler

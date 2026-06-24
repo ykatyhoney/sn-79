@@ -75,7 +75,7 @@ class ImbalanceAgent(GenTRXAgent):
             # If hitting this, it is likely that the response will time out. 
             # In that case, you would need to upgrade hardware, increase parallel_history_workers,
             # or find other ways to optimize the process.
-            bt.logging.info(f"Waiting for history update to complete...")
+            bt.logging.info("Waiting for history update to complete...")
             time.sleep(0.5)
         # Process each order book in the current market state
         for book_id, book in state.books.items():

@@ -935,10 +935,6 @@ class GenTRXAgent(FinanceSimulationAgent):
         tag_end = _ts_to_tag(interval_end)
         # Row-cap early flushes write multiple partials per interval; the seq
         # suffix keeps each unique. First flush of an interval has no suffix.
-        # Mirrors gradient-server's 0b474676 disambiguation — the validator's
-        # _tag_to_ns strips `_NNNN` when parsing timestamps, and dataset
-        # readers glob *.parquet without parsing filenames, so downstream
-        # paths are unaffected.
         suffix = f"_{buf.flush_seq:04d}" if buf.flush_seq else ""
         out_path = out_dir / f"{tag_start}-{tag_end}{suffix}.parquet"
 

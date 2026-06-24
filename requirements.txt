@@ -1,5 +1,5 @@
 bittensor==10.4.0
-torch>=2.7.0
+torch>=2.7.1  # 2.7.1 clears PYSEC-2025-207/208/209 (the 2.7.0 floor advisories)
 loguru
 prometheus_client
 binance-connector
@@ -26,7 +26,7 @@ uvicorn>=0.29
 httpx>=0.27
 boto3>=1.34
 aiobotocore>=2.9
-transformers>=4.36
+transformers>=4.48  # >=4.48 clears the deserialization/ReDoS GHSAs in the 4.36 floor
 polars>=0.20
 pyarrow>=14.0
 structlog>=23.2

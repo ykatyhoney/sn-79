@@ -268,7 +268,7 @@ void HighFrequencyTraderAgent::handleRetrieveL1Response(Message::Ptr msg)
     m_baseFree[bookId] = m_wealthFrac * 
         taosim::util::decimal2double(simulation()->exchange()->account(name()).at(bookId).base.getFree());
     m_quoteFree[bookId] = m_wealthFrac * 
-        taosim::util::decimal2double(simulation()->exchange()->account(name()).at(bookId).quote.getFree());
+        taosim::util::decimal2double(simulation()->exchange()->account(name()).at(bookId).quote->getFree());
 
     double timescaling = 1-(simulation()->currentTimestamp()/ m_delta)/(simulation()->duration() / m_delta);
     m_pRes = midquote - m_gHFT * m_inventory[bookId] * m_sigmaSqr * timescaling;

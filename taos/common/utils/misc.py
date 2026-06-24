@@ -117,7 +117,6 @@ def ttl_get_block(self) -> int:
 
 import bittensor as bt
 import subprocess
-import select
         
 def run_process(cmd, cwd):
     """

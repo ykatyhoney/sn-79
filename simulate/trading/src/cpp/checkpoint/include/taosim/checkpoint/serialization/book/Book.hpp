@@ -34,24 +34,19 @@ struct convert<taosim::book::Book>
             auto key = k.as<std::string_view>();
 
             if (key == "buyQueue") {
-                using T = std::remove_cvref_t<decltype(v.buyQueue())>;
-                v.buyQueue() = val.as<T>();
+                val.convert(v.buyQueue());
             }
             else if (key == "sellQueue") {
-                using T = std::remove_cvref_t<decltype(v.sellQueue())>;
-                v.sellQueue() = val.as<T>();
+                val.convert(v.sellQueue());
             }
             else if (key == "orderIdCounter") {
-                using T = std::remove_cvref_t<decltype(v.orderIdCounter())>;
-                v.orderIdCounter() = val.as<T>();
+                val.convert(v.orderIdCounter());
             }
             else if (key == "tradeIdCounter") {
-                using T = std::remove_cvref_t<decltype(v.tradeIdCounter())>;
-                v.tradeIdCounter() = val.as<T>();
+                val.convert(v.tradeIdCounter());
             }
             else if (key == "orderToClientInfo") {
-                using T = std::remove_cvref_t<decltype(v.orderToClientInfo())>;
-                v.orderToClientInfo() = val.as<T>();
+                val.convert(v.orderToClientInfo());
             }
         }
 
@@ -74,10 +69,10 @@ struct pack<taosim::book::Book>
         o.pack(v.sellQueue());
 
         o.pack("orderIdCounter");
-        o.pack(v.orderIdCounter());
+        o.pack(*v.orderIdCounter());
 
         o.pack("tradeIdCounter");
-        o.pack(v.tradeIdCounter());
+        o.pack(*v.tradeIdCounter());
 
         o.pack("orderToClientInfo");
         o.pack(v.orderToClientInfo());

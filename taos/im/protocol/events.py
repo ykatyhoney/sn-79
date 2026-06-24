@@ -93,7 +93,7 @@ class SimulationStartEvent(FinanceEvent):
         )
         
     def __str__(self):
-        return f"SIMULATION STARTED!"
+        return "SIMULATION STARTED!"
 
 class SimulationEndEvent(FinanceEvent):
     """
@@ -111,7 +111,7 @@ class SimulationEndEvent(FinanceEvent):
         )
         
     def __str__(self):
-        return f"SIMULATION ENDED!"
+        return "SIMULATION ENDED!"
 
 class OrderPlacementEvent(FinanceEvent):
     """
@@ -344,7 +344,7 @@ class OrderCancellationsEvent(FinanceEvent):
                 event.cancellations.append(
                     OrderCancellationEvent.model_construct( timestamp=event.timestamp,
                         bookId=event.bookId, orderId=cancellation['orderId'],quantity=cancellation['volume'],
-                        success=False,message=f"Order Id does not exist!"
+                        success=False,message="Order Id does not exist!"
                     )
                 )
         return event
@@ -528,11 +528,13 @@ class TradeEvent(FinanceEvent):
     
     @property
     def makerFeeRate(self) ->float:
-        return self.makerFee / (self.quantity * self.price)
-    
+        denom = self.quantity * self.price
+        return self.makerFee / denom if denom else 0.0
+
     @property
     def takerFeeRate(self) ->float:
-        return self.takerFee / (self.quantity * self.price)
+        denom = self.quantity * self.price
+        return self.takerFee / denom if denom else 0.0
     
     @classmethod
     def from_json(self, json : dict):

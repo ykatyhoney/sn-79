@@ -9,13 +9,11 @@
 
 """Multi-Book High Frequency Trader Agent Class."""
 import math
-import random
 import xml.etree.ElementTree as ET
 import os
 import numpy as np
 from scipy.stats import rayleigh
 
-from GBM import GBM
 from thesimulator import *
 import re
 
@@ -113,15 +111,15 @@ class HighFrequencyTraderAgent:
             pattern = r'^HIGH_FREQUENCY_TRADER_AGENT_(?:[0-9]|1[0-9]|20)$'
             if bool(re.match(pattern, self.name())):
                 self.agentInventoryFile = open(os.path.join(self.logDir,f"agent_inventory_{self.name()}.csv"), 'a')
-                self.agentInventoryFile.write(f"Timestamp,BookId,Inventory,Free,Actual,qFree,qActual\n")
+                self.agentInventoryFile.write("Timestamp,BookId,Inventory,Free,Actual,qFree,qActual\n")
                 self.agentInventoryFile.flush()
 
                 self.orderHFT = open(os.path.join(self.logDir,f"orderHFT_{self.name()}.csv"), 'a')
-                self.orderHFT.write(f"Timestamp,BookId,Price,Volume,orderID,ID,Direction,Leverage\n")
+                self.orderHFT.write("Timestamp,BookId,Price,Volume,orderID,ID,Direction,Leverage\n")
                 self.orderHFT.flush()
 
                 self.tradedOrder = open(os.path.join(self.logDir,f"tradedOrder_{self.name()}.csv"), 'a')
-                self.tradedOrder.write(f"Timestamp,orderId,bookId,flag\n")
+                self.tradedOrder.write("Timestamp,orderId,bookId,flag\n")
                 self.tradedOrder.flush()
 
         # pattern = r'HIGH_FREQUENCY_TRADER_AGENT_(?:[0-9]|1[0-9]|20)$'
@@ -137,7 +135,7 @@ class HighFrequencyTraderAgent:
         #try:
         match messagetype:
                 case "EVENT_SIMULATION_START":
-                    self.log(f"-----SIMULATION STARTED----")
+                    self.log("-----SIMULATION STARTED----")
                     simulation.dispatchMessage(self.currentTimestamp, 1, self.name(), self.exchange, "SUBSCRIBE_EVENT_TRADE", EmptyPayload())                            
                     self.agentId = simulation.getAgentId(self.name())
                     for i in range(self.bookCount):
@@ -146,7 +144,7 @@ class HighFrequencyTraderAgent:
                         simulation.dispatchMessage(self.currentTimestamp, 1, self.name(), self.exchange, "RETRIEVE_L1", L1Payload)
 
                 case "RESPONSE_SUBSCRIBE_EVENT_TRADE":
-                    self.log(f"-----Subscribed to trade events----") 
+                    self.log("-----Subscribed to trade events----") 
                     for i in range(self.bookCount):
                         if self.debug:
                             self.log(f"BOOK {i} | BASE : {self.wealthFrac*float(simulation.account(self.name())[i].base.getFree())} | QUOTE : {self.wealthFrac*float(simulation.account(self.name())[i].quote.getFree())}")
@@ -203,7 +201,7 @@ class HighFrequencyTraderAgent:
 
                 case "ERROR_RESPONSE_CANCEL_ORDERS":
                     bookId = payload.requestPayload.bookId            
-                    if not 'do not exist' in payload.errorPayload.message:
+                    if 'do not exist' not in payload.errorPayload.message:
                         self.log(f"BOOK {payload.requestPayload.bookId} |  ERROR CANCELLING ORDER : {payload.errorPayload.message}") 
 
                 case "EVENT_TRADE":
@@ -227,7 +225,7 @@ class HighFrequencyTraderAgent:
                     self.process_trade_event(payload)
 
                 case "EVENT_SIMULATION_STOP":
-                    self.log(f"-----The simulation ends now----")
+                    self.log("-----The simulation ends now----")
 
                 case _:
                     self.log(messagetype)

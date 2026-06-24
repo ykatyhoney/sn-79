@@ -73,7 +73,7 @@ void InitializationAgent::placeBuyOrders()
     const auto& account = simulation()->account(name());
 
     for (BookId bookId = 0; bookId < m_bookCount; ++bookId) {
-        const double freeQuote = taosim::util::decimal2double(account.at(bookId).quote.getFree());
+        const double freeQuote = taosim::util::decimal2double(account.at(bookId).quote->getFree());
         const double maxQuantity = freeQuote / m_price / 2;
         double usedQuote = 0.0;
         while (usedQuote < freeQuote) {

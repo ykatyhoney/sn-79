@@ -144,12 +144,19 @@ struct Order : public BasicOrder
         taosim::decimal_t leverage = 0_dec,
         STPFlag stpFlag = STPFlag::CO,
         SettleFlag settleFlag = SettleType::FIFO,
-        Currency currency = Currency::BASE) noexcept;
+        Currency currency = Currency::BASE,
+        std::optional<taosim::decimal_t> stopLoss = std::nullopt,
+        std::optional<taosim::decimal_t> takeProfit = std::nullopt,
+        std::optional<taosim::decimal_t> placeholder = std::nullopt) noexcept;
 
     [[nodiscard]] OrderDirection direction() const noexcept { return m_direction; }
     [[nodiscard]] STPFlag stpFlag() const noexcept { return m_stpFlag; }
     [[nodiscard]] SettleFlag settleFlag() const noexcept { return m_settleFlag; }
     [[nodiscard]] Currency currency() const noexcept { return m_currency; }
+    [[nodiscard]] std::optional<taosim::decimal_t> stopLoss() const noexcept { return m_stopLoss; }
+    [[nodiscard]] std::optional<taosim::decimal_t> takeProfit() const noexcept { return m_takeProfit; }
+    [[nodiscard]] std::optional<taosim::decimal_t> placeholder() const noexcept { return m_placeholder; }
+    [[nodiscard]] bool hasSLTP() const noexcept { return m_stopLoss || m_takeProfit; }
 
     virtual void jsonSerialize(
         rapidjson::Document& json, const std::string& key = {}) const override;
@@ -158,6 +165,9 @@ struct Order : public BasicOrder
     STPFlag m_stpFlag{STPFlag::CO};
     SettleFlag m_settleFlag{SettleType::FIFO};
     Currency m_currency{Currency::BASE};
+    std::optional<taosim::decimal_t> m_stopLoss;
+    std::optional<taosim::decimal_t> m_takeProfit;
+    std::optional<taosim::decimal_t> m_placeholder;
 
     MSGPACK_DEFINE_MAP(
         MSGPACK_NVP("orderId", m_id),
@@ -167,7 +177,10 @@ struct Order : public BasicOrder
         MSGPACK_NVP("direction", m_direction),
         MSGPACK_NVP("stpFlag", m_stpFlag),
         MSGPACK_NVP("settleFlag", m_settleFlag),
-        MSGPACK_NVP("currency", m_currency));
+        MSGPACK_NVP("currency", m_currency),
+        MSGPACK_NVP("stopLoss", m_stopLoss),
+        MSGPACK_NVP("takeProfit", m_takeProfit),
+        MSGPACK_NVP("placeholder", m_placeholder));
 };
 
 //-------------------------------------------------------------------------
@@ -175,6 +188,8 @@ struct Order : public BasicOrder
 struct MarketOrder : public Order
 {
     using Ptr = std::shared_ptr<MarketOrder>;
+
+    taosim::decimal_t m_maxSlippage{0_dec};  // 0 = no price limit
 
     MarketOrder() noexcept = default;
 
@@ -186,7 +201,13 @@ struct MarketOrder : public Order
         taosim::decimal_t leverage = 0_dec,
         STPFlag stpFlag = STPFlag::CO,
         SettleFlag settleFlag = SettleType::FIFO,
-        Currency currency = Currency::BASE) noexcept;
+        Currency currency = Currency::BASE,
+        taosim::decimal_t maxSlippage = 0_dec,
+        std::optional<taosim::decimal_t> stopLoss = std::nullopt,
+        std::optional<taosim::decimal_t> takeProfit = std::nullopt,
+        std::optional<taosim::decimal_t> placeholder = std::nullopt) noexcept;
+
+    [[nodiscard]] taosim::decimal_t maxSlippage() const noexcept { return m_maxSlippage; }
 
     void L3Serialize(rapidjson::Document& json, const std::string& key = {}) const;
 
@@ -203,7 +224,10 @@ struct MarketOrder : public Order
         MSGPACK_NVP("direction", m_direction),
         MSGPACK_NVP("stpFlag", m_stpFlag),
         MSGPACK_NVP("settleFlag", m_settleFlag),
-        MSGPACK_NVP("currency", m_currency));
+        MSGPACK_NVP("currency", m_currency),
+        MSGPACK_NVP("stopLoss", m_stopLoss),
+        MSGPACK_NVP("takeProfit", m_takeProfit),
+        MSGPACK_NVP("placeholder", m_placeholder));
 };
 
 //-------------------------------------------------------------------------
@@ -226,7 +250,10 @@ struct LimitOrder : public Order
         bool postOnly = false,
         taosim::TimeInForce timeInForce = taosim::TimeInForce::GTC,
         std::optional<Timestamp> expiryPeriod = std::nullopt,
-        Currency currency = Currency::BASE) noexcept;
+        Currency currency = Currency::BASE,
+        std::optional<taosim::decimal_t> stopLoss = std::nullopt,
+        std::optional<taosim::decimal_t> takeProfit = std::nullopt,
+        std::optional<taosim::decimal_t> placeholder = std::nullopt) noexcept;
 
     [[nodiscard]] taosim::decimal_t price() const noexcept { return m_price; };
     [[nodiscard]] bool postOnly() const noexcept { return m_postOnly; }
@@ -245,7 +272,7 @@ struct LimitOrder : public Order
     taosim::decimal_t m_price;
     bool m_postOnly{};
     taosim::TimeInForce m_timeInForce{taosim::TimeInForce::GTC};
-    std::optional<Timestamp> m_expiryPeriod{};
+    std::optional<Timestamp> m_expiryPeriod;
 
     MSGPACK_DEFINE_MAP(
         MSGPACK_NVP("orderId", m_id),
@@ -259,7 +286,10 @@ struct LimitOrder : public Order
         MSGPACK_NVP("price", m_price),
         MSGPACK_NVP("postOnly", m_postOnly),
         MSGPACK_NVP("timeInForce", m_timeInForce),
-        MSGPACK_NVP("expiryPeriod", m_expiryPeriod));
+        MSGPACK_NVP("expiryPeriod", m_expiryPeriod),
+        MSGPACK_NVP("stopLoss", m_stopLoss),
+        MSGPACK_NVP("takeProfit", m_takeProfit),
+        MSGPACK_NVP("placeholder", m_placeholder));
 };
 
 //-------------------------------------------------------------------------
@@ -268,16 +298,28 @@ struct OrderClientContext
 {
     AgentId agentId;
     std::optional<ClientOrderID> clientOrderId;
+    std::string delegate;
+    Currency currency{Currency::QUOTE};
+    // SL/TP close metadata — populated only for exchange-triggered market closes.
+    uint8_t closeReason{0};       // 0=none, 1=SL, 2=TP
+    OrderID originatingOrderId{0}; // LOB ID of the position order that spawned the SL/TP
 
     OrderClientContext() noexcept = default;
 
-    OrderClientContext(AgentId agentId, std::optional<ClientOrderID> clientOrderId = {}) noexcept
-        : agentId{agentId}, clientOrderId{clientOrderId}
+    OrderClientContext(
+        AgentId agentId,
+        std::optional<ClientOrderID> clientOrderId = {},
+        std::string delegate = {},
+        Currency currency = Currency::QUOTE) noexcept
+        : agentId{agentId},
+          clientOrderId{clientOrderId},
+          delegate{std::move(delegate)},
+          currency{currency}
     {}
 
     [[nodiscard]] static OrderClientContext fromJson(const rapidjson::Value& json);
 
-    MSGPACK_DEFINE_MAP(agentId, clientOrderId);
+    MSGPACK_DEFINE_MAP(agentId, clientOrderId, delegate, currency);
 };
 
 //-------------------------------------------------------------------------

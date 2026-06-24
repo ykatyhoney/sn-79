@@ -37,6 +37,7 @@ class OrderOptionAgent(GenTRXAgent):
             'FOK' : bool(self.config.FOK) if hasattr(self.config, 'FOK') else None,
             'QUOTE' : bool(self.config.QUOTE) if hasattr(self.config, 'QUOTE') else None,
             'MARGIN' : bool(self.config.MARGIN) if hasattr(self.config, 'MARGIN') else None,
+            'SLTP' : bool(self.config.SLTP) if hasattr(self.config, 'SLTP') else None,
         }
         # If no tests explicitly specified in launch parameters, assume all tests should be run
         if all([t is None for t in self.tests.values()]):
@@ -71,9 +72,12 @@ class OrderOptionAgent(GenTRXAgent):
             ask = book.asks[0].price
             bidvol = book.bids[0].quantity
             askvol = book.asks[0].quantity
+            # Prices that cross the spread — used by PO, IOC, and FOK post-only tests.
+            bidpricePOFail = ask  # buy at ask → immediately matches → PO rejected
+            askpricePOFail = bid  # sell at bid → immediately matches → PO rejected
             # Obtain a random quantity
             quantity = self.quantity()
-            
+
             match self.round:
                 case 0:
                     response.limit_order(book_id=book_id, direction=OrderDirection.BUY, quantity=quantity, price=bid-0.01, postOnly=True, clientOrderId=100 + book_id)
@@ -86,11 +90,8 @@ class OrderOptionAgent(GenTRXAgent):
                 response.market_order(book_id=book_id, direction=OrderDirection.SELL, quantity=round(bid * bidvol,self.simulation_config.quoteDecimals), currency=OrderCurrency.QUOTE)
 
             if self.tests['PO']:
-                # Populate prices which are expected to trigger key scenarios in Post-Only handling
                 bidpricePO = bid
-                bidpricePOFail = ask
                 askpricePO = ask
-                askpricePOFail = bid
                 # Place a buy order which is expected to be opened on the book
                 response.limit_order(book_id=book_id, direction=OrderDirection.BUY, quantity=quantity, price=bidpricePO, postOnly=True)
                 # Place a buy order which is expected to be rejected due to post-only limitation
@@ -163,7 +164,38 @@ class OrderOptionAgent(GenTRXAgent):
                 # Place an FOK order with postOnly=True (INVALID)
                 response.limit_order(book_id=book_id, direction=OrderDirection.SELL, quantity=quantity, price=askpricePOFail, postOnly=True, timeInForce=TimeInForce.FOK)
                 
-            if self.tests['MARGIN']:                
+            if self.tests['SLTP']:
+                # Round 0: BUY market with SL=2% below fill, TP=5% above fill
+                # Round 1: SELL market with SL=2% above fill, TP=5% below fill
+                # Round 2: BUY limit with SL=3% / TP=6%
+                # Round 3: SELL limit with SL=3% / TP=6%
+                match self.round:
+                    case 0:
+                        # BUY market: SL 2% below fill price, TP 5% above fill price
+                        response.market_order(book_id=book_id, direction=OrderDirection.BUY,
+                                              quantity=quantity,
+                                              stop_loss=-0.02, take_profit=0.05)
+                        bt.logging.info("SLTP ROUND 0: BUY MARKET SL=-2% TP=+5%")
+                    case 1:
+                        # SELL market: SL 2% above fill price, TP 5% below fill price
+                        response.market_order(book_id=book_id, direction=OrderDirection.SELL,
+                                              quantity=quantity,
+                                              stop_loss=0.02, take_profit=-0.05)
+                        bt.logging.info("SLTP ROUND 1: SELL MARKET SL=+2% TP=-5%")
+                    case 2:
+                        # BUY limit: SL 3% below price, TP 6% above price
+                        response.limit_order(book_id=book_id, direction=OrderDirection.BUY,
+                                             quantity=quantity, price=bid,
+                                             stop_loss=-0.03, take_profit=0.06)
+                        bt.logging.info("SLTP ROUND 2: BUY LIMIT SL=-3% TP=+6%")
+                    case 3:
+                        # SELL limit: SL 3% above price, TP 6% below price
+                        response.limit_order(book_id=book_id, direction=OrderDirection.SELL,
+                                             quantity=quantity, price=ask,
+                                             stop_loss=0.03, take_profit=-0.06)
+                        bt.logging.info("SLTP ROUND 3: SELL LIMIT SL=+3% TP=-6%")
+
+            if self.tests['MARGIN']:
                 bt.logging.info(f"BOOK {book_id} ROUND {self.round} : QUOTE : {self.accounts[book_id].quote_balance.total} [LOAN {self.accounts[book_id].quote_loan} | COLLAT {self.accounts[book_id].quote_collateral}]")
                 bt.logging.info(f"BOOK {book_id} ROUND {self.round} : BASE : {self.accounts[book_id].base_balance.total} [LOAN {self.accounts[book_id].base_loan} | COLLAT {self.accounts[book_id].base_collateral}]")
                 match self.round:
@@ -219,7 +251,7 @@ class OrderOptionAgent(GenTRXAgent):
                 self.response = FinanceAgentResponse(agent_id=self.uid)
             self.response.cancel_order(event.bookId, event.orderId)
     
-    def onTrade(self, event : TradeEvent) -> None:
+    def onTrade(self, event : TradeEvent, validator: str = None) -> None:
         """
         Handler for event where an order is traded in the simulator.  To be implemented by subclasses.
 
@@ -249,6 +281,12 @@ class OrderOptionAgent(GenTRXAgent):
 if __name__ == "__main__":
     """
     Example command for local standalone testing execution using Proxy:
-    python OrderOptionAgent.py --port 8888 --agent_id 0 --params min_quantity=0.1 max_quantity=1.0 expiry_period=200 PO=1 GTT=1 IOC=1 FOK=1 QUOTE=1"
+    python OrderOptionAgent.py --port 8888 --agent_id 0 --params min_quantity=0.1 max_quantity=1.0 PO=1 GTT=1 IOC=1 FOK=1 QUOTE=1 MARGIN=1 SLTP=1
+
+    SLTP test runs 4 rounds per book:
+      Round 0: BUY market, SL=-2%, TP=+5%
+      Round 1: SELL market, SL=+2%, TP=-5%
+      Round 2: BUY limit, SL=-3%, TP=+6%
+      Round 3: SELL limit, SL=+3%, TP=-6%
     """
     launch(OrderOptionAgent)

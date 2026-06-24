@@ -5,12 +5,12 @@
 #pragma once
 
 #include "AccountRegistry.hpp"
-#include <taosim/exchange/ExchangeSignals.hpp>
+#include <taosim/matching/ExchangeSignals.hpp>
 #include "common.hpp"
 
 #include <spdlog/spdlog.h>
 
-using namespace taosim::exchange;
+using namespace taosim::matching;
 
 //-------------------------------------------------------------------------
 

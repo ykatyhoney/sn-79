@@ -8,7 +8,6 @@ import pandas as pd
 import json
 import traceback
 from arch import arch_model
-from scipy.stats import levy_stable
 from decimal import *
 
 import matplotlib
@@ -242,7 +241,7 @@ def process_l2_file(l2_file, N, offset=0):
             bidVolLevels = 0
             askVolLevels = 0
 
-            if bidprice[-1] == None or askprice[-1] == None :
+            if bidprice[-1] is None or askprice[-1] is None :
                 vol_imbalance.append(None) 
             else: 
                 for (bvol,_),(avol,_) in zip(bidlevels[:levels_count],asklevels[:levels_count]):
@@ -680,7 +679,7 @@ def generate_plots(self, out_dir, l2_file, time, timestamp_trade,bestbidvol,best
         agent_type, type_proportion['Fundamentalist'], type_proportion['Chartist'],
         type_proportion['Noise'], type_proportion['HighFrequency'], total_count, fundamental_lag1)
     elif self.fCount == 0 and self.nCount == 0 and self.cCount != 0:
-        itle = 'T = {:s}, F = {:.2f}, C = {:.2f}, N = {:.2f}, H = {:.2f}, Count = {:d}, Lag1 = {:.2f}'.format(
+        'T = {:s}, F = {:.2f}, C = {:.2f}, N = {:.2f}, H = {:.2f}, Count = {:d}, Lag1 = {:.2f}'.format(
         agent_type, type_proportion['Fundamentalist'], type_proportion['Chartist'],
         type_proportion['Noise'], type_proportion['HighFrequency'], total_count, fundamental_lag1)
     elif self.cCount == 0 and self.nCount == 0 and self.fCount != 0:
@@ -719,7 +718,7 @@ def generate_plots(self, out_dir, l2_file, time, timestamp_trade,bestbidvol,best
         agent_type, type_proportion['Fundamentalist'], type_proportion['Chartist'],
         type_proportion['Noise'], type_proportion['HighFrequency'], total_count, beta_param, alpha_param)
     elif self.fCount == 0 and self.nCount == 0 and self.cCount != 0:
-        itle = 'T = {:s}, F = {:.2f}, C = {:.2f}, N = {:.2f}, H = {:.2f}, Count = {:d}, B={:.2f}, Alpha={:.2f}'.format(
+        'T = {:s}, F = {:.2f}, C = {:.2f}, N = {:.2f}, H = {:.2f}, Count = {:d}, B={:.2f}, Alpha={:.2f}'.format(
         agent_type, type_proportion['Fundamentalist'], type_proportion['Chartist'],
         type_proportion['Noise'], type_proportion['HighFrequency'], total_count, beta_param, alpha_param)
     elif self.cCount == 0 and self.nCount == 0 and self.fCount != 0:
@@ -760,7 +759,7 @@ def generate_plots(self, out_dir, l2_file, time, timestamp_trade,bestbidvol,best
         plt.savefig(os.path.join(out_dir,f'midquote_averaged_{self.checkpoints[0] if self.checkpoints != [] else self.duration}.png'))
         plt.clf()
         plt.close('all')
-    except Exception as e:
+    except Exception:
         # Print an error message if plotting fails
         print("An error occurred while trying to plot:")
         traceback.print_exc()
@@ -837,7 +836,7 @@ def generate_plots(self, out_dir, l2_file, time, timestamp_trade,bestbidvol,best
         plt.clf()
         plt.close('all')
 
-    except Exception as e:
+    except Exception:
         # Print an error message if plotting fails
         print("An error occurred while trying to plot:")
         traceback.print_exc()
@@ -925,7 +924,7 @@ def generate_plots(self, out_dir, l2_file, time, timestamp_trade,bestbidvol,best
         agent_type, type_proportion['Fundamentalist'], type_proportion['Chartist'],
         type_proportion['Noise'], type_proportion['HighFrequency'], total_count, midquote_lag1)
     elif self.fCount == 0 and self.nCount == 0 and self.cCount != 0:
-        itle = 'T = {:s}, F = {:.2f}, C = {:.2f}, N = {:.2f}, H = {:.2f}, Count = {:d}, Lag1 = {:.2f}'.format(
+        'T = {:s}, F = {:.2f}, C = {:.2f}, N = {:.2f}, H = {:.2f}, Count = {:d}, Lag1 = {:.2f}'.format(
         agent_type, type_proportion['Fundamentalist'], type_proportion['Chartist'],
         type_proportion['Noise'], type_proportion['HighFrequency'], total_count, midquote_lag1)
     elif self.cCount == 0 and self.nCount == 0 and self.fCount != 0:
@@ -952,7 +951,7 @@ def generate_plots(self, out_dir, l2_file, time, timestamp_trade,bestbidvol,best
         agent_type, type_proportion['Fundamentalist'], type_proportion['Chartist'],
         type_proportion['Noise'], type_proportion['HighFrequency'], total_count, beta_param, alpha_param)
     elif self.fCount == 0 and self.nCount == 0 and self.cCount != 0:
-        itle = 'T = {:s}, F = {:.2f}, C = {:.2f}, N = {:.2f}, H = {:.2f}, Count = {:d}, B={:.2f}, Alpha={:.2f}'.format(
+        'T = {:s}, F = {:.2f}, C = {:.2f}, N = {:.2f}, H = {:.2f}, Count = {:d}, B={:.2f}, Alpha={:.2f}'.format(
         agent_type, type_proportion['Fundamentalist'], type_proportion['Chartist'],
         type_proportion['Noise'], type_proportion['HighFrequency'], total_count, beta_param, alpha_param)
     elif self.cCount == 0 and self.nCount == 0 and self.fCount != 0:
@@ -999,7 +998,7 @@ def generate_plots(self, out_dir, l2_file, time, timestamp_trade,bestbidvol,best
         agent_type, type_proportion['Fundamentalist'], type_proportion['Chartist'],
         type_proportion['Noise'], type_proportion['HighFrequency'], total_count, weighted_midquote_lag1)
     elif self.fCount == 0 and self.nCount == 0 and self.cCount != 0:
-        itle = 'T = {:s}, F = {:.2f}, C = {:.2f}, N = {:.2f}, H = {:.2f}, Count = {:d}, Lag1 = {:.2f}'.format(
+        'T = {:s}, F = {:.2f}, C = {:.2f}, N = {:.2f}, H = {:.2f}, Count = {:d}, Lag1 = {:.2f}'.format(
         agent_type, type_proportion['Fundamentalist'], type_proportion['Chartist'],
         type_proportion['Noise'], type_proportion['HighFrequency'], total_count, weighted_midquote_lag1)
     elif self.cCount == 0 and self.nCount == 0 and self.fCount != 0:
@@ -1024,7 +1023,7 @@ def generate_plots(self, out_dir, l2_file, time, timestamp_trade,bestbidvol,best
         agent_type, type_proportion['Fundamentalist'], type_proportion['Chartist'],
         type_proportion['Noise'], type_proportion['HighFrequency'], total_count, beta_param, alpha_param)
     elif self.fCount == 0 and self.nCount == 0 and self.cCount != 0:
-        itle = 'T = {:s}, F = {:.2f}, C = {:.2f}, N = {:.2f}, H = {:.2f}, Count = {:d}, B={:.2f}, Alpha={:.2f}'.format(
+        'T = {:s}, F = {:.2f}, C = {:.2f}, N = {:.2f}, H = {:.2f}, Count = {:d}, B={:.2f}, Alpha={:.2f}'.format(
         agent_type, type_proportion['Fundamentalist'], type_proportion['Chartist'],
         type_proportion['Noise'], type_proportion['HighFrequency'], total_count, beta_param, alpha_param)
     elif self.cCount == 0 and self.nCount == 0 and self.fCount != 0:
@@ -1177,7 +1176,7 @@ def generate_plots(self, out_dir, l2_file, time, timestamp_trade,bestbidvol,best
             plt.title('T = {:s}, F = {:.2f} , C = {:.2f}, N = {:.2f}, H = {:.2f}, Count = {:d}'.format(agent_type, type_proportion['Fundamentalist'], type_proportion['Chartist'], type_proportion['Noise'], type_proportion['HighFrequency'], total_count))
         else:
             plt.title('T = {:s}, fS = {:.2f}, cS = {:.2f}, nS = {:.2f}, Hp = {:.2f}, Count = {:d}'.format(agent_type, self.fSD, self.cSD, self.nSD, type_proportion['HighFrequency'], total_count))    
-        plt.savefig(os.path.join(out_dir,f'volume_time_series.png'))
+        plt.savefig(os.path.join(out_dir,'volume_time_series.png'))
         plt.clf()
         plt.close('all')
     else:
@@ -1196,13 +1195,13 @@ def generate_plots(self, out_dir, l2_file, time, timestamp_trade,bestbidvol,best
         elif self.fCount == 0 and self.nCount == 0 and self.cCount != 0:
             plt.title('T = {:s}, F = {:.2f} , C = {:.2f}, N = {:.2f}, Count = {:d}'.format(agent_type, type_proportion['Fundamentalist'], type_proportion['Chartist'],type_proportion['Noise'], total_count))
         elif self.cCount == 0 and self.nCount == 0 and self.fCount != 0:
-            plt.title('T = {:s}, F = {:.2f} , C = 0.00, N = {:.2f}, Count = {:d}'.format(agent_type, type_proportion['Fundamentalist'], type_proportion['Chartist'],type_proportion['Noise'], total_count))
+            plt.title('T = {:s}, F = {:.2f} , C = 0.00, N = {:.2f}, Count = {:d}'.format(agent_type, type_proportion['Fundamentalist'], type_proportion['Chartist'],type_proportion['Noise'], ))
         else:
             plt.title('T = {:s}, fS = {:.2f}, cS = {:.2f}, nS = {:.2f}, Count = {:d}'.format(agent_type, self.fSD, self.cSD, self.nSD, total_count))    
         plt.savefig(os.path.join(out_dir,f'volume_time_series_{self.checkpoints[0] if self.checkpoints != [] else self.duration}.png'))
         plt.clf()
         plt.close('all')
-    except Exception as e:
+    except Exception:
         # Print an error message if plotting fails
         print("An error occurred while trying to plot:")
         traceback.print_exc()
@@ -1332,7 +1331,7 @@ def generate_plots(self, out_dir, l2_file, time, timestamp_trade,bestbidvol,best
             axs[0].set_title('T = {:s}, fS = {:.2f}, cS = {:.2f}, nS = {:.2f}, Hp = {:.2f}, Count = {:d}'.format(agent_type, self.fSD, self.cSD, self.nSD, type_proportion['HighFrequency'], total_count)) 
 
     elif not asklevelsprice_count and not bidlevelsprice_count:
-        print(f"The liquidity-price can be plotted as the book is empty")
+        print("The liquidity-price can be plotted as the book is empty")
 
     else:
         m_bid_count, c_bid_count = np.linalg.lstsq(np.vstack([bidlevelsprice_count, np.ones(len(bidlevelsprice_count))]).T, bidlevelsvol_count, rcond=None)[0]
@@ -1394,7 +1393,7 @@ def generate_plots(self, out_dir, l2_file, time, timestamp_trade,bestbidvol,best
             axs[1].set_title('T = {:s}, fS = {:.2f}, cS = {:.2f}, nS = {:.2f}, Hp = {:.2f}, Count = {:d}'.format(agent_type, self.fSD, self.cSD, self.nSD, type_proportion['HighFrequency'], total_count))  
     
     elif not asklevelsprice_percent and not bidlevelsprice_percent:
-        print(f"The liquidity-price can be plotted as the book is empty")
+        print("The liquidity-price can be plotted as the book is empty")
     
     else:
         m_bid_percent, c_bid_percent = np.linalg.lstsq(np.vstack([bidlevelsprice_percent, np.ones(len(bidlevelsprice_percent))]).T, bidlevelsvol_percent, rcond=None)[0]
@@ -1538,7 +1537,7 @@ def lsSeries(l2_file, currentTimestamp, reportInterval):
 def pricevol_count(l2_file, count):
     if count < 1:
         count = 1
-        print(f"The number of LOB levels chosen should be at least 1")
+        print("The number of LOB levels chosen should be at least 1")
 
     with open(l2_file, 'r') as file:
         lines=file.readlines()
@@ -1552,8 +1551,7 @@ def pricevol_count(l2_file, count):
         asklevelsprice_count = []
         asklevelsvol_count = []
 
-        idx = 0
-        for idx, bidlevel in enumerate(BidLevels_split):
+        for _idx, bidlevel in enumerate(BidLevels_split):
             #if idx < count:
                 quantity, price = bidlevel.strip('()').split('@')
                 bidlevelsprice_count.append(convert_to_number(price))
@@ -1563,8 +1561,7 @@ def pricevol_count(l2_file, count):
         zipped_pairs.sort(key=lambda x: x[0], reverse=True)
         bidlevelsprice_count[:], bidlevelsvol_count[:] = zip(*zipped_pairs)
 
-        idx = 0
-        for idx, asklevel in enumerate(AskLevels_split):
+        for _idx, asklevel in enumerate(AskLevels_split):
             #if idx < count:
                 quantity, price = asklevel.strip('()').split('@')
                 asklevelsprice_count.append(convert_to_number(price))
@@ -1579,7 +1576,7 @@ def pricevol_count(l2_file, count):
 def pricevol(l2_file, percentage):
     if percentage <= 0:
         percentage = 1e-6
-        print(f"The percentage chosen should be greater than 0")
+        print("The percentage chosen should be greater than 0")
 
     with open(l2_file, 'r') as file:
         lines=file.readlines()
@@ -1616,7 +1613,7 @@ def lob_stats(bestaskprice,bestbidprice,bestaskvol,bestbidvol):
     relative_spread=[]
     spread=[]
     for i,j in zip(bestaskprice,bestbidprice):
-        if i==None or j==None:
+        if i is None or j is None:
             spread.append(None)
             relative_spread.append(None)
             midquote.append(None)
@@ -1627,14 +1624,14 @@ def lob_stats(bestaskprice,bestbidprice,bestaskvol,bestbidvol):
 
     vol_imbalance =[]
     for i,j in zip(bestaskvol,bestbidvol):
-        if i==None or j==None:
+        if i is None or j is None:
             vol_imbalance.append(None)
         else:
             vol_imbalance.append((j-i)/(j+i))
 
     weighted_midquote=[]
     for i,j,k,l in zip(bestaskprice,bestbidprice,bestaskvol,bestbidvol):
-        if i==None or j==None:
+        if i is None or j is None:
             weighted_midquote.append(None)
         else:
             weighted_midquote.append((i*k+j*l)/(k+l))

@@ -1,5 +1,0 @@
-ExchangeSimulator v2.0
- - 'SimulationExample.xml' loaded successfully
- - starting the simulations
-TRADER_DOOB: Upcrossings registered: 0
- - all simulations finished, exiting

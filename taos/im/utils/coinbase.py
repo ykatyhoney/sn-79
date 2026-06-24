@@ -8,7 +8,6 @@ import websockets
 import asyncio
 import ssl
 
-import websockets
 
 from coinbase.api_base import get_logger
 from coinbase.constants import USER_AGENT
@@ -28,7 +27,7 @@ class CoinbaseClient(WSBase):
 
         headers = self._set_headers()
 
-        logger.debug("Connecting to %s", self.base_url)
+        logger.debug(f"Connecting to {self.base_url}")
         try:
             self.websocket = await websockets.connect(
                 self.base_url,
@@ -38,7 +37,7 @@ class CoinbaseClient(WSBase):
                 additional_headers=headers,
                 ssl=ssl.SSLContext() if self.base_url.startswith("wss://") else None,
             )
-            logger.debug("Successfully connected to %s", self.base_url)
+            logger.debug(f"Successfully connected to {self.base_url}")
 
             if self.on_open:
                 self.on_open()
@@ -49,11 +48,11 @@ class CoinbaseClient(WSBase):
 
         except asyncio.TimeoutError as toe:
             self.websocket = None
-            logger.error("Connection attempt timed out: %s", toe)
+            logger.error(f"Connection attempt timed out: {toe}")
             raise WSClientException("Connection attempt timed out") from toe
         except (websockets.exceptions.WebSocketException, OSError) as wse:
             self.websocket = None
-            logger.error("Failed to establish WebSocket connection: %s", wse)
+            logger.error(f"Failed to establish WebSocket connection: {wse}")
             raise WSClientException("Failed to establish WebSocket connection") from wse
         
     def _is_websocket_open(self) -> bool:

@@ -5,9 +5,13 @@
 #include "MultiBookExchangeAgent.hpp"
 
 #include "Simulation.hpp"
-#include <taosim/exchange/FeePolicy.hpp>
-#include <taosim/exchange/TieredFeePolicy.hpp>
-#include <taosim/exchange/DynamicFeePolicy.hpp>
+#include <json_util.hpp>
+#include <taosim/net/net.hpp>
+#include <taosim/matching/FeePolicy.hpp>
+#include <taosim/util/SLTPDebug.hpp>
+#include <taosim/matching/TieredFeePolicy.hpp>
+#include <taosim/matching/DynamicFeePolicy.hpp>
+#include <taosim/matching/ZeroFeePolicy.hpp>
 #include <taosim/book/FeeLogger.hpp>
 #include "util.hpp"
 #include "InstructionLogger.hpp"
@@ -86,6 +90,11 @@ void MultiBookExchangeAgent::checkMarginCall() noexcept
                                 taosim::util::dec1p(loan->get().leverage()),
                                 remainingVolume
                             );
+
+                            taosim::util::SLTPDebugger::log(
+                                "margin-call cleanup (BUY): order#{} agent#{} book={}",
+                                idIt->orderId, idIt->agentId, bookId);
+                            m_sltpContainer.removeOrder(bookId, idIt->orderId);
 
                             if (idIt->agentId < 0){
 
@@ -178,9 +187,14 @@ void MultiBookExchangeAgent::checkMarginCall() noexcept
                                 taosim::util::dec1p(loan->get().leverage()),
                                 remainingVolume
                             );
-                            
+
+                            taosim::util::SLTPDebugger::log(
+                                "margin-call cleanup (SELL): order#{} agent#{} book={}",
+                                idIt->orderId, idIt->agentId, bookId);
+                            m_sltpContainer.removeOrder(bookId, idIt->orderId);
+
                             if (idIt->agentId < 0){
-                                
+
                                 simulation()->dispatchMessageWithPriority(
                                     simulation()->currentTimestamp(),
                                     0,
@@ -263,31 +277,33 @@ void MultiBookExchangeAgent::configure(const pugi::xml_node& node)
             &m_config2,
             simulation()->sharedResources());
 
-        if (std::string(node.child("FeePolicy").attribute("type").as_string()) == "dynamic"){
+        if (auto feePolicy = std::string_view{node.child("FeePolicy").attribute("type").as_string()};
+            feePolicy == "dynamic")
+        {
             simulation()->logDebug("DYNAMIC FEE POLICY");
-            m_clearingManager = std::make_unique<taosim::exchange::ClearingManager>(
+            m_clearingManager = std::make_unique<taosim::matching::ClearingManager>(
                 this,
                 bookCount,
-                std::make_unique<taosim::exchange::FeePolicyWrapper>(
-                    taosim::exchange::DynamicFeePolicy::fromXML(
+                std::make_unique<taosim::matching::FeePolicyWrapper>(
+                    taosim::matching::DynamicFeePolicy::fromXML(
                         node.child("FeePolicy"), const_cast<Simulation*>(simulation())),
                     &accounts()),
-                taosim::exchange::OrderPlacementValidator::Parameters{
+                taosim::matching::OrderPlacementValidator::Parameters{
                     .volumeIncrementDecimals = m_config.parameters().volumeIncrementDecimals,
                     .priceIncrementDecimals = m_config.parameters().priceIncrementDecimals,
                     .baseIncrementDecimals = m_config.parameters().baseIncrementDecimals,
                     .quoteIncrementDecimals = m_config.parameters().quoteIncrementDecimals
                 });
-                
-        } else if (std::string(node.child("FeePolicy").attribute("type").as_string()) == "tiered"){
-            m_clearingManager = std::make_unique<taosim::exchange::ClearingManager>(
+        }
+        else if (feePolicy == "tiered") {
+            m_clearingManager = std::make_unique<taosim::matching::ClearingManager>(
                 this,
                 bookCount,
-                std::make_unique<taosim::exchange::FeePolicyWrapper>(
-                    taosim::exchange::TieredFeePolicy::fromXML(
+                std::make_unique<taosim::matching::FeePolicyWrapper>(
+                    taosim::matching::TieredFeePolicy::fromXML(
                         node.child("FeePolicy"), const_cast<Simulation*>(simulation())),
                     &accounts()),
-                taosim::exchange::OrderPlacementValidator::Parameters{
+                taosim::matching::OrderPlacementValidator::Parameters{
                     .volumeIncrementDecimals = m_config.parameters().volumeIncrementDecimals,
                     .priceIncrementDecimals = m_config.parameters().priceIncrementDecimals,
                     .baseIncrementDecimals = m_config.parameters().baseIncrementDecimals,
@@ -305,9 +321,22 @@ void MultiBookExchangeAgent::configure(const pugi::xml_node& node)
                     c++;
                 }
             }
-
-        } else {
-            throw std::runtime_error("DEFAULT FEE POLICY MUST BE DEFINED UNDER MultibookExchangeAgent");
+        }
+        else {
+            simulation()->logDebug("ZERO FEE POLICY");
+            m_clearingManager = std::make_unique<taosim::matching::ClearingManager>(
+                this,
+                bookCount,
+                std::make_unique<taosim::matching::FeePolicyWrapper>(
+                    std::make_unique<taosim::matching::ZeroFeePolicy>(),
+                    &accounts()
+                ),
+                taosim::matching::OrderPlacementValidator::Parameters{
+                    .volumeIncrementDecimals = m_config.parameters().volumeIncrementDecimals,
+                    .priceIncrementDecimals = m_config.parameters().priceIncrementDecimals,
+                    .baseIncrementDecimals = m_config.parameters().baseIncrementDecimals,
+                    .quoteIncrementDecimals = m_config.parameters().quoteIncrementDecimals
+                });
         }
 
         const auto balancesNode = node.child("Balances");
@@ -346,9 +375,102 @@ void MultiBookExchangeAgent::configure(const pugi::xml_node& node)
         m_L2Loggers.resize(bookCount);
         m_L3EventLoggers.resize(bookCount);
         m_feeLoggers.resize(bookCount);
+        m_sltpContainer.resize(bookCount);
+
+        // SL/TP plumbing: closing market orders go through the agent's
+        // normal local message path, so accounting, validation and
+        // matching all stay on the standard flow.
+        m_sltpContainer.setDispatch(
+            [this](const taosim::matching::SLTPEntry& entry, taosim::decimal_t observedPrice) {
+                fmt::println("{} | SLTP DISPATCH {} | AGENT #{} BOOK {} : "
+                    "closingSide={} volume={} currency={} observedPrice={}",
+                    simulation()->currentTimestamp(),
+                    entry.isSL ? "SL" : "TP",
+                    entry.agentId, simulation()->bookIdCanon(entry.bookId),
+                    std::to_underlying(entry.closingSide),
+                    entry.volume,
+                    std::to_underlying(entry.currency),
+                    observedPrice);
+                auto pld = MessagePayload::create<PlaceOrderMarketPayload>();
+                pld->direction = entry.closingSide;
+                // SLTPEntry.volume = trade->volume() (pre-fee BASE). For a close SELL
+                // (BUY position), the agent only received volume*(1-takerFee) BASE, so
+                // canReserve(volume) can fail by exactly one fee quantum when the agent's
+                // free BASE is nearly exhausted.  Cap to actual free BASE so the close
+                // always executes and produces a fill/badge even in that edge case.
+                pld->volume = entry.volume;
+                if (entry.closingSide == OrderDirection::SELL
+                        && entry.currency == Currency::BASE
+                        && entry.agentId >= 0) {
+                    const taosim::decimal_t freeBase =
+                        accounts()[entry.agentId][entry.bookId].base.getFree();
+                    if (freeBase <= 0_dec) {
+                        fmt::println("{} | SLTP CLOSE {} | AGENT #{} BOOK {} : "
+                            "no free BASE ({}) — skipping close order",
+                            simulation()->currentTimestamp(),
+                            entry.isSL ? "SL" : "TP",
+                            entry.agentId, simulation()->bookIdCanon(entry.bookId),
+                            freeBase);
+                        return;
+                    }
+                    if (pld->volume > freeBase) {
+                        fmt::println("{} | SLTP CLOSE {} | AGENT #{} BOOK {} : "
+                            "volume {} > freeBase {} — capping to freeBase",
+                            simulation()->currentTimestamp(),
+                            entry.isSL ? "SL" : "TP",
+                            entry.agentId, simulation()->bookIdCanon(entry.bookId),
+                            pld->volume, freeBase);
+                        pld->volume = freeBase;
+                    }
+                }
+                pld->leverage = entry.leverage;
+                pld->bookId = entry.bookId;
+                // entry.volume is always in BASE units (trade->volume()).  Using the
+                // original order's currency (e.g. QUOTE) would mis-interpret the BASE
+                // volume as a QUOTE amount and compute a micro BASE order that fails
+                // min-size.  Always close in BASE so the validator uses volume directly.
+                pld->currency = Currency::BASE;
+                pld->clientOrderId = entry.clientCtx.clientOrderId;
+                pld->delegate = entry.clientCtx.delegate;
+                pld->skipMinSizeCheck = true;
+                pld->closeReason = entry.isSL ? 1 : 2;
+                pld->originatingOrderId = entry.originatingOrderId;
+                if (entry.agentId < 0) {
+                    simulation()->dispatchMessage(
+                        simulation()->currentTimestamp(),
+                        Timestamp{},
+                        accounts().idBimap().right.at(entry.agentId),
+                        name(),
+                        "PLACE_ORDER_MARKET",
+                        pld);
+                } else {
+                    // Self-dispatch: send to the exchange itself so the close is
+                    // processed directly by handleDistributedPlaceMarketOrder without
+                    // a validator round-trip.  In sim mode execute() is a no-op, so
+                    // routing via DISTRIBUTED_PROXY_AGENT would silently drop the order.
+                    simulation()->dispatchMessage(
+                        simulation()->currentTimestamp(),
+                        Timestamp{},
+                        name(),
+                        name(),
+                        "DISTRIBUTED_PLACE_ORDER_MARKET",
+                        MessagePayload::create<DistributedAgentResponsePayload>(
+                            entry.agentId,
+                            pld));
+                }
+            });
+
+        using IdCounters = std::tuple<decltype(m_orderIdCounter), decltype(m_tradeIdCounter)>;
+        std::tie(m_orderIdCounter, m_tradeIdCounter) = [&] -> IdCounters {
+            if (!node.attribute("sharedQuoteBalances").as_bool()) {
+                return {nullptr, nullptr};
+            }
+            return {std::make_shared<OrderID>(), std::make_shared<TradeID>()};
+        }();
 
         for (BookId bookId{}; bookId < bookCount; ++bookId) {
-            auto book = std::make_shared<taosim::book::Book>(simulation(), bookId, maxDepth, detailedDepth);
+            auto book = std::make_shared<taosim::book::Book>(
+                simulation(), bookId, maxDepth, detailedDepth, m_orderIdCounter, m_tradeIdCounter);
             book->signals().orderCreated.connect(
                 [this](Order::Ptr order, OrderContext ctx) { orderCallback(order, ctx); });
             book->signals().orderLog.connect(
@@ -371,11 +493,22 @@ void MultiBookExchangeAgent::configure(const pugi::xml_node& node)
                         simulation()->currentTimestamp(),
                         order->price()
                     ));
+                    // Debit canceled volume from the SL/TP side store; no-op
+                    // for unflagged orders. Without this, fully-canceled
+                    // SLTP orders leak their orderInfo template forever.
+                    m_sltpContainer.onOrderCanceled(bookId, order->id(), volumeToCancel);
                 });
             book->signals().marketOrderProcessed.connect(
                 [this](MarketOrder::Ptr marketOrder, OrderContext ctx) {
                     marketOrderProcessedCallback(marketOrder, ctx);
                 });
+            // SL/TP price feed: project Book trade events to
+            // (bookId, latest price) and forward to the container.
+            m_sltpContainer.priceFeed(bookId) =
+                book->signals().trade.connect(
+                    [this, bookId](Trade::Ptr trade, BookId) {
+                        m_sltpContainer.onPriceUpdate(bookId, trade->price());
+                    });
             m_books.push_back(book);
             m_signals[bookId] = std::make_unique<ExchangeSignals>();
             const BookId bookIdCanon = simulation()->m_blockIdx * bookCount + bookId;
@@ -422,7 +555,7 @@ void MultiBookExchangeAgent::configure(const pugi::xml_node& node)
                     const fs::path path =
                         simulation()->logDir() / fmt::format("Replay-{}.log", bookIdCanon);
                     m_replayEventLoggers.push_back(
-                        std::make_unique<taosim::exchange::ReplayEventLogger>(
+                        std::make_unique<taosim::matching::ReplayEventLogger>(
                             path, startTimePoint, simulation()));
                 }
             }
@@ -478,7 +611,7 @@ void MultiBookExchangeAgent::configure(const pugi::xml_node& node)
                                 allocator);
                             balanceJson.AddMember(
                                 "quote",
-                                taosim::json::packedDecimal2json(bals.quote.getTotal(), allocator),
+                                taosim::json::packedDecimal2json(bals.quote->getTotal(), allocator),
                                 allocator);
                             balancesJson.PushBack(balanceJson, allocator);
                         }
@@ -588,23 +721,23 @@ void MultiBookExchangeAgent::jsonSerialize(
                 }
                 for (const taosim::book::TickContainer& bidLevel : book->buyQueue()) {
                     for (const auto& bid : bidLevel) {
-                        const auto [agentId, clientOrderId] = m_books[bookId]->orderToClientInfo().at(bid->id());
-                        const auto agentIdStr = std::to_string(agentId);
+                        const auto& ctx = m_books[bookId]->orderToClientInfo().at(bid->id());
+                        const auto agentIdStr = std::to_string(ctx.agentId);
                         const char* agentIdCStr = agentIdStr.c_str();
                         rapidjson::Document orderJson{&allocator};
                         bid->jsonSerialize(orderJson);
-                        taosim::json::setOptionalMember(orderJson, "clientOrderId", clientOrderId);
+                        taosim::json::setOptionalMember(orderJson, "clientOrderId", ctx.clientOrderId);
                         json[agentIdCStr]["orders"][bookId].PushBack(orderJson, allocator);
                     }
                 }
                 for (const taosim::book::TickContainer& askLevel : book->sellQueue()) {
                     for (const auto& ask : askLevel) {
-                        const auto [agentId, clientOrderId] = m_books[bookId]->orderToClientInfo().at(ask->id());
-                        const auto agentIdStr = std::to_string(agentId);
+                        const auto& ctx = m_books[bookId]->orderToClientInfo().at(ask->id());
+                        const auto agentIdStr = std::to_string(ctx.agentId);
                         const char* agentIdCStr = agentIdStr.c_str();
                         rapidjson::Document orderJson{&allocator};
                         ask->jsonSerialize(orderJson);
-                        taosim::json::setOptionalMember(orderJson, "clientOrderId", clientOrderId);
+                        taosim::json::setOptionalMember(orderJson, "clientOrderId", ctx.clientOrderId);
                         json[agentIdCStr]["orders"][bookId].PushBack(orderJson, allocator);
                     }
                 }
@@ -730,7 +863,9 @@ void MultiBookExchangeAgent::handleDistributedAgentReset(Message::Ptr msg)
                 const auto bookId = bookIdCanon % m_books.size();
                 acct.at(bookId) = taosim::accounting::Balances(taosim::accounting::BalancesDesc{
                     .base = taosim::accounting::Balance{taosim::json::getDecimal(balsMember.value["base"])},
-                    .quote = taosim::accounting::Balance{taosim::json::getDecimal(balsMember.value["quote"])},
+                    .quote = std::make_shared<taosim::accounting::Balance>(
+                        taosim::json::getDecimal(balsMember.value["quote"])
+                    ),
                     .roundParams = acct.at(bookId).m_roundParams
                 });
             }
@@ -796,7 +931,7 @@ void MultiBookExchangeAgent::handleDistributedAgentReset(Message::Ptr msg)
                             allocator);
                         balanceJson.AddMember(
                             "quote",
-                            taosim::json::packedDecimal2json(bals.quote.getTotal(), allocator),
+                            taosim::json::packedDecimal2json(bals.quote->getTotal(), allocator),
                             allocator);
                         balancesJson.AddMember(
                             rapidjson::Value{
@@ -854,19 +989,30 @@ void MultiBookExchangeAgent::handleDistributedPlaceMarketOrder(Message::Ptr msg)
 
     if (simulation()->debug()) {
         const auto& balances = simulation()->exchange()->accounts()[payload->agentId][subPayload->bookId];
-        simulation()->logDebug("{} | AGENT #{} BOOK {} : QUOTE : {}  BASE : {}", simulation()->currentTimestamp(), payload->agentId, simulation()->bookIdCanon(subPayload->bookId), balances.quote, balances.base);
+        simulation()->logDebug("{} | AGENT #{} BOOK {} : QUOTE : {}  BASE : {}", simulation()->currentTimestamp(), payload->agentId, simulation()->bookIdCanon(subPayload->bookId), *balances.quote, balances.base);
     }
     const auto orderResult = m_clearingManager->handleOrder(
-        taosim::exchange::MarketOrderDesc{
+        taosim::matching::MarketOrderDesc{
             .agentId = payload->agentId,
             .payload = subPayload
         });
     if (simulation()->debug()) {
         const auto& balances = simulation()->exchange()->accounts()[payload->agentId][subPayload->bookId];
-        simulation()->logDebug("{} | AGENT #{} BOOK {} : QUOTE : {}  BASE : {}", simulation()->currentTimestamp(), payload->agentId, simulation()->bookIdCanon(subPayload->bookId), balances.quote, balances.base);
+        simulation()->logDebug("{} | AGENT #{} BOOK {} : QUOTE : {}  BASE : {}", simulation()->currentTimestamp(), payload->agentId, simulation()->bookIdCanon(subPayload->bookId), *balances.quote, balances.base);
     }
 
     if (orderResult.ec != OrderErrorCode::VALID) {
+        if (subPayload->closeReason != 0) {
+            const auto& bals =
+                simulation()->exchange()->accounts()[payload->agentId][subPayload->bookId];
+            fmt::println("{} | SLTP CLOSE {} | AGENT #{} BOOK {} : "
+                "placement FAILED ({}) | volume={} freeBase={} freeQuote={}",
+                simulation()->currentTimestamp(),
+                subPayload->closeReason == 1 ? "SL" : "TP",
+                payload->agentId, simulation()->bookIdCanon(subPayload->bookId),
+                OrderErrorCode2StrView(orderResult.ec),
+                subPayload->volume, bals.base.getFree(), bals.quote->getFree());
+        }
         simulation()->logDebug(
             "Invalid Market Order Placement by Distributed Agent - {} : {}",
             orderResult.ec,
@@ -883,15 +1029,23 @@ void MultiBookExchangeAgent::handleDistributedPlaceMarketOrder(Message::Ptr msg)
                         OrderErrorCode2StrView(orderResult.ec).data()))));
     }
 
+    auto clientCtx = OrderClientContext(
+        payload->agentId, subPayload->clientOrderId, subPayload->delegate, subPayload->currency);
+    clientCtx.closeReason        = subPayload->closeReason;
+    clientCtx.originatingOrderId = subPayload->originatingOrderId;
     const auto order = m_books[subPayload->bookId]->placeMarketOrder(
-        OrderClientContext{payload->agentId, subPayload->clientOrderId},
+        std::move(clientCtx),
         msg->arrival,
         orderResult.orderSize,
         subPayload->direction,
         subPayload->leverage,
         subPayload->stpFlag,
         subPayload->settleFlag,
-        subPayload->currency);
+        subPayload->currency,
+        subPayload->maxSlippage,
+        subPayload->stopLoss,
+        subPayload->takeProfit,
+        subPayload->placeholder);
 
     if (simulation()->m_replayMode && !simulation()->isReplacedAgent(msg->source)) return;
 
@@ -927,16 +1081,16 @@ void MultiBookExchangeAgent::handleDistributedPlaceLimitOrder(Message::Ptr msg)
 
     if (simulation()->debug()) {
         const auto& balances = simulation()->exchange()->accounts()[payload->agentId][subPayload->bookId];
-        simulation()->logDebug("{} | AGENT #{} BOOK {} : QUOTE : {}  BASE : {}", simulation()->currentTimestamp(), payload->agentId, simulation()->bookIdCanon(subPayload->bookId), balances.quote, balances.base);
+        simulation()->logDebug("{} | AGENT #{} BOOK {} : QUOTE : {}  BASE : {}", simulation()->currentTimestamp(), payload->agentId, simulation()->bookIdCanon(subPayload->bookId), *balances.quote, balances.base);
     }
     const auto orderResult = m_clearingManager->handleOrder(
-        taosim::exchange::LimitOrderDesc{
+        taosim::matching::LimitOrderDesc{
             .agentId = payload->agentId,
             .payload = subPayload
         });
     if (simulation()->debug()) {
         const auto& balances = simulation()->exchange()->accounts()[payload->agentId][subPayload->bookId];
-        simulation()->logDebug("{} | AGENT #{} BOOK {} : QUOTE : {}  BASE : {}", simulation()->currentTimestamp(), payload->agentId, simulation()->bookIdCanon(subPayload->bookId), balances.quote, balances.base);
+        simulation()->logDebug("{} | AGENT #{} BOOK {} : QUOTE : {}  BASE : {}", simulation()->currentTimestamp(), payload->agentId, simulation()->bookIdCanon(subPayload->bookId), *balances.quote, balances.base);
     }
 
     if (orderResult.ec != OrderErrorCode::VALID) {
@@ -957,7 +1111,8 @@ void MultiBookExchangeAgent::handleDistributedPlaceLimitOrder(Message::Ptr msg)
     }
 
     const auto order = m_books[subPayload->bookId]->placeLimitOrder(
-        OrderClientContext{payload->agentId, subPayload->clientOrderId},
+        OrderClientContext(
+            payload->agentId, subPayload->clientOrderId, subPayload->delegate, subPayload->currency),
         msg->arrival,
         orderResult.orderSize,
         subPayload->direction,
@@ -968,7 +1123,10 @@ void MultiBookExchangeAgent::handleDistributedPlaceLimitOrder(Message::Ptr msg)
         subPayload->postOnly,
         subPayload->timeInForce,
         subPayload->expiryPeriod,
-        subPayload->currency);
+        subPayload->currency,
+        subPayload->stopLoss,
+        subPayload->takeProfit,
+        subPayload->placeholder);
 
     if (simulation()->m_replayMode && !simulation()->isReplacedAgent(msg->source)) return;
 
@@ -1230,17 +1388,17 @@ void MultiBookExchangeAgent::handleLocalPlaceMarketOrder(Message::Ptr msg)
     if (simulation()->debug()) {
         auto agentId = accounts().idBimap().left.at(msg->source);
         const auto& balances = simulation()->exchange()->accounts()[agentId][payload->bookId];
-        simulation()->logDebug("{} | AGENT #{} BOOK {} : QUOTE : {}  BASE : {}", simulation()->currentTimestamp(), agentId, simulation()->bookIdCanon(payload->bookId), balances.quote, balances.base);
+        simulation()->logDebug("{} | AGENT #{} BOOK {} : QUOTE : {}  BASE : {}", simulation()->currentTimestamp(), agentId, simulation()->bookIdCanon(payload->bookId), *balances.quote, balances.base);
     }
     const auto orderResult = m_clearingManager->handleOrder(
-        taosim::exchange::MarketOrderDesc{
+        taosim::matching::MarketOrderDesc{
             .agentId = msg->source,
             .payload = payload
         });
     if (simulation()->debug()) {
         auto agentId = accounts().idBimap().left.at(msg->source);
         const auto& balances = simulation()->exchange()->accounts()[agentId][payload->bookId];
-        simulation()->logDebug("{} | AGENT #{} BOOK {} : QUOTE : {}  BASE : {}", simulation()->currentTimestamp(), agentId, simulation()->bookIdCanon(payload->bookId), balances.quote, balances.base);
+        simulation()->logDebug("{} | AGENT #{} BOOK {} : QUOTE : {}  BASE : {}", simulation()->currentTimestamp(), agentId, simulation()->bookIdCanon(payload->bookId), *balances.quote, balances.base);
     }
     
     if (orderResult.ec != OrderErrorCode::VALID) {
@@ -1259,14 +1417,19 @@ void MultiBookExchangeAgent::handleLocalPlaceMarketOrder(Message::Ptr msg)
     }
 
     const auto order = m_books[payload->bookId]->placeMarketOrder(
-        OrderClientContext{accounts().idBimap().left.at(msg->source), payload->clientOrderId},
+        OrderClientContext(
+            accounts().idBimap().left.at(msg->source), payload->clientOrderId, payload->delegate, payload->currency),
         msg->arrival,
         orderResult.orderSize,
         payload->direction,
         payload->leverage,
         payload->stpFlag,
         payload->settleFlag,
-        payload->currency);
+        payload->currency,
+        payload->maxSlippage,
+        payload->stopLoss,
+        payload->takeProfit,
+        payload->placeholder);
 
     notifyMarketOrderSubscribers(order);
 
@@ -1299,17 +1462,17 @@ void MultiBookExchangeAgent::handleLocalPlaceLimitOrder(Message::Ptr msg)
     if (simulation()->debug()) {
         auto agentId = accounts().idBimap().left.at(msg->source);
         const auto& balances = simulation()->exchange()->accounts()[agentId][payload->bookId];
-        simulation()->logDebug("{} | AGENT #{} BOOK {} : QUOTE : {}  BASE : {}", simulation()->currentTimestamp(), agentId, simulation()->bookIdCanon(payload->bookId), balances.quote, balances.base);
+        simulation()->logDebug("{} | AGENT #{} BOOK {} : QUOTE : {}  BASE : {}", simulation()->currentTimestamp(), agentId, simulation()->bookIdCanon(payload->bookId), *balances.quote, balances.base);
     }
     const auto orderResult = m_clearingManager->handleOrder(
-        taosim::exchange::LimitOrderDesc{
+        taosim::matching::LimitOrderDesc{
             .agentId = msg->source,
             .payload = payload
         });
     if (simulation()->debug()) {
         auto agentId = accounts().idBimap().left.at(msg->source);
         const auto& balances = simulation()->exchange()->accounts()[agentId][payload->bookId];
-        simulation()->logDebug("{} | AGENT #{} BOOK {} : QUOTE : {}  BASE : {}", simulation()->currentTimestamp(), agentId, simulation()->bookIdCanon(payload->bookId), balances.quote, balances.base);
+        simulation()->logDebug("{} | AGENT #{} BOOK {} : QUOTE : {}  BASE : {}", simulation()->currentTimestamp(), agentId, simulation()->bookIdCanon(payload->bookId), *balances.quote, balances.base);
     }
 
     if (orderResult.ec != OrderErrorCode::VALID) {
@@ -1328,7 +1491,8 @@ void MultiBookExchangeAgent::handleLocalPlaceLimitOrder(Message::Ptr msg)
     }
 
     const auto order = m_books[payload->bookId]->placeLimitOrder(
-        OrderClientContext{accounts().idBimap().left.at(msg->source), payload->clientOrderId},
+        OrderClientContext(
+            accounts().idBimap().left.at(msg->source), payload->clientOrderId, payload->delegate, payload->currency),
         msg->arrival,
         orderResult.orderSize,
         payload->direction,
@@ -1339,7 +1503,10 @@ void MultiBookExchangeAgent::handleLocalPlaceLimitOrder(Message::Ptr msg)
         payload->postOnly,
         payload->timeInForce,
         payload->expiryPeriod,
-        payload->currency);
+        payload->currency,
+        payload->stopLoss,
+        payload->takeProfit,
+        payload->placeholder);
 
     notifyLimitOrderSubscribers(order);
 
@@ -1558,24 +1725,24 @@ void MultiBookExchangeAgent::handleLocalRetrieveL2(Message::Ptr msg)
         MessagePayload::create<RetrieveL2ResponsePayload>(
             simulation()->currentTimestamp(),
             book->buyQueue()
-                | views::reverse
-                | views::take(payload->depth)
-                | views::transform([](const auto& level) -> BookLevel {
-                    return {
-                        .price = level.price(),
-                        .quantity = level.volume()
-                    };
-                })
-                | ranges::to<std::vector>,
+            | views::reverse
+            | views::take(payload->depth)
+            | views::transform([](const auto& level) -> BookLevel {
+                return {
+                    .price = level.price(),
+                    .quantity = level.volume()
+                };
+            })
+            | ranges::to<std::vector>,
             book->sellQueue()
-                | views::take(payload->depth)
-                | views::transform([](const auto& level) -> BookLevel {
-                    return {
-                        .price = level.price(),
-                        .quantity = level.volume()
-                    };
-                })
-                | ranges::to<std::vector>,
+            | views::take(payload->depth)
+            | views::transform([](const auto& level) -> BookLevel {
+                return {
+                    .price = level.price(),
+                    .quantity = level.volume()
+                };
+            })
+            | ranges::to<std::vector>,
             book->id()));
 }
 
@@ -1665,6 +1832,7 @@ void MultiBookExchangeAgent::handleLocalTradeByOrderSubscription(Message::Ptr ms
 
 void MultiBookExchangeAgent::handleLocalUnknownMessage(Message::Ptr msg)
 {
+    if (msg->source == name()) { return; }
     fastRespondToMessage(
         msg,
         "ERROR",
@@ -1787,6 +1955,27 @@ void MultiBookExchangeAgent::notifyTradeSubscribersByOrderID(
 void MultiBookExchangeAgent::orderCallback(Order::Ptr order, OrderContext ctx)
 {
     accounts()[ctx.agentId].activeOrders()[ctx.bookId].insert(order);
+
+    // Snapshot SL/TP info into the container's side store at creation
+    // time. This covers aggressing market / marketable-limit orders that
+    // the book never retains, as well as resting limit orders. Looked up
+    // by orderId on each subsequent fill in tradeCallback.
+    if (order->hasSLTP()) {
+        m_sltpContainer.onOrderCreated({
+            .orderId = order->id(),
+            .bookId = ctx.bookId,
+            .agentId = ctx.agentId,
+            .clientCtx = OrderClientContext{
+                ctx.agentId, ctx.clientOrderId, {}, order->currency()},
+            .originatingSide = order->direction(),
+            .volume = order->volume(),
+            .leverage = order->leverage(),
+            .currency = order->currency(),
+            .stopLoss = order->stopLoss(),
+            .takeProfit = order->takeProfit(),
+            .placeholder = order->placeholder()
+        });
+    }
 }
 
 //-------------------------------------------------------------------------
@@ -1801,7 +1990,8 @@ void MultiBookExchangeAgent::orderLogCallback(Order::Ptr order, OrderContext ctx
 
 //-------------------------------------------------------------------------
 
-void MultiBookExchangeAgent::instructionLogCallback(const taosim::exchange::OrderDesc& orderDesc, OrderID orderId)
+void MultiBookExchangeAgent::instructionLogCallback(
+    const taosim::matching::OrderDesc& orderDesc, OrderID orderId)
 {
     std::visit([&](auto&& desc) {
         const auto& agentId = desc.agentId;
@@ -1829,33 +2019,38 @@ void MultiBookExchangeAgent::tradeCallback(Trade::Ptr trade, BookId bookId)
     const auto restingOrderId = trade->restingOrderID();
     const auto aggressingOrderId = trade->aggressingOrderID();
 
-    const auto [restingAgentId, restingClientOrderId] =
-        m_books[bookId]->orderToClientInfo().at(restingOrderId);
-    const auto [aggressingAgentId, aggressingClientOrderId] =
-        m_books[bookId]->orderToClientInfo().at(aggressingOrderId);
+    const auto& book = m_books.at(bookId);
 
-    const auto& fees = m_clearingManager->handleTrade(taosim::exchange::TradeDesc{
+    const auto restingClientInfo = book->orderToClientInfo().at(restingOrderId);
+    const auto aggressiveClientInfo = book->orderToClientInfo().at(aggressingOrderId);
+
+    const auto& fees = m_clearingManager->handleTrade(taosim::matching::TradeDesc{
         .bookId = bookId,
-        .restingAgentId = restingAgentId,
-        .aggressingAgentId = aggressingAgentId,
+        .restingAgentId = restingClientInfo.agentId,
+        .aggressingAgentId = aggressiveClientInfo.agentId,
         .trade = trade
     });
 
-    m_L3Record.at(bookId).push(taosim::event::TradeEvent(
-        trade, TradeContext(bookId, aggressingAgentId, restingAgentId, fees)));
+    auto tradeCtx = TradeContext(bookId, aggressiveClientInfo.agentId, restingClientInfo.agentId, fees);
+    tradeCtx.aggressingCloseReason        = aggressiveClientInfo.closeReason;
+    tradeCtx.aggressingOriginatingOrderId = aggressiveClientInfo.originatingOrderId;
+    m_L3Record.at(bookId).push(taosim::event::TradeEvent(trade, std::move(tradeCtx)));
 
-    auto tradeWithCtx = std::make_shared<TradeWithLogContext>(
-        trade,
-        std::make_shared<TradeLogContext>(aggressingAgentId, restingAgentId, bookId, fees));
+    auto logCtx = std::make_shared<TradeLogContext>(aggressiveClientInfo.agentId, restingClientInfo.agentId, bookId, fees);
+    logCtx->aggressingCloseReason        = aggressiveClientInfo.closeReason;
+    logCtx->aggressingOriginatingOrderId = aggressiveClientInfo.originatingOrderId;
+    auto tradeWithCtx = std::make_shared<TradeWithLogContext>(trade, logCtx);
 
     if (!simulation()->m_replayMode) {
         const Timestamp now = simulation()->currentTimestamp();
-        const std::array<std::pair<AgentId, std::optional<ClientOrderID>>, 2> idPairs{
-            std::pair{restingAgentId, restingClientOrderId},
-            std::pair{aggressingAgentId, aggressingClientOrderId}};
-        for (const auto [agentId, clientOrderId] : idPairs) {
-            const bool isLocalAgent = agentId < AgentId{};
-            if (isLocalAgent) continue;
+        struct ClientInfoWithOrderId { OrderClientContext ctx; OrderID orderId{}; };
+        const std::array<ClientInfoWithOrderId, 2> clientInfosWithOrderId{{
+            {.ctx = restingClientInfo, .orderId = restingOrderId},
+            {.ctx = aggressiveClientInfo, .orderId = aggressingOrderId}
+        }};
+        for (const auto& [ctx, orderId] : clientInfosWithOrderId) {
+            const bool isLocalAgent = ctx.agentId < AgentId{};
+            if (isLocalAgent) { continue; }
             simulation()->dispatchMessage(
                 now,
                 Timestamp{},
@@ -1863,10 +2058,41 @@ void MultiBookExchangeAgent::tradeCallback(Trade::Ptr trade, BookId bookId)
                 "DISTRIBUTED_PROXY_AGENT",
                 "EVENT_TRADE",
                 MessagePayload::create<DistributedAgentResponsePayload>(
-                    agentId,
+                    ctx.agentId,
                     MessagePayload::create<EventTradePayload>(
-                        *trade, *tradeWithCtx->logContext, bookId, clientOrderId)));
+                        *trade,
+                        *tradeWithCtx->logContext,
+                        bookId,
+                        ctx.clientOrderId,
+                        ctx.delegate,
+                        ctx.currency,
+                        ctx.agentId == restingClientInfo.agentId
+                    )));
         }
+    }
+
+    // Forward both sides of the fill to the SL/TP container. The container
+    // walks each agent's per-side FIFO unconditionally (so unflagged
+    // counter-trades still drain prior coverage), and only produces new
+    // triggers for the portion that grows the position on a flagged order.
+    const auto aggressingSide = trade->direction();
+    const auto restingSide = aggressingSide == OrderDirection::BUY
+        ? OrderDirection::SELL
+        : OrderDirection::BUY;
+    struct Side { OrderID orderId; AgentId agentId; OrderDirection side; };
+    const std::array<Side, 2> sides{{
+        {.orderId = restingOrderId, .agentId = restingClientInfo.agentId, .side = restingSide},
+        {.orderId = aggressingOrderId, .agentId = aggressiveClientInfo.agentId, .side = aggressingSide}
+    }};
+    for (const auto& s : sides) {
+        m_sltpContainer.onOrderTrade({
+            .bookId = bookId,
+            .originatingOrderId = s.orderId,
+            .agentId = s.agentId,
+            .side = s.side,
+            .fillPrice = trade->price(),
+            .filledVolume = trade->volume()
+        });
     }
 
     m_signals[bookId]->tradeLog(*tradeWithCtx);
@@ -1874,13 +2100,13 @@ void MultiBookExchangeAgent::tradeCallback(Trade::Ptr trade, BookId bookId)
         m_clearingManager->feePolicy(), 
         taosim::FeeLogEvent{
             .bookId = bookId,
-            .restingAgentId = restingAgentId,
-            .aggressingAgentId = aggressingAgentId,
+            .restingAgentId = restingClientInfo.agentId,
+            .aggressingAgentId = aggressiveClientInfo.agentId,
             .fees = fees,
             .price = trade->price(),
             .volume = trade->volume(),
-            .restingRatio = m_clearingManager->feePolicy()->makerTakerRatio(bookId, restingAgentId),
-            .aggressingRatio = m_clearingManager->feePolicy()->makerTakerRatio(bookId, aggressingAgentId)
+            .restingRatio = m_clearingManager->feePolicy()->makerTakerRatio(bookId, restingClientInfo.agentId),
+            .aggressingRatio = m_clearingManager->feePolicy()->makerTakerRatio(bookId, aggressiveClientInfo.agentId)
         }   
     );
 
@@ -1899,10 +2125,10 @@ void MultiBookExchangeAgent::unregisterLimitOrderCallback(LimitOrder::Ptr limitO
         if (balances.canFree(orderId)){
             if (limitOrder->direction() == OrderDirection::BUY) {
                 simulation()->logDebug("FREEING RESERVATION OF {} BASE + {} QUOTE for BUY order #{}", 
-                    balances.base.getReservation(orderId).value_or(0_dec), balances.quote.getReservation(orderId).value_or(0_dec), orderId);
+                    balances.base.getReservation(orderId).value_or(0_dec), balances.quote->getReservation(orderId).value_or(0_dec), orderId);
             } else {
                 simulation()->logDebug("FREEING RESERVATION OF {} BASE + {} QUOTE for SELL order #{}", 
-                    balances.base.getReservation(orderId).value_or(0_dec), balances.quote.getReservation(orderId).value_or(0_dec), orderId);
+                    balances.base.getReservation(orderId).value_or(0_dec), balances.quote->getReservation(orderId).value_or(0_dec), orderId);
             }
             return balances.freeReservation(orderId, limitOrder->price(),
                     m_books[bookId]->bestBid(), m_books[bookId]->bestAsk(), limitOrder->direction(), 
@@ -1924,22 +2150,22 @@ void MultiBookExchangeAgent::unregisterLimitOrderCallback(LimitOrder::Ptr limitO
             limitOrder->leverage() > 0_dec ? fmt::format("{}x{}",1_dec + limitOrder->leverage(),limitOrder->volume()) : fmt::format("{}",limitOrder->volume()),
             limitOrder->price(),
             freed.base, freed.quote,
-            balances.quote.getReserved(),
+            balances.quote->getReserved(),
             balances.base.getReserved());
     }
 
-    if (balances.quote.getReserved() < 0_dec) {
+    if (balances.quote->getReserved() < 0_dec) {
         throw std::runtime_error(fmt::format(
             "{} | AGENT #{} BOOK {} | {}: Reserved quote balance {} < 0 after unregistering order #{}", 
             simulation()->currentTimestamp(),
             agentId,
             simulation()->bookIdCanon(bookId), std::source_location::current().function_name(),
-            balances.quote.getReserved(), agentId, orderId));
+            balances.quote->getReserved(), agentId, orderId));
     }
     if (accounts()[agentId].activeOrders()[bookId].empty()) {
 
-        if (balances.quote.getReserved() > 0_dec){
-            for (const auto& res : balances.quote.getReservations()){
+        if (balances.quote->getReserved() > 0_dec){
+            for (const auto& res : balances.quote->getReservations()){
                 fmt::println("unregisterLimitOrderCallback | Releasing Quote residual reservation {} with no corresponding active order #{} in book #{}", 
                     res.second, res.first, simulation()->bookIdCanon(bookId));
                 // balances.releaseReservation(res.first, simulation()->bookIdCanon(bookId));

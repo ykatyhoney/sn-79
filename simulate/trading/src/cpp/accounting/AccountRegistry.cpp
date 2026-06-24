@@ -83,6 +83,21 @@ AgentId AccountRegistry::registerRemote(std::optional<Account> account) noexcept
 
 //-------------------------------------------------------------------------
 
+bool AccountRegistry::registerRemote(AgentId agentId, Account::Holdings holdings) noexcept
+{
+    if (m_accounts.contains(agentId)) return false;
+    m_accounts[agentId] = [&] {
+        Account acct;
+        acct.holdings() = std::move(holdings);
+        acct.activeOrders().resize(acct.holdings().size());
+        return acct;
+    }();
+    m_remoteIdCounter = std::max(m_remoteIdCounter, agentId + 1);
+    return true;
+}
+
+//-------------------------------------------------------------------------
+
 void AccountRegistry::registerJson(const rapidjson::Value& json)
 {
     for (const auto& member : json.GetObject()) {
@@ -96,7 +111,7 @@ void AccountRegistry::registerJson(const rapidjson::Value& json)
             m_accounts.at(agentId).at(bookId) = Balances::fromJson(balanceJson);
             fmt::println("AGENT #{} BOOK {} : RESTORED BALANCES : QUOTE {} | BASE {}",
                 agentId, bookId,
-                m_accounts.at(agentId).at(bookId).quote, m_accounts.at(agentId).at(bookId).base);
+                *m_accounts.at(agentId).at(bookId).quote, m_accounts.at(agentId).at(bookId).base);
         }
         if (agentId < 0) {
             m_localIdCounter = std::min(m_localIdCounter, agentId);

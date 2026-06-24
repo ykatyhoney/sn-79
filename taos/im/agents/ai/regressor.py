@@ -135,7 +135,8 @@ Output Directory : {self.output_dir}
         """
         validators = os.listdir(self.output_dir)
         for validator in validators:
-            if not is_valid_ss58_address(validator): continue
+            if not is_valid_ss58_address(validator):
+                continue
             pretrain_files = glob.glob(self.features_file(validator, '*'))
             for pretrain_file in pretrain_files:
                 book_id = os.path.basename(pretrain_file).split('.')[1]

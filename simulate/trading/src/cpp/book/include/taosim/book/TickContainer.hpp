@@ -37,6 +37,25 @@ public:
     [[nodiscard]] auto&& price(this auto&& self) noexcept { return self.m_price; }
     [[nodiscard]] auto&& volume(this auto&& self) noexcept { return self.m_volume; }
 
+    // NOTE: m_volume can retain rounding residue after ghost orders accumulate
+    // (push_back adds unrounded totalVolume, trades decrement rounded amounts).
+    // Checking orders directly is what makes bestBid/bestAsk skip fully-ghost levels
+    // and prevents the matching loop from dead-ending on a residue level (which
+    // would otherwise trigger the "no progress" fallback and cross the book).
+    [[nodiscard]] bool hasActiveOrders() const noexcept
+    {
+        return ranges::any_of(*this, [](auto&& order) { return order->volume() > 0_dec; });
+    }
+
+    [[nodiscard]] value_type getFirstActiveOrder() noexcept
+    {
+        auto it = ranges::find_if(*this, [](auto&& order) { return order->volume() > 0_dec; });
+        if (it == ranges::end(*this)) {
+            return nullptr;
+        }
+        return *it;
+    }
+
     void updateVolume(taosim::decimal_t deltaVolume) noexcept;
 
     bool operator<(const TickContainer& rhs) const noexcept { return m_price < rhs.price(); }
@@ -51,7 +70,7 @@ public:
 private:
     OrderContainer* m_orderContainer;
     taosim::decimal_t m_price;
-    taosim::decimal_t m_volume{};
+    taosim::decimal_t m_volume;
 };
 
 //-------------------------------------------------------------------------

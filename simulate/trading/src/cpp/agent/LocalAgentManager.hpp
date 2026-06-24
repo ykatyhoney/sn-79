@@ -4,8 +4,8 @@
  */
 #pragma once
 
+#include <taosim/agent/DistributedProxyAgent.hpp>
 #include "Agent.hpp"
-#include "DistributedProxyAgent.hpp"
 #include "LocalAgentRoster.hpp"
 #include "MultiBookExchangeAgent.hpp"
 #include "PythonAgent.hpp"
@@ -46,7 +46,7 @@ private:
 //-------------------------------------------------------------------------
 
 template<>
-void LocalAgentManager::createAgentInstanced<DistributedProxyAgent>(pugi::xml_node node);
+void LocalAgentManager::createAgentInstanced<taosim::agent::DistributedProxyAgent>(pugi::xml_node node);
 
 template<>
 void LocalAgentManager::createAgentInstanced<MultiBookExchangeAgent>(pugi::xml_node node);

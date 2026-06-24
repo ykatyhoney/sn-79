@@ -79,6 +79,8 @@ For the full mechanism, chain commitments, S3 layout, HTTP routes, the round-lif
 
 A **single designated validator** publishes the canonical checkpoint each round. This aggregator is operated by the MVTRX team during PoC and mainnet bring-up to keep the model lineage coherent. Other validators (*sibling validators*) score locally and submit aggregation proposals, but they do not need to publish checkpoints themselves; the aggregator evaluates all proposals and picks the best delta.
 
+> **For all other operators:** run in **sibling** mode (`run_validator.sh -G` / `--no-is-aggregator` / `run_gradients.sh -m sibling`). Aggregator mode is reserved for the MVTRX team's uid-0 validator; running an additional aggregator from a non-uid-0 host would not be picked up by the rest of the subnet and would waste GPU resources.
+
 See [`validator_setup.md`](validator_setup.md) for the UID configuration.
 
 ### Scoring and weights

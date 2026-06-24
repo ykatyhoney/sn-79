@@ -4,7 +4,7 @@
  */
 #pragma once
 
-#include <taosim/exchange/Fees.hpp>
+#include <taosim/matching/Fees.hpp>
 #include "JsonSerializable.hpp"
 #include "Order.hpp"
 #include "Timestamp.hpp"
@@ -86,7 +86,10 @@ struct TradeContext : public JsonSerializable
     BookId bookId;
     AgentId aggressingAgentId;
     AgentId restingAgentId;
-    taosim::exchange::Fees fees;
+    taosim::matching::Fees fees;
+    // SL/TP close metadata — 0/0 for regular orders.
+    uint8_t aggressingCloseReason{0};   // 0=none, 1=SL, 2=TP
+    OrderID aggressingOriginatingOrderId{0};
 
     TradeContext() = default;
 
@@ -94,7 +97,7 @@ struct TradeContext : public JsonSerializable
         BookId bookId,
         AgentId aggressingAgentId,
         AgentId restingAgentId,
-        taosim::exchange::Fees fees) noexcept
+        taosim::matching::Fees fees) noexcept
         : bookId{bookId},
           aggressingAgentId{aggressingAgentId},
           restingAgentId{restingAgentId},
@@ -118,7 +121,10 @@ struct TradeLogContext : public JsonSerializable
     AgentId aggressingAgentId;
     AgentId restingAgentId;
     BookId bookId;
-    taosim::exchange::Fees fees;
+    taosim::matching::Fees fees;
+    // SL/TP close metadata — 0/0 for regular orders.
+    uint8_t aggressingCloseReason{0};   // 0=none, 1=SL, 2=TP
+    OrderID aggressingOriginatingOrderId{0};
 
     TradeLogContext() noexcept = default;
 
@@ -126,7 +132,7 @@ struct TradeLogContext : public JsonSerializable
         AgentId aggressingAgentId,
         AgentId restingAgentId,
         BookId bookId,
-        taosim::exchange::Fees fees) noexcept
+        taosim::matching::Fees fees) noexcept
         : aggressingAgentId{aggressingAgentId},
           restingAgentId{restingAgentId},
           bookId{bookId},

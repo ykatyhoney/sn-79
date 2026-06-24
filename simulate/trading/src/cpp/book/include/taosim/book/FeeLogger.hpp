@@ -5,8 +5,8 @@
 #pragma once
 
 #include <taosim/logging/RotatingLoggerBase.hpp>
-#include <taosim/exchange/FeePolicyWrapper.hpp>
-#include <taosim/exchange/ExchangeSignals.hpp>
+#include <taosim/matching/FeePolicyWrapper.hpp>
+#include <taosim/matching/ExchangeSignals.hpp>
 #include "FeeLogEvent.hpp"
 
 //-------------------------------------------------------------------------
@@ -26,14 +26,14 @@ public:
     FeeLogger(
         const fs::path& filepath,
         std::chrono::system_clock::time_point startTimePoint,
-        decltype(exchange::ExchangeSignals::feeLog)& signal,
+        decltype(matching::ExchangeSignals::feeLog)& signal,
         Simulation* simulation) noexcept;
 
     static constexpr std::string_view s_header =
         "Date,Time,AgentId,Role,Fee,FeeRate,Price,Volume,FeeRatio";
 
 private:
-    void log(const exchange::FeePolicyWrapper* feePolicyWrapper, const FeeLogEvent& event);
+    void log(const matching::FeePolicyWrapper* feePolicyWrapper, const FeeLogEvent& event);
     
     bs2::scoped_connection m_feed;
 };

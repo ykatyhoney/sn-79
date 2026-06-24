@@ -73,7 +73,7 @@ class BaseMinerNeuron(BaseNeuron):
         self.axon = bt.Axon(wallet=self.wallet, config=self.config, ip=self.config.axon.ip, port=self.config.axon.port, external_ip=self.config.axon.external_ip, external_port=self.config.axon.external_port)
 
         # Attach determiners which functions are called when servicing a request.
-        bt.logging.info(f"Attaching forward function to miner axon.")
+        bt.logging.info("Attaching forward function to miner axon.")
         self.axon.attach(
             forward_fn=self.forward,
             blacklist_fn=self.blacklist_forward,
@@ -185,17 +185,22 @@ class BaseMinerNeuron(BaseNeuron):
 
         Otherwise, allow the request to be processed further.
         """
-        uid = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
-        if (
-            not self.config.blacklist.allow_non_registered
-            and synapse.dendrite.hotkey not in self.metagraph.hotkeys
-        ):
-            # Ignore requests from un-registered entities.
+        if synapse.dendrite.hotkey not in self.metagraph.hotkeys:
+            # Unregistered hotkey: there is no uid / validator_permit to look up,
+            # so the membership test MUST come before metagraph.hotkeys.index()
+            # (which would otherwise raise ValueError on an unknown hotkey).
+            if not self.config.blacklist.allow_non_registered:
+                # Ignore requests from un-registered entities.
+                bt.logging.trace(
+                    f"Blacklisting un-registered hotkey {synapse.dendrite.hotkey}"
+                )
+                return True, "Unrecognized hotkey"
             bt.logging.trace(
-                f"Blacklisting un-registered hotkey {synapse.dendrite.hotkey}"
+                f"Not Blacklisting un-registered hotkey {synapse.dendrite.hotkey} (allow_non_registered)"
             )
-            return True, "Unrecognized hotkey"
+            return False, "Hotkey recognized!"
 
+        uid = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
         if not self.config.blacklist.allow_non_validators:
             # If the config is set to force validator permit, then we should only allow requests from validators.
             if not self.metagraph.validator_permit[uid]:
@@ -313,7 +318,7 @@ class BaseMinerNeuron(BaseNeuron):
             exit()
 
         # In case of unforeseen errors, the miner will log the error and continue operations.
-        except Exception as e:
+        except Exception:
             bt.logging.error(traceback.format_exc())
 
     def run_in_background_thread(self):

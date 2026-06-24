@@ -25,7 +25,8 @@ def triggerPagerDutyIncident(integration_keys, source, group, event_class, msg, 
     if integration_keys and len(integration_keys) > 0:
         bt.logging.error(msg)
         for integration_key in integration_keys:
-            if integration_key is None: continue
+            if integration_key is None:
+                continue
             try:
                 data={
                     'routing_key': integration_key,
@@ -56,7 +57,8 @@ def resolvePagerDutyIncident(integration_keys, source, dedup_key):
     """
     if integration_keys and len(integration_keys) > 0:
         for integration_key in integration_keys:
-            if integration_key is None: continue
+            if integration_key is None:
+                continue
             try:
                 data={
                     'routing_key': integration_key,

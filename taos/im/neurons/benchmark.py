@@ -28,7 +28,8 @@ validator-assigned UID (>= 256), bypassing on-chain registration.
 # memory per round. Re-exec once with MALLOC_ARENA_MAX set so glibc sees it
 # before allocating any arenas. Only triggers on direct script execution.
 if __name__ == "__main__":
-    import os, sys
+    import os
+    import sys
     if os.environ.get("MALLOC_ARENA_MAX") is None:
         os.environ["MALLOC_ARENA_MAX"] = "2"
         os.execvp(sys.executable, [sys.executable] + sys.argv)
@@ -45,7 +46,6 @@ if __name__ != "__mp_main__":
 
     from taos.common.neurons import BaseNeuron
     from taos.im.neurons.miner import Miner
-    from taos.common.config import add_miner_args
 
     class BenchmarkMiner(Miner):
         """
@@ -155,7 +155,7 @@ if __name__ != "__mp_main__":
             self.axon = bt.Axon(wallet=self.wallet, config=self.config, ip=self.config.axon.ip, port=self.config.axon.port, external_ip=self.config.axon.external_ip, external_port=self.config.axon.external_port)
 
             # Attach determiners which functions are called when servicing a request.
-            bt.logging.info(f"Attaching forward function to miner axon.")
+            bt.logging.info("Attaching forward function to miner axon.")
             self.axon.attach(
                 forward_fn=self.forward,
                 blacklist_fn=self.blacklist_forward,
@@ -164,12 +164,16 @@ if __name__ != "__mp_main__":
                 forward_fn=self.update,
                 blacklist_fn=self.blacklist_update,
                 priority_fn=self.priority_update,
+            ).attach(
+                forward_fn=self.forward_exchange,
+                blacklist_fn=self.blacklist_forward_exchange,
+                priority_fn=self.priority_forward_exchange,
             )
             # Attach GenTRX assignment handler (inherited from Miner).
             # Benchmark miners participate in GenTRX training when
             # GENTRX_AGENT_S3_* env vars are set; handler is a no-op otherwise.
             try:
-                from taos.im.protocol.gentrx import GenTRXAssignment
+                from taos.im.protocol.gentrx import GenTRXAssignment  # noqa: F401  (import is the GenTRX-installed probe)
                 self.axon.attach(
                     forward_fn=self.forward_gentrx_assignment,
                     blacklist_fn=self.blacklist_gentrx_assignment,
@@ -264,7 +268,7 @@ if __name__ != "__mp_main__":
                 exit()
 
             # In case of unforeseen errors, the miner will log the error and continue operations.
-            except Exception as e:
+            except Exception:
                 bt.logging.error(traceback.format_exc())
 
 

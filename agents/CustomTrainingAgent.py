@@ -26,8 +26,6 @@ The data schema written by collect_row() is defined in
 GenTRX/src/util/schema.py (order_stream_schema).
 """
 
-from __future__ import annotations
-
 from pathlib import Path
 from typing import Any
 
@@ -290,3 +288,14 @@ class CustomTrainingAgent(GenTRXAgent):
         )
 
         self._gtx.train_window_id += 1
+
+
+if __name__ == "__main__":
+    """
+    Example launch (paired with the local proxy/simulator in agents/proxy):
+
+        python CustomTrainingAgent.py --port 8888 --agent_id 0 \
+            --params gtx_training_enabled=true gtx_collect_data=true
+    """
+    from taos.common.agents import launch
+    launch(CustomTrainingAgent)

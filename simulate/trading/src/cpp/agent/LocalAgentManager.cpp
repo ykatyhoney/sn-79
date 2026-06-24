@@ -33,7 +33,7 @@ void LocalAgentManager::createAgentsInstanced(
             createAgentInstanced<MultiBookExchangeAgent>(child);
         }
         else if (name == "DistributedProxyAgent") {
-            createAgentInstanced<DistributedProxyAgent>(child);
+            createAgentInstanced<taosim::agent::DistributedProxyAgent>(child);
         }
         else if (name == "StylizedTraderAgent") {
             createAgentInstanced<taosim::agent::StylizedTraderAgent>(child);
@@ -104,10 +104,10 @@ void LocalAgentManager::createAgentInstanced(pugi::xml_node node)
 //-------------------------------------------------------------------------
 
 template<>
-void LocalAgentManager::createAgentInstanced<DistributedProxyAgent>(pugi::xml_node node)
+void LocalAgentManager::createAgentInstanced<taosim::agent::DistributedProxyAgent>(pugi::xml_node node)
 {
     m_agents.push_back([this, node] {
-        auto agent = std::make_unique<DistributedProxyAgent>(m_simulation);
+        auto agent = std::make_unique<taosim::agent::DistributedProxyAgent>(m_simulation);
         agent->configure(node);
         m_simulation->m_proxy = agent.get();
         return agent;

@@ -573,7 +573,7 @@ void StylizedTraderAgent::placeOrderChiarella(BookId bookId)
     const auto freeBase =
         taosim::util::decimal2double(simulation()->account(name()).at(bookId).base.getFree());
     const auto freeQuote =
-        taosim::util::decimal2double(simulation()->account(name()).at(bookId).quote.getFree());
+        taosim::util::decimal2double(simulation()->account(name()).at(bookId).quote->getFree());
 
     if (m_riskAversion * forecastResult.varianceOfLastLogReturns == 0.0) {
         // ERROR recovery rebalance in order to keep things flowing

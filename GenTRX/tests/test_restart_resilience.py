@@ -8,7 +8,6 @@ of either is "unknown lineage" and the default is preserve.
 Run: pytest GenTRX/tests/test_restart_resilience.py -v
 """
 
-import pytest
 
 
 def _make_aggregator(tmp_path, validator_store=None):

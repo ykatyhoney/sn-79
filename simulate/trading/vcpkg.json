@@ -13,6 +13,7 @@
         "boost-signals2",
         "boost-uuid",
         "cli11",
+        "cnl",
         "date",
         "eigen3",
         "fmt",
@@ -20,12 +21,14 @@
         "magic-enum",
         "mimalloc",
         "msgpack",
+        "parallel-hashmap",
         "pugixml",
         "pybind11",
         "range-v3",
         "rapidcsv",
         "rapidjson",
-        "spdlog"
+        "spdlog",
+        "tbb"
     ],
     "builtin-baseline": "e140b1fde236eb682b0d47f905e65008a191800f",
     "overrides": [

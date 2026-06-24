@@ -1,4 +1,5 @@
 file(GLOB agent_sources CONFIGURE_DEPENDS "*.cpp")
+
 add_library(agent STATIC ${agent_sources})
 add_library(taosim::agent ALIAS agent)
 
@@ -16,6 +17,8 @@ target_include_directories(agent
         "${SRC_DIR}/serialization"
 )
 
+find_package(TBB REQUIRED)
+
 target_link_libraries(agent
     PUBLIC
         pugixml::static pugixml::pugixml
@@ -24,6 +27,7 @@ target_link_libraries(agent
         taosim::event
         taosim::exchange
         taosim::message
+        taosim::net
         taosim::process
         taosim::replay
         taosim::simulation
@@ -32,4 +36,5 @@ target_link_libraries(agent
         Eigen3::Eigen
         date::date
         pybind11::embed
+        TBB::tbb
 )

@@ -6,7 +6,6 @@ operational settings via the SubnetInfoRuntimeApi.
 """
 from bittensor import Subtensor
 from dataclasses import dataclass
-from bittensor.utils.balance import fixed_to_float
 from bittensor.core.chain_data.info_base import InfoBase
 from typing import Optional, Union
 

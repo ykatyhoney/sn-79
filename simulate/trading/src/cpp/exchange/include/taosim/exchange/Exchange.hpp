@@ -4,7 +4,7 @@
  */
 #pragma once
 
-#include <taosim/exchange/ClearingManager.hpp>
+#include <taosim/matching/ClearingManager.hpp>
 #include "Simulation.hpp"
 
 //-------------------------------------------------------------------------

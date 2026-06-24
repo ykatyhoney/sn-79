@@ -14,13 +14,6 @@ import bittensor as bt
 from pathlib import Path
 from threading import Thread
 import traceback
-
-# Ensure GenTRX service logs are visible (uses standard Python logging)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
 import posix_ipc
 import mmap
 import msgpack
@@ -37,6 +30,23 @@ from taos.im.validator.reward import set_delays
 
 from ypyjson import YpyObject
 import xml.etree.ElementTree as ET
+
+# Ensure GenTRX service logs are visible (uses standard Python logging)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+
+_MVTRX_DATA_SERVICE_URL = os.environ.get("MVTRX_DATA_SERVICE_URL", "")
+
+async def _push_proxy_state_to_mvtrx(state, block: int) -> None:
+    """Delegate to the optional data-service push module when present."""
+    try:
+        from agents.proxy.mvtrx_push import push_proxy_state as _push
+    except ImportError:
+        return
+    await _push(state, block, _MVTRX_DATA_SERVICE_URL)
 
 # GenTRX integration — StatePackager + assignment fetch via GenTRXService
 try:
@@ -71,7 +81,8 @@ class Proxy(Validator):
         self.agent_urls = {}
         port = launcher_config['agents']['start_port']
         for agent, agent_configs in launcher_config['agents'].items():
-            if agent in ['start_port', 'path']: continue
+            if agent in ['start_port', 'path']:
+                continue
             for agent_config in agent_configs:
                 base_agent_name = f"{agent}_{'_'.join(list([str(a) for a in agent_config['params'].values()]))}"
                 for i in range(agent_config['count']):
@@ -117,6 +128,12 @@ class Proxy(Validator):
         self.xml_config = ET.parse(self.simulator_config_file).getroot()
         self.simulation = MarketSimulationConfig.from_xml(self.xml_config)
 
+    def compress_outputs(self, start: bool = False) -> None:
+        """No-op for the local proxy harness. The production validator's
+        log-archive + disk-cleanup loop lives on SimulationEngine; the proxy
+        runs locally where disk hygiene isn't a concern, so skip it."""
+        pass
+
     def seed(self) -> None:
         """
         Generates simulator seed data with improved error handling and non-blocking restarts.
@@ -155,7 +172,7 @@ class Proxy(Validator):
         bt.logging.info("-"*40)
 
     async def handle_state(self, message : dict, state : MarketSimulationStateUpdate, receive_start : int) -> dict:
-        start = time.time()
+        time.time()
         state.version = __spec_version__
         state.dendrite.hotkey = 'proxy'
         if not self.start_time:
@@ -188,7 +205,7 @@ class Proxy(Validator):
                     response_time = time.time() - start
                     bt.logging.success(f"{agent} | Response : {response} ({response_time}s)")
                 return uid, agent, response, response_time
-            except asyncio.exceptions.TimeoutError as e:
+            except asyncio.exceptions.TimeoutError:
                 bt.logging.error(f"{agent} | Timed out after {self.config.neuron.timeout}s while awaiting response from {url}.")
                 return uid, agent, None, response_time
             except Exception as e:
@@ -217,13 +234,15 @@ class Proxy(Validator):
                     bt.logging.error(f"{agent} | Failed to validate response : {e}")
         agent_responses = set_delays(self, synapse_responses)
         simulator_response = SimulatorResponseBatch(agent_responses).serialize()
+        block_time_ns = getattr(getattr(self, 'simulation', None), 'block_time_ns', 12_000_000_000) or 12_000_000_000
+        asyncio.create_task(_push_proxy_state_to_mvtrx(state, state.timestamp // block_time_ns))
         bt.logging.info(f"State update handled ({time.time()-receive_start}s)")
         return simulator_response
 
     async def _deliver_gentrx_assignments(self, assignments: dict) -> None:
         """Deliver GenTRX assignments to agents via HTTP POST."""
         async with aiohttp.ClientSession() as sess:
-            for uid, (agent, agent_url) in enumerate(self.agent_urls.items()):
+            for uid, (_agent, agent_url) in enumerate(self.agent_urls.items()):
                 if uid in assignments:
                     assign_url = agent_url.replace("/handle", "/gentrx/assignment")
                     try:
@@ -240,7 +259,7 @@ class Proxy(Validator):
         def receive(mq_req) -> dict:
             msg, priority = mq_req.receive()
             receive_start = time.time()
-            bt.logging.info(f"Received state update from simulator (msgpack)")
+            bt.logging.info("Received state update from simulator (msgpack)")
             byte_size_req = int.from_bytes(msg, byteorder="little")
             shm_req = posix_ipc.SharedMemory("/state")
             start = time.time()
@@ -299,7 +318,7 @@ class Proxy(Validator):
                 message, receive_start = receive(mq_req)
                 state = MarketSimulationStateUpdate.parse_dict(message)
                 response = await self.handle_state(message, state, receive_start)
-            except Exception as ex:
+            except Exception:
                 traceback.print_exc()
             finally:
                 respond(response)
@@ -310,10 +329,10 @@ class Proxy(Validator):
         try:
             asyncio.run(self._listen())
         except KeyboardInterrupt:
-            print("Listening stopped by user.")
+            bt.logging.info("Listening stopped by user.")
 
     async def orderbook(self, request : Request):
-        start = time.time()
+        time.time()
         body = await request.body()
         message = YpyObject(body, 1)
         state = MarketSimulationStateUpdate.from_ypy(message) # Populate synapse class from request data
@@ -331,7 +350,13 @@ class Proxy(Validator):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default="config.json")
+    parser.add_argument('--data-service-url', type=str, default=None,
+                        help="Base URL of the MVTRX Data Service for ingest push.")
     args = parser.parse_args()
+
+    if args.data_service_url is not None:
+        _MVTRX_DATA_SERVICE_URL = args.data_service_url
+
     config = json.load(open(args.config))
     app = FastAPI()
     proxy = Proxy(config)

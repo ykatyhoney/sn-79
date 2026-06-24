@@ -91,7 +91,7 @@ class DiscordNotifier:
     def send_notification(
         self,
         content: str,
-        username: str = "algorithm_0",
+        username: str = "reveng_1",
         bypass_rate_limit: bool = False,
     ) -> bool:
         """POST a plain-text message to the webhook.
@@ -125,6 +125,48 @@ class DiscordNotifier:
             bt.logging.error(f"Failed to send Discord notification: {e}")
             return False
 
+    def send_embed(
+        self,
+        title: str,
+        description: str,
+        color: int = 0x1A56FF,
+        thumbnail_url: Optional[str] = None,
+        username: str = "reveng_1",
+    ) -> bool:
+        """Send a rich embed notification to the Discord webhook.
+
+        Args:
+            title: Embed title text.
+            description: Embed body text.
+            color: Sidebar accent colour as an integer (default: MVTRX blue).
+            thumbnail_url: Optional URL for a thumbnail image.
+            username: Bot display name.
+
+        Returns:
+            True on HTTP 204 (success), False otherwise.
+        """
+        if not self.enabled or not self.webhook_url:
+            return False
+
+        embed: dict = {"title": title, "description": description, "color": color}
+        if thumbnail_url:
+            embed["thumbnail"] = {"url": thumbnail_url}
+
+        try:
+            response = requests.post(
+                self.webhook_url,
+                json={"username": username, "embeds": [embed]},
+                timeout=5,
+            )
+            if response.status_code == 204:
+                self.last_notification_time = time.time()
+                return True
+            bt.logging.warning(f"Discord embed webhook returned status {response.status_code}")
+            return False
+        except Exception as e:
+            bt.logging.error(f"Failed to send Discord embed: {e}")
+            return False
+
     def add_trade(
         self,
         action: str,
@@ -151,9 +193,11 @@ class DiscordNotifier:
     def flush_trades(self) -> bool:
         """Send all pending trades, splitting into multiple messages if needed.
 
-        Discord enforces a 2000-character limit per message.  Lines are packed
-        greedily and excess lines spill into a new batch.  Batches are delivered
-        sequentially with a short inter-batch pause.
+        Each batch is wrapped in a fenced code block so columns stay aligned
+        in monospace across all Discord clients.  Discord enforces a 2000-
+        character limit per message; lines are packed greedily and excess lines
+        spill into a new batch.  Batches are delivered sequentially with a
+        short inter-batch pause.
 
         Returns:
             True if every batch was delivered successfully, False if any failed.
@@ -161,13 +205,15 @@ class DiscordNotifier:
         if not self.pending_trades:
             return True
 
+        # Discord has a 2000 character limit per message
         MAX_CHARS = 2000
         batches: list[str] = []
         current_lines: list[str] = []
         current_len = 0
 
         for line in self.pending_trades:
-            line_len = len(line) + 1  # +1 for the joining newline
+            line_len = len(line) + 1  # +1 for joining newline
+            # If adding this line would exceed limit, start a new batch
             if current_len + line_len > MAX_CHARS and current_lines:
                 batches.append("\n".join(current_lines))
                 current_lines = [line]
@@ -176,19 +222,27 @@ class DiscordNotifier:
                 current_lines.append(line)
                 current_len += line_len
 
+        # Add remaining lines
         if current_lines:
             batches.append("\n".join(current_lines))
 
+        # Clear pending trades
         self.pending_trades.clear()
 
+        # Send all batches
         all_success = True
         for i, batch in enumerate(batches):
-            success = self.send_notification(batch, bypass_rate_limit=True)
+            # Wrap in code block for monospace alignment across all Discord clients
+            content = f"```\n{batch}\n```"
+            # Bypass rate limit for batched messages (we control the delay)
+            success = self.send_notification(content, bypass_rate_limit=True)
             if not success:
                 all_success = False
                 bt.logging.warning(f"Failed to send Discord batch {i + 1}/{len(batches)}")
             elif i < len(batches) - 1:
-                time.sleep(0.5)  # Brief pause to respect Discord's own rate limits
+                # Small delay between batches to avoid Discord's own rate limiting
+                # Only sleep if not the last batch
+                time.sleep(0.5)
 
         return all_success
 
@@ -201,29 +255,39 @@ class DiscordNotifier:
         quantity: float,
         price: float,
     ) -> str:
-        """Format a single trade as a fixed-width one-liner.
+        """Format a single trade as a fixed-width pipe-separated one-liner.
 
-        Example::
+        Intended to be rendered inside a ``` code block so columns stay aligned.
 
-            🟢 BUY  [2025-02-12 14:23:15] SIM #5/64    10.50@285.45
-            🔴 SELL [2025-02-12 14:23:18] SIM #41/64    8.25@142.78
+        Example output (inside the block)::
+
+            ▲ BUY  | 2026-02-27 12:00:43 | SimBook  #9 |    2.00 @    313.29
+            ▼ SELL | 2026-02-27 12:00:45 | SimBook #41 |    8.25 @    142.78
+
+        Symbol convention:
+            ▲  up arrow   = BUY
+            ▼  down arrow = SELL
 
         Args:
             action: ``"BUY"`` or ``"SELL"``.
             book_id: Zero-based book identifier.
-            total_books: Total books in the simulation.
+            total_books: Total books in the simulation (unused; kept for
+                signature compatibility).
             direction: ``OrderDirection`` enum value (unused directly; ``action``
-                string drives the emoji).
+                string drives the arrow symbol).
             quantity: Order size in base units.
-            price: Execution price.
+            price: Execution price (typically the current mid-quote).
 
         Returns:
-            A single formatted string suitable for Discord plain-text output.
+            A single formatted string suitable for pasting into a ``` block.
         """
-        emoji = "🟢" if "BUY" in action else "🔴"
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        book_display = f"SIM #{book_id + 1}/{total_books}"
-        return f"{emoji} {action:<12} [{timestamp}] {book_display:<10} {quantity:.2f}@{price:.2f}"
+        symbol = "▲" if "BUY" in action else "▼"
+        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        # Pad book number so column width is stable up to 3-digit book IDs
+        book_display = f"SimBook #{book_id + 1:>3}"
+        # Right-align quantity (up to 6 chars before decimal) and price
+        trade_str = f"{quantity:>7.2f} @ {price:>9.2f}"
+        return f"{symbol} {action:<4} | {timestamp} | {book_display} | {trade_str}"
 
 
 # ---------------------------------------------------------------------------
@@ -448,13 +512,17 @@ class AgentDataStorage:
             sampling_interval: Bucket width in nanoseconds.
             samples: Maximum number of buckets to retain.
         """
+        # Categorize trade volume as HIGH or LOW
         category = VolumeCategory.HIGH if volume > category_threshold else VolumeCategory.LOW
 
+        # Create new entry if none exist or sampling interval has elapsed
         if not self.predictors or (timestamp - self.predictors[-1].timestamp) > sampling_interval:
             self.append_predictor(PredictorEntry(timestamp=timestamp))
 
         self.update_last_predictor(volume, direction, category)
 
+        # Maintain rolling window size by pruning oldest entries
+        # NOTE: caveat if there is no new predictors old ones are used!
         while len(self.predictors) > samples:
             self.predictors.pop(0)
 
@@ -657,6 +725,7 @@ def ask_trial(study: Study) -> tuple[Trial, HyperParams]:
         sampled hyperparameter values.
     """
     trial = study.ask()
+    # NOTE: use numbers for importance
     hp = HyperParams(
         sampling_interval=trial.suggest_int("sampling_interval", int(10e9), int(400e9), step=int(1e9)),
         model_threshold=trial.suggest_float("model_threshold", 0.0, 0.99, step=0.01),
@@ -714,6 +783,10 @@ class RevengAgent(GenTRXAgent):
     each book into a momentum or mean-reversion regime.  Hyperparameters are
     continuously self-optimised via an Optuna ask-tell loop.  Optional Discord
     webhook notifications report non-emergency trades in real time.
+
+    Works in both simulation and exchange mode without modification.
+    In exchange mode, predictor signals are inactive (no book event logs) so the
+    agent operates via emergency trades until the predictor window fills.
     """
 
     def __init__(self, uid, config, log_dir=None):
@@ -740,24 +813,26 @@ class RevengAgent(GenTRXAgent):
         super().initialize()
         bt.logging.set_info()
 
-        # Build default trading params, then apply any config-level overrides
+        # Set default parameters and override with user inputs
+        # NOTE: per validator needed, save init values here
         self.init_tparams = TradingParameters()
         for k, v in self.init_tparams.__dict__.items():
             if hasattr(self.config, k):
                 setattr(self.init_tparams, k, type(v)(getattr(self.config, k)))
 
-        self.tparams: dict[str, TradingParameters] = {}   # per-validator params
-        self.studies: dict[str, StudyParams] = {}          # per-validator Optuna studies
+        # NOTE: per validator params
+        self.tparams: dict[str, TradingParameters] = {}
+        self.studies: dict[str, StudyParams] = {}
         self.opt_interval: int = getattr(self.config, "opt_interval", int(10 * 60e9))
 
-        # buffers[validator_hotkey][book_id] -> AgentDataStorage
+        # Internal state storage: buffers[validator_hotkey][book_id] → AgentDataStorage
         self.buffers: dict[str, dict[int, AgentDataStorage]] = {}
 
-        # Only observe trades from other agents; exclude our own fills from signals
+        # Filter to only process trades from other agents (exclude own trades)
         agent_range = getattr(self.config, "agent_range", 256)
         self.filter_range = [i for i in range(agent_range) if i != self.uid]
 
-        # Discord notifier setup
+        # Discord notification setup
         self.discord = DiscordNotifier(
             webhook_url=getattr(self.config, "discord_webhook_url", None),
             enabled=bool(getattr(self.config, "discord_enabled", False)),
@@ -766,10 +841,19 @@ class RevengAgent(GenTRXAgent):
         )
         if self.discord.enabled:
             if self.discord.webhook_url:
-                bt.logging.info(f"Discord enabled (rate limit: {self.discord.rate_limit_seconds}s)")
+                bt.logging.info(f"Discord notifications enabled (rate limit: {self.discord.rate_limit_seconds}s)")
                 if self.discord.target_validator:
-                    bt.logging.info(f"Discord filter: {self.discord.target_validator[:16]}...")
-                self.discord.send_notification("🚀 **algorithm_0 Started**")
+                    bt.logging.info(f"Discord filtering to validator: {self.discord.target_validator[:16]}...")
+                # Send startup embed with MVTRX branding and logo
+                self.discord.send_embed(
+                    title="MVTRX  |  reveng_1 started",
+                    description=(
+                        "Online. Scanning order flow, "
+                        "generating adaptive signals, self-optimising."
+                    ),
+                    color=0x1A56FF,
+                    thumbnail_url="https://assets.mvtrx.fi/logo.png",
+                )
             else:
                 bt.logging.warning("Discord enabled but no webhook_url provided — disabling.")
                 self.discord.enabled = False
@@ -794,7 +878,7 @@ class RevengAgent(GenTRXAgent):
         if hotkey not in self.buffers:
             self.buffers[hotkey] = {}
         if hotkey not in self.studies:
-            self.reset_study(hotkey, state.config.simulation_id)
+            self.reset_study(hotkey, getattr(state.config, 'simulation_id', 'exchange'))
 
         if book_id not in self.buffers[hotkey]:
             self.buffers[hotkey][book_id] = self._empty_buffer(state.timestamp)
@@ -803,7 +887,7 @@ class RevengAgent(GenTRXAgent):
             and state.timestamp < self.buffers[hotkey][book_id].predictors[-1].timestamp
         ):
             bt.logging.info("Timestamp regression detected — resetting book buffer and study.")
-            self.reset_study(hotkey, state.config.simulation_id)
+            self.reset_study(hotkey, getattr(state.config, 'simulation_id', 'exchange'))
             self.buffers[hotkey][book_id] = self._empty_buffer(state.timestamp)
 
     def _empty_buffer(self, startup_timestamp: int) -> AgentDataStorage:
@@ -819,7 +903,7 @@ class RevengAgent(GenTRXAgent):
         """
         return AgentDataStorage(
             predictors=[],
-            midquotes=[TimestampedPrice(timestamp=0, price=self.simulation_config.init_price)],
+            midquotes=[TimestampedPrice(timestamp=0, price=getattr(self.simulation_config, 'init_price', 100.0))],
             returns=[],
             startup_timestamp=startup_timestamp,
         )
@@ -858,6 +942,7 @@ class RevengAgent(GenTRXAgent):
                 best_params = self.init_trading_params(validator)
 
         study = _create_or_load_study(study_file)
+        # Init the study file
         _persist_study(study, study_file)
 
         self.studies[validator] = StudyParams(
@@ -869,6 +954,7 @@ class RevengAgent(GenTRXAgent):
             opt_interval=self.opt_interval,
         )
 
+        # Init empty hp and replace with "best" params
         trial, hp = seed_study(study, HyperParams().from_dict(best_params))
         self.change_trading_params(validator, hp)
         self.studies[validator].trial_cache[trial.number] = trial
@@ -932,17 +1018,6 @@ class RevengAgent(GenTRXAgent):
         """
 
         def build_trade(event: TradeEvent, prev_volume: float) -> MyTrade:
-            """Construct a ``MyTrade`` from a raw ``TradeEvent``.
-
-            Args:
-                event: Raw fill event.
-                prev_volume: Cumulative volume before this fill; used to
-                    initialise ``rolling_volume`` on the first fill.
-
-            Returns:
-                A ``MyTrade`` with signed ``rolling_quote`` and initialised
-                ``rolling_volume``.
-            """
             taker = event.takerAgentId == self.uid
             side = event.side if taker else int(abs(event.side - 1))
             fee = event.takerFee if taker else event.makerFee
@@ -977,12 +1052,14 @@ class RevengAgent(GenTRXAgent):
         cutoff = event.timestamp - self.tparams[validator].validator_lookback
         pruned = [t for t in buf.returns if t.timestamp >= cutoff]
 
+        # Adjust rolling_quote if we pruned any entries
         if len(pruned) < len(buf.returns) and pruned:
             # Re-zero rolling_quote at the new window boundary
             offset = buf.returns[0].rolling_quote
             for t in pruned:
                 t.rolling_quote -= offset
 
+        # NOTE: No pruning for volume => wait for reset!
         buf.returns = pruned
 
     def onEnd(self, event: SimulationEndEvent) -> None:
@@ -1023,13 +1100,14 @@ class RevengAgent(GenTRXAgent):
                 watermark and to derive the lookback cutoff.
         """
         buffer = self.buffers[validator][book.id]
+        # Reduce lookback just in case
         cutoff = timestamp - self.tparams[validator].sampling_interval
 
         events_processed = 0
         skipped = {"not_trade": 0, "too_old": 0, "already_processed": 0, "not_other_agent": 0}
 
         for event in book.events:
-            if not isinstance(event, TradeInfo):
+            if event.type != "t":  # Only process trade events
                 skipped["not_trade"] += 1
                 continue
             if event.timestamp < cutoff:
@@ -1042,6 +1120,7 @@ class RevengAgent(GenTRXAgent):
                 skipped["not_other_agent"] += 1
                 continue
 
+            # --- Predictor collection ---
             buffer.new_entry(
                 event.quantity,
                 event.side,
@@ -1051,11 +1130,13 @@ class RevengAgent(GenTRXAgent):
                 self.tparams[validator].samples,
             )
             events_processed += 1
+            # Update to highest event timestamp processed (not current state timestamp)
             buffer.last_processed_timestamp = max(buffer.last_processed_timestamp, event.timestamp)
 
-        # Advance the watermark to the current state timestamp
+        # Advance the watermark to the current state timestamp to avoid reprocessing events
         buffer.last_processed_timestamp = timestamp
 
+        # Debug logging when no predictors are created
         if events_processed == 0 and not buffer.predictors:
             bt.logging.debug(
                 f"BOOK {book.id} | No events ingested: total={len(book.events)} "
@@ -1082,6 +1163,7 @@ class RevengAgent(GenTRXAgent):
                 older than ``2 × sampling_interval`` are removed.
         """
         buffer.midquotes.append(TimestampedPrice(timestamp=timestamp, price=midquote))
+        # Prune old midquotes
         cutoff = timestamp - sampling_interval * 2
         while len(buffer.midquotes) > 3 and buffer.midquotes[0].timestamp < cutoff:
             buffer.midquotes.pop(0)
@@ -1119,19 +1201,21 @@ class RevengAgent(GenTRXAgent):
             named ``"NoData"`` or ``"InsufficientPriceHistory"`` when
             prerequisites are not met.
         """
+        # Calculate volume imbalance ratio for each predictor entry
         imbalances = [
             p.imbalance(tparams.strategy_category)
             for p in buffer.predictors
-            if p.timestamp > 0
+            if p.timestamp > 0  # Skip empty initial entries
         ]
 
         if not imbalances:
             return Prediction("NoData", OrderDirection.BUY, 0.0, 0.0, current_timestamp)
 
         mean_imbalance = float(np.mean(imbalances))
+        # Confidence is magnitude of average imbalance
         confidence = abs(mean_imbalance)
 
-        # Map imbalance sign to a trade direction (optionally inverted)
+        # Direction based on imbalance sign (optionally inverted)
         buy_condition = mean_imbalance > 0 if tparams.reverse_strategy else mean_imbalance < 0
         direction = OrderDirection.BUY if buy_condition else OrderDirection.SELL
 
@@ -1140,28 +1224,33 @@ class RevengAgent(GenTRXAgent):
             f'{"Reversed" if tparams.reverse_strategy else ""}'
         )
 
+        # SIMPLIFIED: strength == imbalance, no price history required
         if not tparams.advanced:
-            # Simple mode: strength == imbalance, no price history required
             return Prediction(name, direction, confidence, mean_imbalance, current_timestamp)
 
         # Advanced mode: incorporate recent log-return
         if len(buffer.midquotes) < 2:
             return Prediction("InsufficientPriceHistory", direction, 0.0, 0.0, current_timestamp)
 
+        # Find price from sampling_interval ago
         target_ts = current_timestamp - tparams.sampling_interval
-        prev_price = buffer.midquotes[0].price  # Fallback: oldest available
+        prev_price = buffer.midquotes[0].price  # Fallback to oldest available
         for mq in reversed(buffer.midquotes[:-1]):
             if mq.timestamp <= target_ts:
                 prev_price = mq.price
                 break
 
         current_price = buffer.midquotes[-1].price
+        # Log return over sampling interval
         log_return = (
             float(np.log(current_price / prev_price))
             if prev_price > 0 and current_price > 0
             else 0.0
         )
 
+        # Strength combines return and imbalance:
+        # - Positive: imbalance and return agree (momentum)
+        # - Negative: imbalance and return disagree (mean-reversion)
         return Prediction(name, direction, confidence, log_return * mean_imbalance, current_timestamp)
 
     def signal(self, prediction: Prediction, tparams: TradingParameters) -> Signals:
@@ -1189,12 +1278,16 @@ class RevengAgent(GenTRXAgent):
         if not tparams.advanced:
             return Signals.BEARISH if prediction.direction == OrderDirection.SELL else Signals.BULLISH
 
+        # Insufficient confidence in prediction → do nothing
         if prediction.confidence < tparams.model_threshold:
             return Signals.NOISE
+        # Strong momentum signal
         if prediction.strength > tparams.signal_threshold + tparams.signal_tolerance:
             return Signals.MOMENTUM
+        # Mean-reversion signal
         if prediction.strength < tparams.signal_threshold - tparams.signal_tolerance:
             return Signals.REVERSION
+        # Within tolerance band → hold current state
         return Signals.HOLD
 
     # ------------------------------------------------------------------
@@ -1245,7 +1338,7 @@ class RevengAgent(GenTRXAgent):
                 )
 
         elif signal == Signals.REVERSION:
-            # Close any existing position (it was in the wrong direction)
+            # Mean revert signal: exit old position
             if pos.open:
                 response, amount, close_dir = self.generate_exit_response(
                     response, validator, book_id, prediction=prediction
@@ -1261,6 +1354,7 @@ class RevengAgent(GenTRXAgent):
                 )
 
         elif signal == Signals.MOMENTUM:
+            # Momentum signal: enter or extend
             response = self.entry_or_extend(
                 response, validator, book_id, prediction.direction, prediction=prediction
             )
@@ -1306,17 +1400,17 @@ class RevengAgent(GenTRXAgent):
         pos = self.buffers[validator][book_id].positions
         qty = self.tparams[validator].quantity * multiplier
 
-        # Volume-cap guard (skipped for emergency trades and at timestamp zero)
+        # Volume-cap guard (skipped for emergency trades, at timestamp zero, and in exchange mode)
         trade_history = self.buffers[validator][book_id].returns
         if (
             trade_history
             and prediction is not None
             and prediction.timestamp > 0
-            and self.simulation_config.duration > 0
+            and getattr(self.simulation_config, 'duration', 0) > 0
         ):
             fraction = prediction.timestamp / self.simulation_config.duration
             volume_estimate = trade_history[-1].rolling_volume / fraction
-            cap = self.simulation_config.miner_wealth * self.tparams[validator].validator_vol_cap
+            cap = getattr(self.simulation_config, 'miner_wealth', 0) * self.tparams[validator].validator_vol_cap
             if volume_estimate > cap:
                 bt.logging.error(
                     f"Volume cap exceeded — skipping trade.\n"
@@ -1339,13 +1433,15 @@ class RevengAgent(GenTRXAgent):
                     )
                 return response
 
+            # Simple flag to not extend positions; by default exit will open a new one
             if self.tparams[validator].skip_extend:
-                return response  # Configured not to add to existing positions
+                return response
 
             pos.amount += 1
             pos.qty += qty
             label = "EXTEND"
         else:
+            # Opening new position
             pos.direction = direction
             pos.amount = 1
             pos.qty = qty
@@ -1359,6 +1455,7 @@ class RevengAgent(GenTRXAgent):
             suffix=f"[{self.validator_to_str(validator)}]",
         )
 
+        # Add to Discord batch (only for non-emergency trades and target validator)
         if self.discord.enabled and not is_emergency and (
             not self.discord.target_validator or self.discord.target_validator == validator
         ):
@@ -1406,10 +1503,11 @@ class RevengAgent(GenTRXAgent):
         close_dir = OrderDirection(abs(pos.direction - 1))
         total_qty = pos.qty
         pos.amount = 0
-        pos.qty = 0.0
+        pos.qty = 0.0  # Also reset quantity
 
         response.market_order(book_id, close_dir, total_qty)
 
+        # Add to Discord batch (only for non-emergency trades and target validator)
         if self.discord.enabled and not is_emergency and (
             not self.discord.target_validator or self.discord.target_validator == validator
         ):
@@ -1429,71 +1527,58 @@ class RevengAgent(GenTRXAgent):
     # Main loop
     # ------------------------------------------------------------------
 
-    def respond(self, state: MarketSimulationStateUpdate) -> FinanceAgentResponse:
-        """Process one validator state update and return trading instructions.
-
-        For each book in the update:
-
-        1. Initialise buffers if needed.
-        2. Ingest new market trades into the predictor window.
-        3. Track the current mid-quote.
-        4. If insufficient data, consider an emergency trade.
-        5. Rate-limit signal generation to ``sampling_interval``.
-        6. Generate a prediction, derive a signal, and execute trading logic.
-
-        After all books are processed, the Optuna hyperparameter optimisation
-        step runs if ``opt_interval`` nanoseconds have elapsed, and any pending
-        Discord notifications are flushed.
-
-        Args:
-            state: The market state update delivered by the validator.
-
-        Returns:
-            A ``FinanceAgentResponse`` containing all market orders to submit.
-        """
-        # GenTRX: data collection + training trigger (runs even when training disabled).
-        response = super().respond(state)
+    def respond_simulation(self, state):
+        """Process one validator state update and return trading instructions."""
+        response = self.make_response()
         validator = state.dendrite.hotkey
         start = time.time()
 
-        # One-shot Discord smoke-test triggered by the ``run_discord_test`` config flag
+        # Discord test auto-trigger (requires book event data)
         if (
             self.discord.enabled
             and getattr(self.config, "run_discord_test", False)
             and not hasattr(self, "_discord_test_completed")
         ):
             if any(book.bids and book.asks for book in state.books.values()):
-                bt.logging.info("Running Discord notification test...")
+                bt.logging.info("🧪 Auto-triggering Discord test with first viable state...")
                 result = self._test_discord_with_live_data(state)
                 self._discord_test_completed = True
                 return result
 
-        for book_id, book in state.books.items():
+        for book_id, book in (state.books or {}).items():
             try:
-                best_bid = book.bids[0].price if book.bids else 0.0
-                best_ask = (
-                    book.asks[0].price if book.asks
-                    else best_bid + 10 ** (-self.simulation_config.priceDecimals)
-                )
-                midquote = (best_bid + best_ask) / 2
+                bids = book.bids if hasattr(book, 'bids') else []
+                asks = book.asks if hasattr(book, 'asks') else []
+                if bids and asks:
+                    bid, ask = bids[0].price, asks[0].price
+                elif bids:
+                    bid = ask = bids[0].price
+                elif asks:
+                    bid = ask = asks[0].price
+                else:
+                    continue
+                midquote = (bid + ask) / 2
 
                 self.buffers_init(state, book_id)
-                self.update_predictors(validator, book, state.timestamp)
+
+                # Ingest book event log into predictor window
+                self.update_predictors(validator, state.books[book_id], state.timestamp)
 
                 buffer = self.buffers[validator][book_id]
-                buffer.traded_volume = state.accounts[self.uid][book_id].traded_volume
+                buffer.traded_volume = self.accounts[book_id].traded_volume
                 self.midquote_tracking(
                     state.timestamp, midquote, buffer, self.tparams[validator].sampling_interval
                 )
 
-                # Not enough predictor data yet — consider an emergency trade
+                # Skip prediction if insufficient historical data
                 if len(buffer.predictors) < self.tparams[validator].samples:
                     self._maybe_emergency_trade(
                         response, state, validator, book_id, midquote, buffer
                     )
                     continue
 
-                # Rate-limit signals to the sampling interval
+                # Only generate signals at configured intervals
+                # NOTE: revised
                 if buffer.returns and (
                     state.timestamp - self.tparams[validator].sampling_interval
                     < buffer.returns[-1].timestamp
@@ -1517,11 +1602,12 @@ class RevengAgent(GenTRXAgent):
                 )
                 bt.logging.error(traceback.format_exc())
 
-        # Periodic hyperparameter optimisation
-        if state.timestamp - self.studies[validator].trial_time > self.studies[validator].opt_interval:
+        # ASYNC if slow
+        if validator in self.studies and state.timestamp - self.studies[validator].trial_time > self.studies[validator].opt_interval:
             self.evaluate_and_update_hp(validator)
             self.studies[validator].trial_time = state.timestamp
 
+        # Flush any pending Discord notifications
         if self.discord.enabled:
             self.discord.flush_trades()
 
@@ -1564,20 +1650,23 @@ class RevengAgent(GenTRXAgent):
         emergency_interval = tp.validator_lookback // 6
         time_since_startup = state.timestamp - buffer.startup_timestamp
 
+        # Check if enough time has passed since buffer initialization
         has_waited = time_since_startup >= tp.validator_lookback
+        # Check if we need emergency action (no recent trades)
         needs_trade = len(buffer.returns) < 3 or (
             buffer.returns
             and (state.timestamp - buffer.returns[-1].timestamp) > int(tp.validator_lookback * 2 / 3)
         )
+        # Only allow emergency if we've waited long enough AND sufficient time since last emergency
         can_fire = has_waited and (
             state.timestamp - buffer.last_emergency_timestamp
         ) >= emergency_interval
 
         if not (needs_trade and can_fire):
             bt.logging.info(
-                f"BOOK {book_id} | Waiting for data: "
-                f"{len(buffer.predictors)}/{tp.samples} buckets, "
-                f"{time_since_startup / 1e9:.0f}s / {tp.validator_lookback / 1e9:.0f}s elapsed",
+                f"BOOK {book_id} | Insufficient data: "
+                f"{len(buffer.predictors)}/{tp.samples} observations "
+                f"(waited {time_since_startup / 1e9:.1f}s / {tp.validator_lookback / 1e9:.1f}s)",
             )
             return
 
@@ -1585,13 +1674,13 @@ class RevengAgent(GenTRXAgent):
 
         if buffer.positions.open:
             self.generate_exit_response(response, validator, book_id, is_emergency=True)
-            bt.logging.info(f"BOOK {book_id} | Emergency close (no signal data).")
+            bt.logging.info(f"BOOK {book_id} | No signals, emergency close.")
         else:
             direction = (
                 OrderDirection.BUY if midquote >= buffer.midquotes[0].price else OrderDirection.SELL
             )
             self.entry_or_extend(response, validator, book_id, direction, is_emergency=True)
-            bt.logging.info(f"BOOK {book_id} | Emergency open dir={direction.name}.")
+            bt.logging.info(f"BOOK {book_id} | No signals received, emergency position open.")
 
     # ------------------------------------------------------------------
     # Optuna optimisation
@@ -1612,6 +1701,8 @@ class RevengAgent(GenTRXAgent):
             Median rolling-quote P&L across all books with at least two fills,
             or ``0.0`` if no such books exist.
         """
+        # TODO: Add more than rolling quote, such as score, and vol cap estimate
+        # NOTE: study uses maximize
         buffer = self.buffers.get(validator)
         if not buffer:
             return 0.0
@@ -1641,7 +1732,7 @@ class RevengAgent(GenTRXAgent):
 
         gain = self.evaluate_trial(validator)
         sp = self.studies[validator]
-        trial_id = None  # Stays None when the cache is empty
+        trial_id = None
 
         if sp.trial_cache:
             trial_id, trial = sp.trial_cache.popitem()
@@ -1655,14 +1746,16 @@ class RevengAgent(GenTRXAgent):
 
         next_trial, hp = ask_trial(sp.study)
         sp.trial_cache[next_trial.number] = next_trial
-        bt.logging.info(f"Next trial params: {hp}", prefix="[TRIAL]")
+        bt.logging.info(f"ID {trial_id} ended with {gain} -- Change to {hp}", prefix="[TRIAL]")
 
+        # TODO: consider checking against others
         try:
-            bt.logging.info(
-                f"Study best: value={sp.study.best_value:.4f} "
-                f"params={sp.study.best_params} trial={sp.study.best_trial.number}",
-                prefix="[TRIAL]",
-            )
+            val = {
+                "best_value": sp.study.best_value,
+                "best_params": sp.study.best_params,
+                "best_trial": sp.study.best_trial.number,
+            }
+            bt.logging.info(f"Study stats: {val}", prefix="[TRIAL]")
         except ValueError:
             pass  # No completed trials yet — normal at startup
 
@@ -1706,11 +1799,12 @@ class RevengAgent(GenTRXAgent):
             A ``FinanceAgentResponse`` containing the test market orders (these
             are real orders and will be executed by the exchange).
         """
-        response = FinanceAgentResponse(agent_id=self.uid)
+        response = self.make_response()
         if not self.discord.enabled:
             bt.logging.warning("Discord test skipped — notifications disabled.")
             return response
 
+        # Use first book with valid data
         test_book_id = next(
             (bid for bid, book in state.books.items() if book.bids and book.asks), None
         )
@@ -1720,14 +1814,25 @@ class RevengAgent(GenTRXAgent):
 
         validator = state.dendrite.hotkey
         book = state.books[test_book_id]
+
+        # Ensure buffer exists
         self.buffers_init(state, test_book_id)
         self.update_predictors(validator, book, state.timestamp)
         buf = self.buffers[validator][test_book_id]
 
+        # Calculate real midquote
         midquote = (book.bids[0].price + book.asks[0].price) / 2
         buf.midquotes.append(TimestampedPrice(timestamp=state.timestamp, price=midquote))
 
-        # Use a real prediction when data permits; fall back to a synthetic one
+        bt.logging.info("\n" + "="*80)
+        bt.logging.info("🧪 DISCORD NOTIFICATION TEST - ONE-LINER FORMAT")
+        bt.logging.info("="*80)
+        bt.logging.info(f"Test Book: {test_book_id}")
+        bt.logging.info(f"Total Books: {getattr(self.simulation_config, 'book_count', 64)}")
+        bt.logging.info(f"Midquote: {midquote:.4f}")
+        bt.logging.info("="*80 + "\n")
+
+        # Generate real prediction if possible; fall back to a synthetic one
         if len(buf.predictors) >= self.tparams[validator].samples:
             pred = self.predict(buf, self.tparams[validator], state.timestamp)
         else:
@@ -1743,14 +1848,14 @@ class RevengAgent(GenTRXAgent):
             pred.name, OrderDirection.SELL, pred.confidence, -pred.strength, state.timestamp
         )
 
-        bt.logging.info("=== Discord test: 4 reported trades + 2 silent emergency trades ===")
+        # Test 1-4: four reported trades (batched into one Discord message)
         for direction, prediction, label in [
-            (OrderDirection.BUY,  pred,      "BUY ENTRY"),
-            (None,                pred,      "EXIT (SELL to close BUY)"),
-            (OrderDirection.SELL, pred_sell, "SELL ENTRY"),
-            (None,                pred_sell, "EXIT (BUY to close SELL)"),
+            (OrderDirection.BUY,  pred,      "Test 1/6: BUY ENTRY"),
+            (None,                pred,      "Test 2/6: EXIT (SELL to close BUY)"),
+            (OrderDirection.SELL, pred_sell, "Test 3/6: SELL ENTRY"),
+            (None,                pred_sell, "Test 4/6: EXIT (BUY to close SELL)"),
         ]:
-            bt.logging.info(f"  Test: {label}")
+            bt.logging.info(label)
             if direction is not None:
                 response = self.entry_or_extend(
                     response, validator, test_book_id, direction, prediction=prediction
@@ -1760,13 +1865,16 @@ class RevengAgent(GenTRXAgent):
                     response, validator, test_book_id, prediction=prediction
                 )
 
+        # Flush batched trades (should send all 4 in one message)
+        bt.logging.info("Flushing batched Discord notifications...")
         self.discord.flush_trades()
 
+        # Test 5-6: emergency trades (no Discord notification)
         for direction, label in [
-            (OrderDirection.BUY,  "EMERGENCY OPEN (silent)"),
-            (None,                "EMERGENCY CLOSE (silent)"),
+            (OrderDirection.BUY,  "Test 5/6: EMERGENCY BUY (no Discord)"),
+            (None,                "Test 6/6: EMERGENCY SELL (no Discord)"),
         ]:
-            bt.logging.info(f"  Test: {label}")
+            bt.logging.info(label)
             if direction is not None:
                 response = self.entry_or_extend(
                     response, validator, test_book_id, direction,
@@ -1777,7 +1885,18 @@ class RevengAgent(GenTRXAgent):
                     response, validator, test_book_id, prediction=None, is_emergency=True
                 )
 
-        bt.logging.info("Discord test complete — check for 1 batched message with 4 lines.")
+        bt.logging.info("\n" + "="*80)
+        bt.logging.info("🧪 DISCORD TEST COMPLETE")
+        bt.logging.info("="*80)
+        bt.logging.info("Check Discord for 1 batched message with 4 one-liner notifications:")
+        bt.logging.info("  ▲ BUY  | 2026-02-27 12:00:43 | SimBook  #X |    2.00 @    313.29")
+        bt.logging.info("  ▼ SELL | 2026-02-27 12:00:45 | SimBook  #X |    2.00 @    313.29")
+        bt.logging.info("  ▼ SELL | 2026-02-27 12:00:47 | SimBook  #X |    2.00 @    313.29")
+        bt.logging.info("  ▲ BUY  | 2026-02-27 12:00:49 | SimBook  #X |    2.00 @    313.29")
+        bt.logging.info("(Emergency trades do not send notifications)")
+        bt.logging.info("(All 4 trades sent in a single batched message)")
+        bt.logging.info("="*80 + "\n")
+
         return response
 
 
@@ -1807,8 +1926,15 @@ if __name__ == "__main__":
     - ``discord_rate_limit``: Minimum seconds between outgoing messages (default: ``1``).
     - ``run_discord_test``: Fire a one-shot 6-trade test on the first viable tick.
 
+    Notification format (monospace code block, columns aligned)::
+
+        ▲ BUY  | 2026-02-27 12:00:43 | SimBook  #9 |    2.00 @    313.29
+        ▼ SELL | 2026-02-27 12:00:45 | SimBook #41 |    8.25 @    142.78
+
     Notes:
-        Trades are batched per ``respond()`` call into a single message.
+        Trades are batched per ``respond()`` call and sent in a single message.
         Emergency trades are never reported to Discord.
+        Bot username displayed in Discord: reveng_1
+        Startup message: rich embed with MVTRX branding and logo.
     """
     launch(RevengAgent)

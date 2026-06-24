@@ -67,7 +67,7 @@ struct convert<taosim::accounting::Balances>
                 v.base = val.as<taosim::accounting::Balance>();
             }
             else if (key == "quote") {
-                v.quote = val.as<taosim::accounting::Balance>();
+                v.quote = val.as<std::shared_ptr<taosim::accounting::Balance>>();
             }
             else if (key == "buyLeverages") {
                 val.convert(v.m_buyLeverages);
@@ -114,7 +114,7 @@ struct pack<taosim::accounting::Balances>
         o.pack(v.base);
 
         o.pack("quote");
-        o.pack(v.quote);
+        o.pack(*v.quote);
 
         o.pack("buyLeverages");
         o.pack(v.m_buyLeverages);

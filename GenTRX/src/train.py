@@ -37,7 +37,7 @@ from torch.utils.data import DataLoader
 from GenTRX.src.dataloader import create_dataloaders
 from GenTRX.src.metrics import StepMetrics
 from GenTRX.src.model import ModelConfig, OrderModel, compute_loss
-from GenTRX.src.tokenizer import TokenizerConfig
+from GenTRX.src.tokenizer import OrderTokenizer, TokenizerConfig
 
 logger = logging.getLogger(__name__)
 

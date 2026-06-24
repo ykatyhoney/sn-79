@@ -157,7 +157,7 @@ def test_create_assignments_from_available_data(mock_server, http_server):
     s._current_round = 1
     assignments = s._create_assignments(status)
     assert set(assignments.keys()) == {2, 3}
-    for uid, a in assignments.items():
+    for _uid, a in assignments.items():
         assert a["round"] == 1
         assert len(a["books"]) > 0
         assert len(a["data"]) > 0
@@ -193,7 +193,6 @@ def test_push_round_sends_to_server(mock_server, http_server):
 
 def test_should_advance_round_timer_mode(mock_server, http_server):
     """In timer mode (no get_block_fn), round advances after poll_interval."""
-    import time
     s = _service(http_server, poll_interval=0.01)
     # First call: should advance (time since last push > poll_interval)
     result = s._should_advance_round()
@@ -375,7 +374,6 @@ def test_spool_persists_unsent_across_instance(http_server, mock_server, tmp_pat
 
 def test_spool_unbounded_queue_replays_all(http_server, mock_server, tmp_path):
     """C3: when spool is enabled, queue is unbounded so replay > 256 still drains."""
-    import time as _t
     spool = str(tmp_path / "spool.bin")
     packager = MagicMock()
     packager.extract_state.return_value = {"step": 1, "books": {}}

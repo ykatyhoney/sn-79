@@ -30,13 +30,14 @@ public:
 
     [[nodiscard]] decltype(auto) begin(this auto&& self) { return self.m_accounts.begin(); }
     [[nodiscard]] decltype(auto) end(this auto&& self) { return self.m_accounts.end(); }
-    
+
     void registerLocal(const LocalAgentId& agentId, std::optional<Account> account = {}) noexcept;
     void registerLocal(
         const LocalAgentId& agentId,
         const std::string& agentType,
         std::optional<Account> account = {}) noexcept;
-    AgentId registerRemote(std::optional<Account> holdings = {}) noexcept;
+    AgentId registerRemote(std::optional<Account> account = {}) noexcept;
+    bool registerRemote(AgentId agentId, Account::Holdings holdings) noexcept;
     void registerJson(const rapidjson::Value& json);
 
     [[nodiscard]] bool contains(const std::variant<AgentId, LocalAgentId>& agentId) const;

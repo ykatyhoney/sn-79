@@ -1,9 +1,0 @@
-ExchangeSimulator v2.0
- - 'PrintingAgentExample.xml' loaded successfully
- - starting the simulations
- - all simulations finished, exiting
- --- Configuring with the following parameters --- 
-{'parameter': 'value'}
- ------------------------------------------------- 
-Received a message of type 'EVENT_SIMULATION_START' at time 0, payload {} 
-Received a message of type 'EVENT_SIMULATION_STOP' at time 1000, payload {} 

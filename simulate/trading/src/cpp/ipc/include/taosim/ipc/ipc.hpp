@@ -6,8 +6,9 @@
 
 #include <boost/interprocess/shared_memory_object.hpp>
 #include <boost/interprocess/mapped_region.hpp>
+#include <boost/interprocess/sync/named_semaphore.hpp>
 
-#include "PosixMessageQueue.hpp"
-#include "util.hpp"
+#include <taosim/ipc/PosixMessageQueue.hpp>
+#include <taosim/ipc/util.hpp>
 
 namespace bipc = boost::interprocess;

@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "taosim/exchange/FeePolicy.hpp"
-#include "taosim/exchange/FeePolicyWrapper.hpp"
+#include "taosim/matching/FeePolicy.hpp"
+#include "taosim/matching/FeePolicyWrapper.hpp"
 #include "taosim/decimal/decimal.hpp"
 #include "formatting.hpp"
 
@@ -12,14 +12,13 @@
 #include <gtest/gtest.h>
 
 
-#include "DistributedProxyAgent.hpp"
 #include "MultiBookExchangeAgent.hpp"
 #include "Order.hpp"
 #include "taosim/message/PayloadFactory.hpp"
 #include "Simulation.hpp"
-#include "server.hpp"
+#include <taosim/net/server.hpp>
 #include "util.hpp"
-#include <taosim/exchange/ClearingManager.hpp>
+#include <taosim/matching/ClearingManager.hpp>
 
 #include <fmt/format.h>
 #include <gmock/gmock.h>
@@ -73,7 +72,7 @@ void printOrderbook(Book::Ptr book){
 
 void printBalances(const taosim::accounting::Balances& balances, const AgentId agentId){
     std::string baseString = normalizeOutput(fmt::format("{}", balances.base));
-    std::string quoteString = normalizeOutput(fmt::format("{}", balances.quote));
+    std::string quoteString = normalizeOutput(fmt::format("{}", *balances.quote));
     fmt::println("Agent {} => \tBase: {} \n\t\tQuote: {}", agentId, baseString, quoteString);
     for (auto it = balances.m_loans.begin(); it != balances.m_loans.end(); it++){
         if (it == balances.m_loans.begin())

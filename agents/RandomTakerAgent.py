@@ -6,14 +6,14 @@ Supports GenTRX distributed training via agent params.
 """
 import bittensor as bt
 from taos.common.agents import launch
-from taos.im.protocol.models import *
-from taos.im.protocol.instructions import *
-from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
-
 from taos.im.agents import GenTRXAgent
+from taos.im.protocol.models import OrderDirection, STP, LoanSettlementOption, OrderCurrency
+
 import random
 
-
+"""
+A simple example agent which randomly places market orders.
+"""
 class RandomTakerAgent(GenTRXAgent):
     def initialize(self):
         """
@@ -31,42 +31,33 @@ class RandomTakerAgent(GenTRXAgent):
         self.min_leverage = self.config.min_leverage if hasattr(self.config, 'min_leverage') else 0.0
         self.max_leverage = self.config.max_leverage if hasattr(self.config, 'max_leverage') else 0.0
         self.max_fee_rate = self.config.max_fee_rate if hasattr(self.config, 'max_fee_rate') else 0.002
+        self.delegate     = getattr(self.config, 'delegate', '')
         # Initialize a variable which allows to maintain the same direction of trade for a defined period
-        self.direction = {}
+        self.direction    = {}
 
     def quantity(self):
         """
         Obtains a random quantity for order placement within the bounds defined by the agent strategy parameters.
         """
-        return round(random.uniform(self.min_quantity,self.max_quantity),self.simulation_config.volumeDecimals)
+        return round(random.uniform(self.min_quantity, self.max_quantity), getattr(self.simulation_config, 'volumeDecimals', 8))
 
     def leverage(self):
         """
-        Obtains a random quantity for order placement within the bounds defined by the agent strategy parameters.
+        Obtains a random leverage value for order placement within the bounds defined by the agent strategy parameters.
         """
-        return round(random.uniform(self.min_leverage,self.max_leverage),2) if self.min_leverage != self.max_leverage else self.max_leverage
+        return round(random.uniform(self.min_leverage, self.max_leverage), 2) if self.min_leverage != self.max_leverage else self.max_leverage
 
-    def respond(self, state : MarketSimulationStateUpdate) -> FinanceAgentResponse:
-        """
-        The main logic of the strategy executed when a new state is received from validator.
-        Analyses the latest market state data and generates instructions to be submitted.
-
-        Args:
-            state (MarketSimulationStateUpdate): The current market state data 
-                provided by the simulation validator.
-
-        Returns:
-            FinanceAgentResponse: A response object containing the list of 
-                instructions (e.g., limit orders) to submit to the market.
-        """
-        # GenTRX: data collection + training trigger (runs even when training disabled).
-        response = super().respond(state)
-        # Iterate over all the book realizations in the state message
-        for book_id, book in state.books.items():
+    def respond_simulation(self, state):
+        volume_decimals = getattr(self.simulation_config, 'volumeDecimals', 8)
+        # Initialize a response class associated with the current miner
+        response = self.make_response()
+        # Iterate over the book realizations in the state message
+        book_ids = list((state.books or {}).keys())
+        for book_id in book_ids:
             # If we have not set a trade direction for this book, or 100 simulation seconds have elapsed
-            if not book_id in self.direction or state.timestamp % 100_000_000_000 == 0:
+            if book_id not in self.direction or state.timestamp % 100_000_000_000 == 0:
                 # Randomly select a new trade direction for the agent on this book
-                self.direction[book_id] = random.choice([OrderDirection.BUY,OrderDirection.SELL])
+                self.direction[book_id] = random.choice([OrderDirection.BUY, OrderDirection.SELL])
 
             # NEW: Maker and taker fees will be dynamically moving under the DIS fee policy
             # The below demonstrates a simple approach for reacting to the changing rates in trading logic
@@ -76,48 +67,52 @@ class RandomTakerAgent(GenTRXAgent):
             if previous_taker_rate > self.max_fee_rate:
                 # If taker rate is above tolerance, do not place orders this round
                 continue
-             
+
             # Attach a market order instruction in the current trade direction for a random quantity within bounds defined by the parameters
             bt.logging.info(f"BOOK {book_id} | QUOTE : {self.accounts[book_id].quote_balance.total} [LOAN {self.accounts[book_id].quote_loan} | COLLAT {self.accounts[book_id].quote_collateral}]")
             bt.logging.info(f"BOOK {book_id} | BASE : {self.accounts[book_id].base_balance.total} [LOAN {self.accounts[book_id].base_loan} | COLLAT {self.accounts[book_id].base_collateral}]")
             if self.direction[book_id] == OrderDirection.BUY:
                 # If in the BUY regime, we place orders randomly with leverage selected from the configured range
                 # Obtain a random leverage value if there is no open margin position on sell side
-                leverage = self.leverage() if self.accounts[book_id].base_loan == 0 else 0.0
-                # If an open opposite margin position exists, repay the corresponding loans in order 
+                leverage   = self.leverage() if self.accounts[book_id].base_loan == 0 else 0.0
+                # If an open opposite margin position exists, repay the corresponding loans in order
                 # from oldest to newest by setting LoanSettlementOption.FIFO
                 settlement = LoanSettlementOption.NONE if self.accounts[book_id].base_loan == 0 else LoanSettlementOption.FIFO
-                # If placing unleveraged order, increase the quantity to better match the average total size of 
+                # If placing unleveraged order, increase the quantity to better match the average total size of
                 # leveraged orders on the other side.  This avoids accumulating too much inventory in one currency.
-                quantity =  round(self.quantity() * (1 + self.leverage()), self.simulation_config.volumeDecimals)
+                quantity   = round(self.quantity() * (1 + self.leverage()), volume_decimals)
                 response.market_order(
-                    book_id=book_id, 
-                    direction=self.direction[book_id], 
-                    quantity=quantity, 
+                    book_id=book_id,
+                    direction=self.direction[book_id],
+                    quantity=quantity,
                     stp=random.choice([STP.DECREASE_CANCEL, STP.CANCEL_OLDEST]),
                     leverage=leverage,
-                    settlement_option=settlement
+                    settlement_option=settlement,
+                    currency=OrderCurrency.BASE,
+                    max_slippage=getattr(self.config, 'max_slippage', 0.01),
                 )
                 bt.logging.info(f"SUBMITTING BUY MARKET ORDER FOR {str(round(1+leverage,2))+'x' if leverage > 0 else ''}{quantity}")
             else:
                 # If in the SELL regime, we place orders randomly without leverage, but with quantity increased to match the amounts placed on buy side.
                 # Obtain a random leverage value if there is no open margin position on sell side
-                leverage = self.leverage() if self.accounts[book_id].quote_loan == 0 else 0.0
-                # If an open opposite margin position exists, repay the corresponding loans in order 
+                leverage   = self.leverage() if self.accounts[book_id].quote_loan == 0 else 0.0
+                # If an open opposite margin position exists, repay the corresponding loans in order
                 # from oldest to newest by setting LoanSettlementOption.FIFO
                 settlement = LoanSettlementOption.NONE if self.accounts[book_id].quote_loan == 0 else LoanSettlementOption.FIFO
-                # If placing unleveraged order, increase the quantity to better match the average total size of 
+                # If placing unleveraged order, increase the quantity to better match the average total size of
                 # leveraged orders on the other side.  This avoids accumulating too much inventory in one currency.
-                quantity =  round(self.quantity() * (1 + self.leverage()), self.simulation_config.volumeDecimals)
+                quantity   = round(self.quantity() * (1 + self.leverage()), volume_decimals)
                 response.market_order(
-                    book_id=book_id, 
-                    direction=self.direction[book_id], 
-                    quantity=quantity, 
+                    book_id=book_id,
+                    direction=self.direction[book_id],
+                    quantity=quantity,
                     stp=random.choice([STP.DECREASE_CANCEL, STP.CANCEL_OLDEST]),
                     leverage=leverage,
-                    settlement_option=settlement
+                    settlement_option=settlement,
+                    currency=OrderCurrency.BASE,
+                    max_slippage=getattr(self.config, 'max_slippage', 0.01),
                 )
-                # bt.logging.info(f"SUBMITTING SELL MARKET ORDER FOR {str(round(1+leverage,2))+'x' if leverage > 0 else ''}{quantity}")
+                bt.logging.info(f"SUBMITTING SELL MARKET ORDER FOR {str(round(1+leverage,2))+'x' if leverage > 0 else ''}{quantity}")
         # Return the response with instructions appended
         # The response will be serialized and sent back to the validator for processing
         return response

@@ -1,0 +1,18 @@
+{
+  "_note": "The gentrx_bucket access_key_id / secret_access_key below are intentionally public. They are READ-ONLY credentials scoped to a single benchmark gradient bucket (no write/admin/cross-resource access) and are the same pair every participant already publishes on-chain via the Commitments pallet. Committing them here is deliberate, not a leak; do not rotate or move them to env injection without coordinating the on-chain commitment.",
+  "agents": [
+    {
+      "uid": 256,
+      "name": "benchmark_0",
+      "ip": "45.135.163.226",
+      "port": 19048,
+      "hotkey": "5ECK3B8TenJ5eYc5CFLxhYotwn4eRL7ZtNxeKTHrnCZh9HEH",
+      "gentrx_bucket": {
+        "endpoint_url": "https://54c1e398b79fefb42485bef8060eb909.r2.cloudflarestorage.com",
+        "bucket_name": "agent-256",
+        "access_key_id": "93bc30f8393637322c68282b67111d02",
+        "secret_access_key": "e0847496d7e080ec1bd7d04d4e0abf370606f9119d3042869eba17df8f79ccf1"
+      }
+    }
+  ]
+}

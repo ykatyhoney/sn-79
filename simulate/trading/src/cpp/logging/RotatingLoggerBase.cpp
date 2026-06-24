@@ -39,33 +39,24 @@ RotatingLoggerBase::RotatingLoggerBase(const RotatingLoggerBaseDesc& desc) noexc
 
 //-------------------------------------------------------------------------
 
-void RotatingLoggerBase::updateSink()
+void RotatingLoggerBase::updateSink(std::optional<Timestamp> currentTime)
 {
     if (!m_simulation->logWindow()) return;
 
-    auto update = [&] {
-        m_logger->sinks().clear();
-        m_logger->sinks().push_back(makeFileSink().sink);
-        m_logger->set_pattern("%v");
-        m_logger->trace(m_header);
-        m_logger->flush();
-    };
+    const auto t = currentTime.value_or(m_simulation->currentTimestamp());
+    const auto window = m_simulation->logWindow();
+    if (t < m_currentWindowBegin + window) [[likely]] return;
 
-    const auto end = std::min(
-        m_currentWindowBegin + m_simulation->logWindow(), taosim::simulation::kLogWindowMax);
+    // Re-bucket from t directly so multi-window jumps (common with
+    // wall-clock-gapped batch timestamps) land in the correct window in
+    // one step rather than chasing them.
+    m_currentWindowBegin = t / window * window;
 
-    const bool withinWindow = m_simulation->currentTimestamp() < end;
-
-    if (withinWindow) [[likely]] return;
-
-    m_currentWindowBegin += m_simulation->logWindow();
-
-    if (m_currentWindowBegin > taosim::simulation::kLogWindowMax) {
-        m_currentWindowBegin = taosim::simulation::kLogWindowMax;
-        m_simulation->logWindow() = {};
-    }
-
-    update();
+    m_logger->sinks().clear();
+    m_logger->sinks().push_back(makeFileSink().sink);
+    m_logger->set_pattern("%v");
+    m_logger->trace(m_header);
+    m_logger->flush();
 }
 
 //-------------------------------------------------------------------------

@@ -321,6 +321,15 @@ Committed by both miners and validators via the Bittensor Commitments pallet. 12
 [account_id: 32 chars][access_key_id: 32 chars][secret_access_key: 64 chars]
 ```
 
+> **On committed credentials being public by design.** These R2 `access_key_id` /
+> `secret_access_key` pairs are **read-only** and scoped to a single gradient bucket — no
+> write, admin, or cross-resource access. They are published on-chain by every participant
+> via the Commitments pallet, so they are public by construction. The benchmark agent config
+> (`taos/im/config/benchmark_agents.testnet.json`) carries the same read-only pair inline on
+> purpose; a committed literal there is intentional, not a leak. Secret scanners will flag it —
+> that finding is expected and may be dismissed. Do not rotate or move these to env injection
+> without also updating the on-chain commitment, or discovery breaks.
+
 Provider auto-detection from `account_id`:
 - **R2**: `account_id` matches `^[0-9a-f]{32}$` → endpoint `https://{account_id}.r2.cloudflarestorage.com`, region `auto`
 - **Hippius**: anything else → `account_id` IS the bucket name, endpoint `https://s3.hippius.com`, region `decentralized`

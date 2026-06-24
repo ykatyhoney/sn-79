@@ -90,7 +90,7 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
                 o.pack("i"s);
                 o.pack(bookIdCanon);
 
-                o.pack("mtr"s);
+                o.pack("r"s);
                 o.pack(exchange->clearingManager().feePolicy()->makerTakerRatio(book->id(), 0));
 
                 o.pack("e"s);
@@ -161,11 +161,6 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
                 const auto& buyQueue = book->buyQueue();
                 o.pack("b"s);
                 o.pack_array(std::min(buyQueue.size(), maxDepth));
-                if (buyQueue.size() < maxDepth) [[unlikely]] {
-                    fmt::println(
-                        "Book {} buy side level count ({}) less than maxDepth ({})",
-                        bookIdCanon, buyQueue.size(), maxDepth);
-                }
                 for (const auto& level : buyQueue | views::reverse | views::take(detailedDepth)) {
                     packLevel(o, level);
                 }
@@ -180,11 +175,6 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
                 const auto& sellQueue = book->sellQueue();
                 o.pack("a"s);
                 o.pack_array(std::min(sellQueue.size(), maxDepth));
-                if (sellQueue.size() < maxDepth) [[unlikely]] {
-                    fmt::println(
-                        "Book {} sell side level count ({}) less than maxDepth ({})",
-                        bookIdCanon, sellQueue.size(), maxDepth);
-                }
                 for (const auto& level : sellQueue | views::take(detailedDepth)) {
                     packLevel(o, level);
                 }
@@ -250,7 +240,7 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
                     packBalance(o, balances.base, "BASE");
 
                     o.pack("qb"s);
-                    packBalance(o, balances.quote, "QUOTE");
+                    packBalance(o, *balances.quote, "QUOTE");
 
                     o.pack("bl"s);
                     o.pack(balances.m_baseLoan);
@@ -407,7 +397,7 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
                 || msg->type == "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET") {
                 o.pack_map(13);
             } else if (msg->type == "EVENT_TRADE") {
-                o.pack_map(15);
+                o.pack_map(17);
             } else if (msg->type == "RESPONSE_DISTRIBUTED_CANCEL_ORDERS" 
                 || msg->type == "ERROR_RESPONSE_DISTRIBUTED_CANCEL_ORDERS") {
                 o.pack_map(5);
@@ -646,6 +636,12 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
 
                 o.pack("q"s);
                 o.pack(subPld->trade.m_volume);
+
+                o.pack("cr"s);
+                o.pack(subPld->context.aggressingCloseReason);
+
+                o.pack("Toi"s);
+                o.pack(subPld->context.aggressingOriginatingOrderId);
             }
             else if (msg->type == "RESPONSE_DISTRIBUTED_CANCEL_ORDERS") {
                 const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);

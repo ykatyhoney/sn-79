@@ -63,7 +63,7 @@ std::optional<size_t> PosixMessageQueue::size() const noexcept
 bool PosixMessageQueue::send(std::span<const char> msg, uint32_t priority) noexcept
 {
     if (!m_desc.timeout) {
-        return mq_send(m_handle, msg.data(), msg.size(), priority);
+        return mq_send(m_handle, msg.data(), msg.size(), priority) == 0;
     }
     const timespec ts = makeTimespec(*m_desc.timeout);
     return mq_timedsend(m_handle, msg.data(), msg.size(), priority, &ts) == 0;
@@ -74,7 +74,7 @@ bool PosixMessageQueue::send(std::span<const char> msg, uint32_t priority) noexc
 ssize_t PosixMessageQueue::receive(std::span<char> msg, uint32_t* priority) noexcept
 {
     if (!m_desc.timeout) {
-        return mq_receive(m_handle, msg.data(), msg.size(), priority);
+        return blockingReceive(msg, priority);
     }
     const timespec ts = makeTimespec(*m_desc.timeout);
     return mq_timedreceive(m_handle, msg.data(), msg.size(), priority, &ts);
@@ -82,11 +82,34 @@ ssize_t PosixMessageQueue::receive(std::span<char> msg, uint32_t* priority) noex
 
 //-------------------------------------------------------------------------
 
+ssize_t PosixMessageQueue::blockingReceive(std::span<char> msg, uint32_t* priority) noexcept
+{
+    return mq_receive(m_handle, msg.data(), msg.size(), priority);
+}
+
+//-------------------------------------------------------------------------
+
 void PosixMessageQueue::flush() noexcept
 {
-    if (auto sz = size(); !sz || *sz == 0) return;
-    std::vector<char> sink(m_desc.attr.mq_maxmsg * m_desc.attr.mq_msgsize);
-    while (mq_receive(m_handle, sink.data(), sink.size(), nullptr) == -1);
+    // Drain every pending message without blocking, so a freshly-started
+    // process never inherits stale frames a previous run left in a persistent
+    // queue. Size the sink from the queue's own attributes — a peer may have
+    // created it with a larger msgsize than our desc, and a too-small buffer
+    // would make mq_receive fail with EMSGSIZE forever. An already-elapsed
+    // absolute timeout makes each receive non-blocking: it returns a pending
+    // message immediately, or fails at once on an empty queue, ending the loop.
+    struct mq_attr attr;
+    if (mq_getattr(m_handle, &attr) == -1) return;
+    std::vector<char> sink(static_cast<size_t>(attr.mq_msgsize));
+    const timespec ts{};
+    while (mq_timedreceive(m_handle, sink.data(), sink.size(), nullptr, &ts) != -1) {}
+}
+
+//-------------------------------------------------------------------------
+
+bool PosixMessageQueue::remove(std::string_view name)
+{
+    return mq_unlink(name.starts_with('/') ? name.data() : fmt::format("/{}", name).c_str()) == 0;
 }
 
 //-------------------------------------------------------------------------

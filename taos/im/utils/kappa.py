@@ -244,7 +244,7 @@ def kappa_3(uid, realized_pnl_values, tau, lookback, norm_min, norm_max,
         
         return kappa_values
         
-    except Exception as ex:
+    except Exception:
         print(f"Failed to calculate Kappa-3 for UID {uid}: {traceback.format_exc()}")
         return None
 

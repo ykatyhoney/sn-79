@@ -8,15 +8,18 @@
 #include <taosim/checkpoint/CheckpointToken.hpp>
 #include <taosim/checkpoint/CheckpointManager.hpp>
 #include <taosim/ipc/ipc.hpp>
+#include <taosim/net/net.hpp>
 #include <taosim/replay/ReplayManager.hpp>
 #include <taosim/simulation/SharedResources.hpp>
-#include <net.hpp>
 
 #include <boost/asio.hpp>
 #include <pugixml.hpp>
 
 #include <memory>
 #include <vector>
+
+//-------------------------------------------------------------------------
+
 
 //-------------------------------------------------------------------------
 
@@ -31,17 +34,12 @@ struct SimulationBlockInfo
     uint32_t dimension;
 };
 
-struct NetworkingInfo
-{
-    std::string host, port, bookStateEndpoint, generalMsgEndpoint;
-    int64_t resolveTimeout, connectTimeout, writeTimeout, readTimeout;
-};
-
 //-------------------------------------------------------------------------
 
 class SimulationManager
 {
 public:
+
     void runSimulations();
     void runReplay();
     void runReplayAdvanced();
@@ -86,7 +84,8 @@ private:
     std::vector<std::unique_ptr<Simulation>> m_simulations;
     fs::path m_logDir;
     Timestamp m_gracePeriod;
-    NetworkingInfo m_netInfo;
+    taosim::net::NetworkingInfo m_netInfo;
+    std::string m_bookStateEndpoint, m_generalMsgEndpoint;
     UnsyncSignal<void()> m_stepSignal;
     std::unique_ptr<ipc::PosixMessageQueue> m_validatorReqMessageQueue;
     std::unique_ptr<ipc::PosixMessageQueue> m_validatorResMessageQueue;
@@ -104,11 +103,6 @@ private:
             t0ckptSave, t1ckptSave,
             t0ckptLoad, t1ckptLoad;
     } m_measurements;
-
-    net::awaitable<void> asyncSendOverNetwork(
-        const rapidjson::Value& reqBody, const std::string& endpoint, rapidjson::Document& resJson);
-    http::request<http::string_body> makeHttpRequest(
-        const std::string& target, const std::string& body);
 };
 
 //-------------------------------------------------------------------------

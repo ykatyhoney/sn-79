@@ -32,9 +32,18 @@ endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     #string(APPEND CMAKE_CXX_FLAGS " -Wall -Wextra -Wpedantic")
+    # Suppress spurious "#pragma message" notes from GCC 14's pstl headers
+    # ("Vectorized algorithm unimplemented, redirected to serial").
+    # These are note-level diagnostics that can't be silenced with -Wno-* flags;
+    # overriding the macro to a no-op is the standard workaround.
+    add_compile_options("-D_PSTL_PRAGMA_MESSAGE(x)=")
 endif()
 
 set(SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/cpp" CACHE STRING "C++ source directory")
+
+
+
+
 
 #-------------------------------------------------------------------------
 

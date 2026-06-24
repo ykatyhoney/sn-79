@@ -380,7 +380,7 @@ void NoiseTraderAgent::placeOrder(BookId bookId)
     const auto freeBase =
         taosim::util::decimal2double(simulation()->account(name()).at(bookId).base.getFree());
     const auto freeQuote =
-        taosim::util::decimal2double(simulation()->account(name()).at(bookId).quote.getFree());
+        taosim::util::decimal2double(simulation()->account(name()).at(bookId).quote->getFree());
     float adjustedRet = m_sigma +  m_mWeight*magnetism + field->magnetismReturn();
     ForecastResult forecastResult = {.price= m_price*std::exp(adjustedRet), .varianceOfLastLogReturns=m_sigma};
     const auto [indifferencePrice, indifferencePriceConverged] =
