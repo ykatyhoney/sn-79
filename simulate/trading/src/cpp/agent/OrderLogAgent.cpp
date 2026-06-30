@@ -36,7 +36,7 @@ void OrderLogAgent::receiveMessage(Message::Ptr messagePtr)
             std::make_shared<EmptyPayload>());
     }
     else if (messagePtr->type == "EVENT_ORDER_MARKET") {
-        auto pptr = std::dynamic_pointer_cast<EventOrderMarketPayload>(messagePtr->payload);
+        auto pptr = std::static_pointer_cast<EventOrderMarketPayload>(messagePtr->payload);
         const auto& order = pptr->order;
 
         std::cout << name() << ": ";
@@ -48,7 +48,7 @@ void OrderLogAgent::receiveMessage(Message::Ptr messagePtr)
         std::cout << std::endl;
     }
     else if (messagePtr->type == "EVENT_ORDER_LIMIT") {
-        auto pptr = std::dynamic_pointer_cast<EventOrderLimitPayload>(messagePtr->payload);
+        auto pptr = std::static_pointer_cast<EventOrderLimitPayload>(messagePtr->payload);
         const auto& order = pptr->order;
 
         std::cout << name() << ": ";

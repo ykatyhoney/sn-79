@@ -374,6 +374,46 @@ def restart_simulator(self : Validator, end : bool = False) -> None:
             bt.logging.info(f"Killed {killed_count} simulator process(es)")
             time.sleep(2.0)
 
+        # If the latest checkpoint sits at or past the configured sim duration, a
+        # `-c latest` resume loads EOF state and the sim exits immediately on its
+        # next tick — leaving the monitor in a restart loop. Detect that case here
+        # and force a fresh start instead. Checkpoint dirs are named
+        # `<sim_time_ns>.ckptd` and the duration is the XML `Simulation duration=`
+        # attribute (ns).
+        if not end:
+            try:
+                from pathlib import Path
+                import re
+                logs_root = (self.repo_path / 'simulate' / 'trading' / 'run' / 'logs').resolve()
+                run_dirs = sorted(
+                    (d for d in logs_root.iterdir() if d.is_dir() and (d / 'ckpt').is_dir()),
+                    key=lambda d: d.stat().st_mtime,
+                )
+                if run_dirs:
+                    ckpt_dir = run_dirs[-1] / 'ckpt'
+                    ckpts = sorted(
+                        d for d in ckpt_dir.iterdir()
+                        if d.is_dir() and d.name.endswith('.ckptd')
+                    )
+                    if ckpts:
+                        latest_ckpt_ns = int(ckpts[-1].name.split('.')[0])
+                        cfg_path = getattr(self, 'simulator_config_file', None)
+                        duration_ns = None
+                        if cfg_path and Path(cfg_path).is_file():
+                            with open(cfg_path) as _cf:
+                                m = re.search(r'\bduration\s*=\s*"(\d+)"', _cf.read())
+                                if m:
+                                    duration_ns = int(m.group(1))
+                        if duration_ns and latest_ckpt_ns >= duration_ns:
+                            bt.logging.warning(
+                                f"Latest checkpoint at {latest_ckpt_ns}ns is at/past sim "
+                                f"duration {duration_ns}ns ({ckpts[-1].name}) — forcing fresh "
+                                f"sim to break the EOF restart loop"
+                            )
+                            end = True
+            except Exception as _eof_ex:
+                bt.logging.debug(f"EOF-checkpoint pre-check failed (will attempt resume anyway): {_eof_ex}")
+
         if not end:
             resume_cmd = [
                 "pm2", "start", "--no-autorestart", "--name=simulator",

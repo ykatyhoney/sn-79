@@ -777,9 +777,32 @@ def score_uid(validator_data: Dict, uid: int) -> Tuple[float, float]:
         round_score = gentrx_ranked.get(uid, 0.0)
         gentrx_ema = validator_data.get('gentrx_ema', {})
         alpha = gentrx_config.get('ema_alpha', 0.1)
-        prev = gentrx_ema.get(uid, round_score)
-        gentrx_score = alpha * round_score + (1.0 - alpha) * prev
-        gentrx_ema[uid] = gentrx_score
+        # Bootstrap new miners at 0 instead of `round_score`. The previous
+        # default seeded the EMA from the first observed score, which gave
+        # newly-registered miners their full round score immediately and
+        # made multi-round consistency irrelevant for them. With alpha=0.1
+        # a new miner now reaches 90% of their steady-state score in ~22
+        # rounds; this is closer to the EMA's intended "trust accrues over
+        # time" semantics.
+        prev = gentrx_ema.get(uid, 0.0)
+        # Per-round idempotency: track which (uid, round) pairs we have
+        # already applied EMA for so a repeated call to `score_uid` within
+        # the same round can't double-apply the smoothing. The round id
+        # comes from validator_data['gentrx_round'] when available; absent
+        # that key (legacy callers) we fall back to the non-idempotent
+        # behaviour with a debug log.
+        round_id = validator_data.get('gentrx_round')
+        applied: set = validator_data.setdefault('_gentrx_ema_applied', set())
+        ema_key = (uid, round_id) if round_id is not None else None
+        if ema_key is not None and ema_key in applied:
+            # Already applied this round — return the cached EMA without
+            # mutating it again.
+            gentrx_score = gentrx_ema.get(uid, 0.0)
+        else:
+            gentrx_score = alpha * round_score + (1.0 - alpha) * prev
+            gentrx_ema[uid] = gentrx_score
+            if ema_key is not None:
+                applied.add(ema_key)
 
     # ===== STEP 4: TRADING SCORE (kappa + pnl, weighted-sum, clamp) =====
     # kappa_weight + pnl_weight must sum to 1.0 within the trading pool

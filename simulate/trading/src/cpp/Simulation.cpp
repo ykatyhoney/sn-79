@@ -86,7 +86,7 @@ void Simulation::dispatchGenericMessage(
 
 //-------------------------------------------------------------------------
 
-void Simulation::queueMessage(Message::Ptr msg) const
+void Simulation::queueMessage(const Message::Ptr& msg) const
 {
     m_messageQueue.push(msg);
 }
@@ -352,7 +352,7 @@ void Simulation::configureLogging(pugi::xml_node node)
 
 //-------------------------------------------------------------------------
 
-void Simulation::deliverMessage(Message::Ptr msg)
+void Simulation::deliverMessage(const Message::Ptr& msg)
 {
     for (const auto& target : msg->targets) {
         if (target == "*") {
@@ -385,24 +385,18 @@ void Simulation::deliverMessage(Message::Ptr msg)
                     const auto& haystack = agent->name();
                     return haystack.find(needle);
                 });
-            std::for_each(lb, ub, [msg](const auto& agent) { agent->receiveMessage(msg); });
+            std::for_each(lb, ub, [&msg](const auto& agent) { agent->receiveMessage(msg); });
         }
         else {
-            auto it = std::lower_bound(
-                m_localAgentManager->begin(),
-                m_localAgentManager->end(),
-                target,
-                [](const auto& agent, const auto& val) { return agent->name() < val; });
-            if ((*it)->name() != target) {
+            // O(1) hash lookup (was O(log N) lower_bound — hot path with
+            // millions of dispatches per tick across 30k+ agents).
+            Agent* const agentPtr = m_localAgentManager->findByName(target);
+            if (agentPtr == nullptr) {
+                // Silent skip retained for parity with the pre-refactor behaviour
+                // (lower_bound miss returned without throwing in the common case).
                 return;
             }
-            else if (it == m_localAgentManager->end()) {
-                throw taosim::simulation::SimulationException(fmt::format(
-                    "{}: unknown message target '{}'",
-                    std::source_location::current().function_name(),
-                    target));
-            }
-            (*it)->receiveMessage(msg);
+            agentPtr->receiveMessage(msg);
         }
     }
 }

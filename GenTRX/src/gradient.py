@@ -172,16 +172,61 @@ def aggregate(gradients: list[CompressedGradient]) -> CompressedGradient:
 
     Returns a dense GradientDelta (not re-compressed) wrapped as CompressedGradient
     with all values retained. Re-compress after if needed for transmission.
+
+    Non-finite handling: any delta whose tensors contain NaN or Inf is dropped
+    from the aggregation (one corrupt miner can otherwise poison the entire
+    aggregate via the mean). If every delta has non-finite values, the bad
+    entries within each delta are zeroed before averaging so we still produce
+    a finite output. This is the load-bearing defense against
+    aggregate-level corruption — applied before any downstream eval, apply,
+    or publish step touches the result.
     """
     if not gradients:
         raise ValueError("No gradients to aggregate")
     if len(gradients) == 1:
         return gradients[0]
 
-    # Decompress all, average
-    deltas = [decompress(g) for g in gradients]
+    # Decompress all
+    decompressed = [decompress(g) for g in gradients]
+
+    # Partition into clean vs polluted. A delta is "clean" if every tensor is
+    # fully finite. Polluted deltas are dropped if any clean ones remain;
+    # otherwise we sanitize them in-place (zero non-finite entries) so we
+    # still produce a finite aggregate rather than failing the round.
+    clean_deltas: list = []
+    polluted_deltas: list = []
+    for cg, d in zip(gradients, decompressed):
+        if all(torch.isfinite(t).all() for t in d.delta.values()):
+            clean_deltas.append((cg, d))
+        else:
+            polluted_deltas.append((cg, d))
+
+    if polluted_deltas and clean_deltas:
+        # Some clean deltas survive — drop the polluted ones entirely.
+        logger.warning(
+            "aggregate: dropping %d of %d gradients with non-finite values "
+            "(miners=%s)",
+            len(polluted_deltas),
+            len(gradients),
+            [cg.metadata.miner_uid for cg, _ in polluted_deltas],
+        )
+        deltas = [d for _, d in clean_deltas]
+    elif polluted_deltas and not clean_deltas:
+        # All deltas had at least one non-finite tensor — sanitize and proceed
+        # rather than failing the round. Non-finite entries become 0.
+        logger.warning(
+            "aggregate: all %d gradients have non-finite values; zeroing the "
+            "non-finite entries before averaging",
+            len(gradients),
+        )
+        for _, d in polluted_deltas:
+            for name, t in d.delta.items():
+                d.delta[name] = torch.where(torch.isfinite(t), t, torch.zeros_like(t))
+        deltas = [d for _, d in polluted_deltas]
+    else:
+        deltas = [d for _, d in clean_deltas]
+
     names = list(deltas[0].delta.keys())
-    # n = len(deltas)
 
     avg_delta: dict[str, torch.Tensor] = {}
     for name in names:

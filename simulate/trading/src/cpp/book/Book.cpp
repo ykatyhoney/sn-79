@@ -118,7 +118,7 @@ Book::OptLevelRef Book::bestSellLevel() const noexcept
 
 //-------------------------------------------------------------------------
 
-void Book::placeOrder(MarketOrder::Ptr order)
+void Book::placeOrder(const MarketOrder::Ptr& order)
 {
     using namespace taosim::util;
 
@@ -156,7 +156,7 @@ void Book::placeOrder(MarketOrder::Ptr order)
 
 //-------------------------------------------------------------------------
 
-void Book::placeOrder(LimitOrder::Ptr order)
+void Book::placeOrder(const LimitOrder::Ptr& order)
 {
     const auto clientCtx = m_order2clientCtx.at(order->id());
 
@@ -172,13 +172,13 @@ void Book::placeOrder(LimitOrder::Ptr order)
 
 //-------------------------------------------------------------------------
 
-void Book::placeLimitBuy(LimitOrder::Ptr order)
+void Book::placeLimitBuy(const LimitOrder::Ptr& order)
 {
     if (!m_sellQueue.hasActiveOrders() || order->price() < bestAsk()) {
         auto firstLessThan = std::find_if(
             m_buyQueue.rbegin(),
             m_buyQueue.rend(),
-            [order](const auto& level) { return level.price() <= order->price(); });
+            [&order](const auto& level) { return level.price() <= order->price(); });
 
         if (firstLessThan != m_buyQueue.rend() && firstLessThan->price() == order->price()) {
             registerLimitOrder(order);
@@ -202,7 +202,7 @@ void Book::placeLimitBuy(LimitOrder::Ptr order)
                 auto firstLessThan = std::find_if(
                     m_buyQueue.rbegin(),
                     m_buyQueue.rend(),
-                    [order](const auto& level) { return level.price() <= order->price(); });
+                    [&order](const auto& level) { return level.price() <= order->price(); });
 
                 if (firstLessThan != m_buyQueue.rend() && firstLessThan->price() == order->price()) {
                     registerLimitOrder(order);
@@ -226,13 +226,13 @@ void Book::placeLimitBuy(LimitOrder::Ptr order)
 
 //-------------------------------------------------------------------------
 
-void Book::placeLimitSell(LimitOrder::Ptr order)
+void Book::placeLimitSell(const LimitOrder::Ptr& order)
 {
     if (!m_buyQueue.hasActiveOrders() || order->price() > bestBid()) {
         auto firstGreaterThan = std::find_if(
             m_sellQueue.begin(),
             m_sellQueue.end(),
-            [order](const auto& level) { return level.price() >= order->price(); });
+            [&order](const auto& level) { return level.price() >= order->price(); });
 
         if (firstGreaterThan != m_sellQueue.end() && firstGreaterThan->price() == order->price()) {
             registerLimitOrder(order);
@@ -256,7 +256,7 @@ void Book::placeLimitSell(LimitOrder::Ptr order)
                 auto firstGreaterThan = std::find_if(
                     m_sellQueue.begin(),
                     m_sellQueue.end(),
-                    [order](const auto& level) { return level.price() >= order->price(); });
+                    [&order](const auto& level) { return level.price() >= order->price(); });
 
                 if (firstGreaterThan != m_sellQueue.end() && firstGreaterThan->price() == order->price()) {
                     registerLimitOrder(order);
@@ -343,7 +343,7 @@ std::optional<LimitOrder::Ptr> Book::getOrder(OrderID orderId) const
 
 //-------------------------------------------------------------------------
 
-void Book::registerLimitOrder(LimitOrder::Ptr order)
+void Book::registerLimitOrder(const LimitOrder::Ptr& order)
 {
     m_orderIdMap[order->id()] = order;
     if (m_simulation->debug()) {
@@ -359,7 +359,7 @@ void Book::registerLimitOrder(LimitOrder::Ptr order)
 
 //-------------------------------------------------------------------------
 
-void Book::unregisterLimitOrder(LimitOrder::Ptr order)
+void Book::unregisterLimitOrder(const LimitOrder::Ptr& order)
 {
     m_signals.unregister(order, m_id);
     m_orderIdMap.erase(order->id());
@@ -368,7 +368,7 @@ void Book::unregisterLimitOrder(LimitOrder::Ptr order)
 
 //-------------------------------------------------------------------------
 
-taosim::decimal_t Book::processAgainstTheBuyQueue(Order::Ptr order, taosim::decimal_t minPrice)
+taosim::decimal_t Book::processAgainstTheBuyQueue(const Order::Ptr& order, taosim::decimal_t minPrice)
 {
     using namespace taosim::util;
 
@@ -435,13 +435,14 @@ taosim::decimal_t Book::processAgainstTheBuyQueue(Order::Ptr order, taosim::deci
         order->setVolume(taosim::util::round(order->volume(), maxDecimals));
         iop->setVolume(taosim::util::round(iop->volume(), maxDecimals));
 
-        const auto& aggBalances = m_simulation->exchange()->accounts()[m_order2clientCtx[order->id()].agentId][m_id];
+        auto& accounts = m_simulation->exchange()->accounts();
+        const auto& aggBalances = accounts[agentId][m_id];
         if ((order->volume() > 0_dec && taosim::util::round(order->volume(), volumeDecimals) == 0_dec) ||
             aggBalances.getReservationInBase(order->id(), 1_dec) == 0_dec){
             order->setVolume(0_dec);
         }
 
-        const auto& restingBalances = m_simulation->exchange()->accounts()[m_order2clientCtx[iop->id()].agentId][m_id];
+        const auto& restingBalances = accounts[iopAgentId][m_id];
         if ((iop->volume() > 0_dec && taosim::util::round(iop->volume(), volumeDecimals) == 0_dec) ||
             restingBalances.getReservationInBase(iop->id(), 1_dec) == 0_dec){
             bestBuyDeque->updateVolume(-taosim::util::round(iop->totalVolume(), maxDecimals));
@@ -476,7 +477,7 @@ taosim::decimal_t Book::processAgainstTheBuyQueue(Order::Ptr order, taosim::deci
 
 //-------------------------------------------------------------------------
 
-taosim::decimal_t Book::processAgainstTheSellQueue(Order::Ptr order, taosim::decimal_t maxPrice)
+taosim::decimal_t Book::processAgainstTheSellQueue(const Order::Ptr& order, taosim::decimal_t maxPrice)
 {
     using namespace taosim::util;
 
@@ -544,13 +545,14 @@ taosim::decimal_t Book::processAgainstTheSellQueue(Order::Ptr order, taosim::dec
         order->setVolume(taosim::util::round(order->volume(), maxDecimals));
         iop->setVolume(taosim::util::round(iop->volume(), maxDecimals));
 
-        const auto& aggBalances = m_simulation->exchange()->accounts()[m_order2clientCtx[order->id()].agentId][m_id];
+        auto& accounts = m_simulation->exchange()->accounts();
+        const auto& aggBalances = accounts[agentId][m_id];
         if ((order->volume() > 0_dec && taosim::util::round(order->volume(), volumeDecimals) == 0_dec) ||
             aggBalances.getReservationInBase(order->id(), 1_dec) == 0_dec){
             order->setVolume(0_dec);
         }
 
-        const auto& restingBalances = m_simulation->exchange()->accounts()[m_order2clientCtx[iop->id()].agentId][m_id];
+        const auto& restingBalances = accounts[iopAgentId][m_id];
         if ((iop->volume() > 0_dec && taosim::util::round(iop->volume(), volumeDecimals) == 0_dec) ||
             restingBalances.getReservationInBase(iop->id(), 1_dec) == 0_dec){
             bestSellDeque->updateVolume(-taosim::util::round(iop->totalVolume(), maxDecimals));
@@ -585,7 +587,7 @@ taosim::decimal_t Book::processAgainstTheSellQueue(Order::Ptr order, taosim::dec
 //-------------------------------------------------------------------------
 
 taosim::book::TickContainer* Book::preventSelfTrade(
-    taosim::book::TickContainer* queue, LimitOrder::Ptr iop, Order::Ptr order, AgentId agentId)
+    taosim::book::TickContainer* queue, const LimitOrder::Ptr& iop, const Order::Ptr& order, AgentId agentId)
 {
     auto stpFlag = order->stpFlag();
     auto now = m_simulation->currentTimestamp();

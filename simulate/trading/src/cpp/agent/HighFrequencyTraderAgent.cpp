@@ -205,7 +205,7 @@ void HighFrequencyTraderAgent::receiveMessage(Message::Ptr msg)
 
 void HighFrequencyTraderAgent::handleSimulationStart()
 {
-    m_id = simulation()->exchange()->accounts().idBimap().left.at(name());
+    m_id = simulation()->exchange()->accounts().lookupLocalAgentId(name());
     for (BookId bookId = 0; bookId < m_bookCount; ++bookId) {
         simulation()->dispatchMessage(
             simulation()->currentTimestamp(),
@@ -235,7 +235,7 @@ void HighFrequencyTraderAgent::handleTradeSubscriptionResponse()
 
 void HighFrequencyTraderAgent::handleRetrieveL1Response(Message::Ptr msg)
 {
-    const auto payload = std::dynamic_pointer_cast<RetrieveL1ResponsePayload>(msg->payload);
+    const auto payload = std::static_pointer_cast<RetrieveL1ResponsePayload>(msg->payload);
     const BookId bookId = payload->bookId;
     m_deltaHFT[bookId] = m_delta / (1.0 + std::exp(std::abs(m_inventory[bookId]) - m_psi));
     m_tauHFT[bookId] = std::max(
@@ -280,7 +280,7 @@ void HighFrequencyTraderAgent::handleRetrieveL1Response(Message::Ptr msg)
 
 void HighFrequencyTraderAgent::handleLimitOrderPlacementResponse(Message::Ptr msg)
 {
-    const auto payload = std::dynamic_pointer_cast<PlaceOrderLimitResponsePayload>(msg->payload);
+    const auto payload = std::static_pointer_cast<PlaceOrderLimitResponsePayload>(msg->payload);
     const BookId bookId = payload->requestPayload->bookId;
 
 
@@ -334,7 +334,7 @@ void HighFrequencyTraderAgent::handleCancelOrdersErrorResponse(Message::Ptr msg)
 
 void HighFrequencyTraderAgent::handleTrade(Message::Ptr msg)
 {
-    const auto payload = std::dynamic_pointer_cast<EventTradePayload>(msg->payload);
+    const auto payload = std::static_pointer_cast<EventTradePayload>(msg->payload);
     const BookId bookId = payload->bookId;
 
     if (m_id == payload->context.aggressingAgentId) {

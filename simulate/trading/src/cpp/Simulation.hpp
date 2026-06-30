@@ -78,7 +78,7 @@ public:
         const std::string& type,
         std::map<std::string, std::string> payload) const;
 
-    void queueMessage(Message::Ptr msg) const;
+    void queueMessage(const Message::Ptr& msg) const;
 
     template<typename... Args>
     requires std::constructible_from<taosim::message::PrioritizedMessage, Args...>
@@ -184,7 +184,7 @@ public:
 
     void step();
     void clearFilledOrders() noexcept;
-    void deliverMessage(Message::Ptr msg);
+    void deliverMessage(const Message::Ptr& msg);
 
     [[nodiscard]] static std::unique_ptr<Simulation> fromXML(pugi::xml_node node);
 

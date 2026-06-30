@@ -14,6 +14,10 @@
 
 //-------------------------------------------------------------------------
 
+// Forward declarations to avoid pulling MagneticField/Process headers into the
+// public agent header just for cached-pointer member types.
+namespace taosim::process { class MagneticField; class Process; }
+
 namespace taosim::agent
 {
 
@@ -151,6 +155,17 @@ private:
     std::vector<TopLevel> m_topLevel;
     std::vector<boost::circular_buffer<double>> m_priceHist;
     std::vector<boost::circular_buffer<double>> m_logReturns;
+    // Incrementally-maintained sum and sum-of-squares of m_logReturns[bookId],
+    // updated on every push (with proper subtraction on circular-buffer eviction).
+    // Used by forecast() to derive mean (compC) and population variance in O(1)
+    // instead of re-scanning the entire history each tick.
+    std::vector<double> m_logReturnSum;
+    std::vector<double> m_logReturnSqSum;
+    // Cached per-bookId process pointers, populated once at configure() —
+    // eliminates the per-tick string lookup + RTTI cast through
+    // exchange()->process("magneticfield"/"fundamental", bookId).
+    std::vector<taosim::process::MagneticField*> m_magneticField;
+    std::vector<taosim::process::Process*> m_fundamental;
 };
 
 //-------------------------------------------------------------------------

@@ -118,7 +118,7 @@ OrderResult ClearingManager::handleOrder(const OrderDesc& orderDesc)
     }
 
     m_exchange->simulation()->logDebug("{} | AGENT #{} BOOK {} : MAKING RESERVATION {} {} WITH LEV {} FOR {} ORDER #{}", 
-        m_exchange->simulation()->currentTimestamp(), std::holds_alternative<LocalAgentId>(agentId) ? m_exchange->accounts().idBimap().left.at(std::get<LocalAgentId>(agentId)) : std::get<AgentId>(agentId), m_exchange->simulation()->bookIdCanon(bookId),
+        m_exchange->simulation()->currentTimestamp(), std::holds_alternative<LocalAgentId>(agentId) ? m_exchange->accounts().lookupLocalAgentId(std::get<LocalAgentId>(agentId)) : std::get<AgentId>(agentId), m_exchange->simulation()->bookIdCanon(bookId),
         validationResult.amount, validationResult.direction == OrderDirection::BUY ? "QUOTE" : "BASE", validationResult.leverage, validationResult.direction == OrderDirection::BUY ? "BUY" : "SELL", orderId
     );
     auto reserved = balances.makeReservation(orderId, price > 0_dec ? price : curPrice,
@@ -132,7 +132,7 @@ OrderResult ClearingManager::handleOrder(const OrderDesc& orderDesc)
     
     m_exchange->simulation()->logDebug(
         "{} | AGENT #{} BOOK {} : RESERVATION OF {} BASE + {} QUOTE (={} {}) CREATED FOR {} ORDER #{} ({}x{}@{}) | BEST {} : {} | MAX LEV : {}", 
-        m_exchange->simulation()->currentTimestamp(), std::holds_alternative<LocalAgentId>(agentId) ? m_exchange->accounts().idBimap().left.at(std::get<LocalAgentId>(agentId)) : std::get<AgentId>(agentId), m_exchange->simulation()->bookIdCanon(bookId),
+        m_exchange->simulation()->currentTimestamp(), std::holds_alternative<LocalAgentId>(agentId) ? m_exchange->accounts().lookupLocalAgentId(std::get<LocalAgentId>(agentId)) : std::get<AgentId>(agentId), m_exchange->simulation()->bookIdCanon(bookId),
         reserved.base, reserved.quote, validationResult.amount, validationResult.direction == OrderDirection::BUY ? "QUOTE" : "BASE",
         validationResult.direction == OrderDirection::BUY ? "BUY" : "SELL", orderId, 
         1_dec + validationResult.leverage, quantity, price > 0_dec ? fmt::format("{}", price) : "MARKET",
@@ -334,7 +334,10 @@ Fees ClearingManager::handleTrade(const TradeDesc& tradeDesc)
             trade->price()
         )};
     }
-    LimitOrder::Ptr restingOrder = std::dynamic_pointer_cast<LimitOrder>(*restingOrderIt);
+    // Resting orders only ever come off the limit-order book, so the static cast
+    // is safe and skips the dynamic_pointer_cast RTTI check (~1 vtable lookup per
+    // trade, with thousands of trades per tick).
+    LimitOrder::Ptr restingOrder = std::static_pointer_cast<LimitOrder>(*restingOrderIt);
 
     auto aggressingOrderIt = std::find_if(
         aggressingAgentActiveOrders.begin(),

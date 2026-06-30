@@ -494,31 +494,96 @@ def compute_loss(
     `sigma=0.0` (default) reproduces the original strict-CE behaviour
     bit-exactly. Typical non-zero values are 0.5-2.0 bins; pick by
     empirical sweep, not intuition.
+
+    `mask_nonfinite_rows=True` (validator-scoring path): when ANY field at
+    a token row produces a non-finite per-row loss, the WHOLE row is
+    dropped from EVERY field's reduction. Previously the mask applied
+    per-field, so a row with `order_type=NaN` but finite `price` still
+    contributed its `price` value to the field-loss average — biasing the
+    score for fields that aren't actually degenerate at the token. With
+    the whole-row mask, a single bad token doesn't poison any field's
+    aggregate. Training (mask_nonfinite_rows=False) keeps the original
+    fast path bit-exactly.
     """
     device = next(iter(logits.values())).device
-    total = torch.tensor(0.0, device=device)
-    details = {}
+    details: dict[str, float] = {}
+    field_weight_map = {name: _FIELD_WEIGHTS.get(name, 1.0) for name in logits}
+
+    if not mask_nonfinite_rows:
+        # Fast path — training. Unchanged behaviour, bit-exact.
+        total = torch.tensor(0.0, device=device)
+        for name, field_logits in logits.items():
+            field_labels = labels[name]
+            flat_logits = field_logits.reshape(-1, field_logits.size(-1))
+            flat_labels = field_labels.reshape(-1)
+            if name == "order_type":
+                weight = _ORDER_TYPE_WEIGHTS.to(device)
+                loss = F.cross_entropy(flat_logits, flat_labels, weight=weight)
+            elif label_smooth_sigma > 0 and name in _ORDINAL_FIELDS:
+                n_bins = flat_logits.size(-1)
+                soft_targets = _soft_ordinal_targets(flat_labels, n_bins, label_smooth_sigma)
+                log_probs = F.log_softmax(flat_logits, dim=-1)
+                loss = -(soft_targets * log_probs).sum(dim=-1).mean()
+            else:
+                loss = F.cross_entropy(flat_logits, flat_labels)
+            total = total + loss * field_weight_map[name]
+            details[name] = loss.item()
+        return total, details
+
+    # Validator scoring path — whole-row mask. Compute per-row losses for
+    # every field, AND their finiteness masks, then reduce each field over
+    # the globally-finite rows.
+    per_row_losses: dict[str, torch.Tensor] = {}
+    weights: dict[str, torch.Tensor | None] = {}  # only order_type carries a per-row weight
     for name, field_logits in logits.items():
         field_labels = labels[name]
         flat_logits = field_logits.reshape(-1, field_logits.size(-1))
         flat_labels = field_labels.reshape(-1)
         if name == "order_type":
-            weight = _ORDER_TYPE_WEIGHTS.to(device)
-            loss = F.cross_entropy(flat_logits, flat_labels, weight=weight)
+            w = _ORDER_TYPE_WEIGHTS.to(device)
+            per_row_losses[name] = F.cross_entropy(flat_logits, flat_labels, weight=w, reduction="none")
+            weights[name] = w[flat_labels]
         elif label_smooth_sigma > 0 and name in _ORDINAL_FIELDS:
             n_bins = flat_logits.size(-1)
             soft_targets = _soft_ordinal_targets(flat_labels, n_bins, label_smooth_sigma)
             log_probs = F.log_softmax(flat_logits, dim=-1)
-            loss = -(soft_targets * log_probs).sum(dim=-1).mean()
+            per_row_losses[name] = -(soft_targets * log_probs).sum(dim=-1)
+            weights[name] = None
         else:
-            loss = F.cross_entropy(flat_logits, flat_labels)
-        # Validators pass mask_nonfinite_rows=True: if a field's reduced loss is
-        # non-finite, recompute over only the finite rows so a few degenerate
-        # positions don't void the whole batch. Clean batches never enter here,
-        # so training stays bit-exact.
-        if mask_nonfinite_rows and not bool(torch.isfinite(loss)):
-            loss = _finite_rows_loss(name, flat_logits, flat_labels, label_smooth_sigma)
-        field_weight = _FIELD_WEIGHTS.get(name, 1.0)
-        total = total + loss * field_weight
+            per_row_losses[name] = F.cross_entropy(flat_logits, flat_labels, reduction="none")
+            weights[name] = None
+
+    # Whole-row mask: a row is kept only if every field's per-row loss is
+    # finite. Token counts MUST agree across fields (same B×T flatten);
+    # asserted by min-length to fail loudly if a caller violates this.
+    row_counts = {name: t.numel() for name, t in per_row_losses.items()}
+    n_rows = min(row_counts.values())
+    if any(c != n_rows for c in row_counts.values()):
+        raise ValueError(
+            f"compute_loss: per-field per-row tensor sizes diverge {row_counts}; "
+            "callers must pass logits/labels with consistent B*T flattening."
+        )
+    global_finite = torch.ones(n_rows, dtype=torch.bool, device=device)
+    for t in per_row_losses.values():
+        global_finite &= torch.isfinite(t)
+
+    # If ALL rows are non-finite, fall back to NaN per-field (matches the
+    # prior _finite_rows_loss behaviour, which returned NaN in that case).
+    any_finite = bool(global_finite.any())
+    total = torch.tensor(0.0, device=device)
+    for name, prl in per_row_losses.items():
+        if not any_finite:
+            details[name] = float("nan")
+            total = total + prl.new_tensor(float("nan")) * field_weight_map[name]
+            continue
+        w = weights[name]
+        if w is not None:
+            # F.cross_entropy weighted-mean: sum(loss*w) / sum(w) over the mask
+            masked = prl[global_finite]
+            masked_w = w[global_finite]
+            loss = masked.sum() / masked_w.sum()
+        else:
+            loss = prl[global_finite].mean()
+        total = total + loss * field_weight_map[name]
         details[name] = loss.item()
     return total, details

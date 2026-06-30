@@ -55,8 +55,8 @@ void DistributedProxyAgent::handleMessageForExchangeService(Message::Ptr msg)
 {
     if (msg->type != "EVENT_TRADE") return;
 
-    const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
-    const auto subPld = std::dynamic_pointer_cast<EventTradePayload>(pld->payload);
+    const auto pld = std::static_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
+    const auto subPld = std::static_pointer_cast<EventTradePayload>(pld->payload);
 
     if (subPld->isResting) {
         fmt::println("TRADE NOTIF {}", json::jsonSerializable2str(subPld));

@@ -147,7 +147,7 @@ void InitializationAgent::placeSellOrders()
 
 void InitializationAgent::handleLimitOrderPlacementResponse(Message::Ptr msg)
 {
-    const auto payload = std::dynamic_pointer_cast<PlaceOrderLimitResponsePayload>(msg->payload);
+    const auto payload = std::static_pointer_cast<PlaceOrderLimitResponsePayload>(msg->payload);
     simulation()->dispatchMessage(
         simulation()->currentTimestamp(),
         m_tau,

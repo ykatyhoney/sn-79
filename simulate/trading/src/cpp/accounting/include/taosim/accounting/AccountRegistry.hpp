@@ -11,6 +11,9 @@
 
 #include <boost/bimap.hpp>
 
+#include <string_view>
+#include <unordered_map>
+
 //-------------------------------------------------------------------------
 
 namespace taosim::accounting
@@ -42,6 +45,13 @@ public:
 
     [[nodiscard]] bool contains(const std::variant<AgentId, LocalAgentId>& agentId) const;
     [[nodiscard]] AgentId getAgentId(const std::variant<AgentId, LocalAgentId>& agentId) const;
+
+    // O(1) local-agent name → AgentId lookup. Mirrors m_idBimap.left.at() but on
+    // an unordered_map with heterogeneous lookup; replaces ~14 string compares
+    // per call (rb-tree at 30k+ agents) on hot order-placement / settlement
+    // paths in MultiBookExchangeAgent + ClearingManager. Throws on miss to match
+    // the .left.at() semantics callers already rely on.
+    [[nodiscard]] AgentId lookupLocalAgentId(std::string_view name) const;
     [[nodiscard]] std::optional<std::reference_wrapper<const std::string>> getAgentBaseName(
         AgentId agentId) const noexcept;
 
@@ -73,6 +83,14 @@ private:
     std::map<std::string, std::function<Account()>> m_agentTypeAccountTemplates;
     AgentIdBimap m_idBimap;
     AgentIdToBaseNameMap m_agentIdToBaseName;
+    struct StringHash {
+        using is_transparent = void;
+        std::size_t operator()(std::string_view s) const noexcept { return std::hash<std::string_view>{}(s); }
+        std::size_t operator()(const std::string& s) const noexcept { return std::hash<std::string_view>{}(s); }
+        std::size_t operator()(const char* s) const noexcept { return std::hash<std::string_view>{}(s); }
+    };
+    // Mirrors m_idBimap.left; kept in lock-step in registerLocal + registerJson.
+    std::unordered_map<std::string, AgentId, StringHash, std::equal_to<>> m_idLookup;
 
     friend class Simulation;
 };

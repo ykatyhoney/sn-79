@@ -85,33 +85,33 @@ public:
 private:
     void handleException();
 
-    void handleDistributedMessage(Message::Ptr msg);
-    void handleDistributedAgentReset(Message::Ptr msg);
-    void handleDistributedPlaceMarketOrder(Message::Ptr msg);
-    void handleDistributedPlaceLimitOrder(Message::Ptr msg);
-    void handleDistributedRetrieveOrders(Message::Ptr msg);
-    void handleDistributedCancelOrders(Message::Ptr msg);
-    void handleDistributedClosePositions(Message::Ptr msg);
-    void handleDistributedUnknownMessage(Message::Ptr msg);
+    void handleDistributedMessage(const Message::Ptr&  msg);
+    void handleDistributedAgentReset(const Message::Ptr&  msg);
+    void handleDistributedPlaceMarketOrder(const Message::Ptr&  msg);
+    void handleDistributedPlaceLimitOrder(const Message::Ptr&  msg);
+    void handleDistributedRetrieveOrders(const Message::Ptr&  msg);
+    void handleDistributedCancelOrders(const Message::Ptr&  msg);
+    void handleDistributedClosePositions(const Message::Ptr&  msg);
+    void handleDistributedUnknownMessage(const Message::Ptr&  msg);
 
-    void handleLocalMessage(Message::Ptr msg);
-    void handleLocalPlaceMarketOrder(Message::Ptr msg);
-    void handleLocalPlaceLimitOrder(Message::Ptr msg);
-    void handleLocalRetrieveOrders(Message::Ptr msg);
-    void handleLocalCancelOrders(Message::Ptr msg);
-    void handleLocalClosePositions(Message::Ptr msg);
-    void handleLocalRetrieveL1(Message::Ptr msg);
-    void handleLocalRetrieveL2(Message::Ptr msg);
-    void handleLocalMarketOrderSubscription(Message::Ptr msg);
-    void handleLocalLimitOrderSubscription(Message::Ptr msg);
-    void handleLocalTradeSubscription(Message::Ptr msg);
-    void handleLocalTradeByOrderSubscription(Message::Ptr msg);
-    void handleLocalUnknownMessage(Message::Ptr msg);
+    void handleLocalMessage(const Message::Ptr&  msg);
+    void handleLocalPlaceMarketOrder(const Message::Ptr&  msg);
+    void handleLocalPlaceLimitOrder(const Message::Ptr&  msg);
+    void handleLocalRetrieveOrders(const Message::Ptr&  msg);
+    void handleLocalCancelOrders(const Message::Ptr&  msg);
+    void handleLocalClosePositions(const Message::Ptr&  msg);
+    void handleLocalRetrieveL1(const Message::Ptr&  msg);
+    void handleLocalRetrieveL2(const Message::Ptr&  msg);
+    void handleLocalMarketOrderSubscription(const Message::Ptr&  msg);
+    void handleLocalLimitOrderSubscription(const Message::Ptr&  msg);
+    void handleLocalTradeSubscription(const Message::Ptr&  msg);
+    void handleLocalTradeByOrderSubscription(const Message::Ptr&  msg);
+    void handleLocalUnknownMessage(const Message::Ptr&  msg);
 
-    void notifyMarketOrderSubscribers(MarketOrder::Ptr marketOrder);
-    void notifyLimitOrderSubscribers(LimitOrder::Ptr limitOrder);
-    void notifyTradeSubscribers(TradeWithLogContext::Ptr tradeWithCtx);
-    void notifyTradeSubscribersByOrderID(TradeWithLogContext::Ptr tradeWithCtx, OrderID orderId);
+    void notifyMarketOrderSubscribers(const MarketOrder::Ptr& marketOrder);
+    void notifyLimitOrderSubscribers(const LimitOrder::Ptr& limitOrder);
+    void notifyTradeSubscribers(const TradeWithLogContext::Ptr& tradeWithCtx);
+    void notifyTradeSubscribersByOrderID(const TradeWithLogContext::Ptr& tradeWithCtx, OrderID orderId);
 
     void orderCallback(Order::Ptr order, OrderContext ctx);
     void orderLogCallback(Order::Ptr order, OrderContext ctx);

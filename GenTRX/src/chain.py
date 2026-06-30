@@ -417,6 +417,19 @@ class GenTRXChain:
         Returns mapping of uid → BucketInfo for all miners with valid
         128-char commitments.
         """
+        # Refresh the metagraph so re-registered uids' NEW hotkeys are visible
+        # below. Without this the gradient server holds whatever instance was
+        # built at startup, and any uid that was deregistered + re-registered
+        # to a different hotkey gets dropped by the
+        # `decoded_ss58 not in hotkey_to_uid` filter — the new commitment is
+        # unmatchable, _miner_buckets[uid] stays stale (or empty), and every
+        # subsequent gradient_get for that uid hits NoSuchBucket. Refresh is
+        # already rate-limited upstream by _miner_buckets_refresh_s in the
+        # gradient server (30s), so the per-call sync cost is bounded.
+        try:
+            self.metagraph.sync(subtensor=self.subtensor)
+        except Exception as exc:
+            logger.warning("metagraph sync failed in get_miner_buckets: %s", exc)
         try:
             from bittensor.utils import SS58_FORMAT, ss58_encode
 

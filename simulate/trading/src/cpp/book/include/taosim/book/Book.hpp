@@ -63,18 +63,18 @@ public:
     template<typename... Args>
     void logTrade(Args&&... args);
 
-    void placeOrder(MarketOrder::Ptr order);
-    void placeOrder(LimitOrder::Ptr order);
-    void placeLimitBuy(LimitOrder::Ptr order);
-    void placeLimitSell(LimitOrder::Ptr order);
+    void placeOrder(const MarketOrder::Ptr& order);
+    void placeOrder(const LimitOrder::Ptr& order);
+    void placeLimitBuy(const LimitOrder::Ptr& order);
+    void placeLimitSell(const LimitOrder::Ptr& order);
     bool cancelOrder(OrderID orderId, std::optional<taosim::decimal_t> volumeToCancel = {});
     [[nodiscard]] std::optional<LimitOrder::Ptr> getOrder(OrderID orderId) const;
-    void registerLimitOrder(LimitOrder::Ptr order);
-    void unregisterLimitOrder(LimitOrder::Ptr order);
-    taosim::decimal_t processAgainstTheBuyQueue(Order::Ptr order, taosim::decimal_t minPrice);
-    taosim::decimal_t processAgainstTheSellQueue(Order::Ptr order, taosim::decimal_t maxPrice);
+    void registerLimitOrder(const LimitOrder::Ptr& order);
+    void unregisterLimitOrder(const LimitOrder::Ptr& order);
+    taosim::decimal_t processAgainstTheBuyQueue(const Order::Ptr& order, taosim::decimal_t minPrice);
+    taosim::decimal_t processAgainstTheSellQueue(const Order::Ptr& order, taosim::decimal_t maxPrice);
     [[nodiscard]] taosim::book::TickContainer* preventSelfTrade(
-        taosim::book::TickContainer* queue, LimitOrder::Ptr iop, Order::Ptr order, AgentId agentId);
+        taosim::book::TickContainer* queue, const LimitOrder::Ptr& iop, const Order::Ptr& order, AgentId agentId);
     void clearFilledOrders() noexcept;
     void printCSV(uint32_t depth) const;
 

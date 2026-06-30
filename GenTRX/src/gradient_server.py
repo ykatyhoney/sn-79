@@ -323,6 +323,17 @@ class GradientAggregator:
             None  # block number from most recent POST /round
         )
         self._lock = threading.Lock()
+        # Guards `_assignments` + `_prev_round_assignments` state-transitions.
+        # Separate from `_lock` (which holds the wide critical sections around
+        # checkpoint load/save) so the API path doesn't stall behind I/O.
+        # RLock: nested re-entry from inside `_create_assignment_for` ->
+        # `_create_round_assignments` is safe.
+        self._assignments_lock = threading.RLock()
+        # Guards `_scoring_cache` get/set/clear so eager-score callers don't
+        # see a half-cleared cache. The model object itself is mutated in place
+        # by aggregation; we evict on the boundary rather than locking the
+        # forward pass.
+        self._scoring_cache_lock = threading.Lock()
         self._running = False
         self._thread: threading.Thread | None = None
 
@@ -464,6 +475,13 @@ class GradientAggregator:
         self._processed_grad_keys: set[str] = set()
         # Negative cache: keys that returned 404/error — skip until next round
         self._failed_grad_keys: set[str] = set()
+        # Per-miner boto3 S3 client cache. Constructing a boto3.client costs
+        # ~50-100 ms (TLS handshake, signer load, endpoint resolution); under
+        # the per-tick miner-gradient poll loop we'd otherwise build one per
+        # miner per tick. Keyed by (endpoint, bucket, access_key) so a miner
+        # rotating credentials yields a fresh client. Cleared on
+        # `_refresh_miner_buckets` when the bucket map changes.
+        self._miner_s3_clients: dict[tuple, Any] = {}
 
         # Price/volume scaling from simulator config (set from first state packet)
         self._price_scale: int | None = None
@@ -691,42 +709,49 @@ class GradientAggregator:
         Returns None if data is not ready yet (PENDING state).
         Returns the assignment dict when state is DATA_READY.
         Also transitions to DELIVERED and stamps `_delivered_at`.
+
+        Thread safety: the create-then-transition block runs under
+        `_assignments_lock` so a concurrent `_create_round_assignments` /
+        `_check_data_readiness` / second `get_assignment` cannot interleave
+        check-then-act on the same uid. `_resolve_data_keys` issues network
+        I/O — it stays inside the lock so the PENDING→DATA_READY transition
+        is atomic with the data-key resolution.
         """
-        a = self._assignments.get(miner_uid)
-
-        # Create on demand if no assignment exists for this UID
-        if a is None or a.get("round") != self._agg_round:
-            self._create_assignment_for(miner_uid)
-            # Check data readiness immediately
+        with self._assignments_lock:
             a = self._assignments.get(miner_uid)
-            if a and a.get("_state") == "PENDING":
-                data_keys = self._resolve_data_keys(
-                    a["books"], a["ts_start"], a["ts_end"]
-                )
-                if data_keys:
-                    a["data"] = data_keys
-                    a["_state"] = "DATA_READY"
 
-        a = self._assignments.get(miner_uid)
-        if a is None:
-            return None
-        if a.get("_state") != "DATA_READY":
-            return None
+            # Create on demand if no assignment exists for this UID
+            if a is None or a.get("round") != self._agg_round:
+                self._create_assignment_for(miner_uid)
+                a = self._assignments.get(miner_uid)
+                if a and a.get("_state") == "PENDING":
+                    data_keys = self._resolve_data_keys(
+                        a["books"], a["ts_start"], a["ts_end"]
+                    )
+                    if data_keys:
+                        a["data"] = data_keys
+                        a["_state"] = "DATA_READY"
 
-        # Transition to DELIVERED, stamp the delivery time. Used by the
-        # heartbeat-loss fallback in _round_complete.
-        a["_state"] = "DELIVERED"
-        a["_delivered_at"] = time.time()
-        logger.info(
-            "[GTX] Assignment delivered: miner=%d round=%d books=%s ts=[%d,%d] data=%d files",
-            miner_uid,
-            a.get("round", 0),
-            a.get("books", []),
-            int(a.get("ts_start", 0)),
-            int(a.get("ts_end", 0)),
-            len(a.get("data", [])),
-        )
-        return {k: v for k, v in a.items() if not k.startswith("_")}
+            a = self._assignments.get(miner_uid)
+            if a is None:
+                return None
+            if a.get("_state") != "DATA_READY":
+                return None
+
+            # Transition to DELIVERED, stamp the delivery time. Used by the
+            # heartbeat-loss fallback in _round_complete.
+            a["_state"] = "DELIVERED"
+            a["_delivered_at"] = time.time()
+            logger.info(
+                "[GTX] Assignment delivered: miner=%d round=%d books=%s ts=[%d,%d] data=%d files",
+                miner_uid,
+                a.get("round", 0),
+                a.get("books", []),
+                int(a.get("ts_start", 0)),
+                int(a.get("ts_end", 0)),
+                len(a.get("data", [])),
+            )
+            return {k: v for k, v in a.items() if not k.startswith("_")}
 
     def _create_round_assignments(self) -> None:
         """Create new PENDING assignments for all miners for the current round.
@@ -776,47 +801,50 @@ class GradientAggregator:
         self._refresh_miner_buckets()
         n_miners = max(len(self._miner_buckets), len(self._assignments), 2)
 
-        for miner_uid in range(n_miners):
-            miner_rng = random.Random(
-                hashlib.sha256(
-                    f"{self._agg_round}:{miner_uid}:time".encode()
-                ).hexdigest()
-            )
-            beta_sample = 1.0 - miner_rng.betavariate(self.beta_alpha, self.beta_beta)
-            ts_start = int(beta_sample * max_start)
-            ts_end = ts_start + self.window_ns
+        with self._assignments_lock:
+            for miner_uid in range(n_miners):
+                miner_rng = random.Random(
+                    hashlib.sha256(
+                        f"{self._agg_round}:{miner_uid}:time".encode()
+                    ).hexdigest()
+                )
+                beta_sample = 1.0 - miner_rng.betavariate(
+                    self.beta_alpha, self.beta_beta
+                )
+                ts_start = int(beta_sample * max_start)
+                ts_end = ts_start + self.window_ns
 
-            start = (miner_uid * self.books_per_miner) % len(shuffled)
-            assigned = []
-            for i in range(self.books_per_miner):
-                assigned.append(shuffled[(start + i) % len(shuffled)])
+                start = (miner_uid * self.books_per_miner) % len(shuffled)
+                assigned = []
+                for i in range(self.books_per_miner):
+                    assigned.append(shuffled[(start + i) % len(shuffled)])
 
-            self._assignments[miner_uid] = {
-                "round": self._agg_round,
-                "model_version": self._version,
-                "books": assigned,
-                "ts_start": ts_start,
-                "ts_end": ts_end,
-                "data": [],  # resolved later by _check_data_readiness
-                "data_source": "s3" if self.validator_store else "local",
-                "data_endpoint": self.validator_store.endpoint_url
-                if self.validator_store
-                else "",
-                "data_bucket": self.validator_store.bucket
-                if self.validator_store
-                else "",
-                "data_access_key": self.validator_store.access_key
-                if self.validator_store
-                else "",
-                "data_secret_key": self.validator_store.secret_key
-                if self.validator_store
-                else "",
-                "_state": "PENDING",
-                "_created_at": time.time(),
-                "_delivered_at": None,
-                "_gradient_data": None,
-                "_score": None,
-            }
+                self._assignments[miner_uid] = {
+                    "round": self._agg_round,
+                    "model_version": self._version,
+                    "books": assigned,
+                    "ts_start": ts_start,
+                    "ts_end": ts_end,
+                    "data": [],  # resolved later by _check_data_readiness
+                    "data_source": "s3" if self.validator_store else "local",
+                    "data_endpoint": self.validator_store.endpoint_url
+                    if self.validator_store
+                    else "",
+                    "data_bucket": self.validator_store.bucket
+                    if self.validator_store
+                    else "",
+                    "data_access_key": self.validator_store.access_key
+                    if self.validator_store
+                    else "",
+                    "data_secret_key": self.validator_store.secret_key
+                    if self.validator_store
+                    else "",
+                    "_state": "PENDING",
+                    "_created_at": time.time(),
+                    "_delivered_at": None,
+                    "_gradient_data": None,
+                    "_score": None,
+                }
 
         rolled = self._version > self._last_assigned_version
         self._last_assigned_version = self._version
@@ -830,7 +858,13 @@ class GradientAggregator:
         )
 
     def _create_assignment_for(self, miner_uid: int) -> None:
-        """Create a PENDING assignment for a specific miner UID."""
+        """Create a PENDING assignment for a specific miner UID.
+
+        Caller must hold `_assignments_lock` (RLock so re-entry from
+        `get_assignment` is safe). The write at the end mutates
+        `_assignments` and races with `_check_data_readiness` /
+        `_create_round_assignments` if unprotected.
+        """
         self._all_books = self._discover_books()
         if not self._all_books:
             return
@@ -862,30 +896,33 @@ class GradientAggregator:
             shuffled[(start + i) % len(shuffled)] for i in range(self.books_per_miner)
         ]
 
-        self._assignments[miner_uid] = {
-            "round": self._agg_round,
-            "model_version": self._version,
-            "books": assigned,
-            "ts_start": ts_start,
-            "ts_end": ts_end,
-            "data": [],
-            "data_source": "s3" if self.validator_store else "local",
-            "data_endpoint": self.validator_store.endpoint_url
-            if self.validator_store
-            else "",
-            "data_bucket": self.validator_store.bucket if self.validator_store else "",
-            "data_access_key": self.validator_store.access_key
-            if self.validator_store
-            else "",
-            "data_secret_key": self.validator_store.secret_key
-            if self.validator_store
-            else "",
-            "_state": "PENDING",
-            "_created_at": time.time(),
-            "_delivered_at": None,
-            "_gradient_data": None,
-            "_score": None,
-        }
+        with self._assignments_lock:
+            self._assignments[miner_uid] = {
+                "round": self._agg_round,
+                "model_version": self._version,
+                "books": assigned,
+                "ts_start": ts_start,
+                "ts_end": ts_end,
+                "data": [],
+                "data_source": "s3" if self.validator_store else "local",
+                "data_endpoint": self.validator_store.endpoint_url
+                if self.validator_store
+                else "",
+                "data_bucket": self.validator_store.bucket
+                if self.validator_store
+                else "",
+                "data_access_key": self.validator_store.access_key
+                if self.validator_store
+                else "",
+                "data_secret_key": self.validator_store.secret_key
+                if self.validator_store
+                else "",
+                "_state": "PENDING",
+                "_created_at": time.time(),
+                "_delivered_at": None,
+                "_gradient_data": None,
+                "_score": None,
+            }
         # Mark this version as assigned (idempotent: first assignment of
         # the round drives the rollover-bump check; on-demand creates
         # inherit the same value).
@@ -913,20 +950,30 @@ class GradientAggregator:
         return base
 
     def _check_data_readiness(self) -> None:
-        """Move PENDING assignments to DATA_READY when S3 data exists."""
-        for uid, a in self._assignments.items():
-            if a.get("_state") != "PENDING":
-                continue
-            data_keys = self._resolve_data_keys(a["books"], a["ts_start"], a["ts_end"])
-            if data_keys:
-                a["data"] = data_keys
-                a["_state"] = "DATA_READY"
-                logger.debug(
-                    "Assignment data ready: miner=%d round=%d files=%d",
-                    uid,
-                    a["round"],
-                    len(data_keys),
+        """Move PENDING assignments to DATA_READY when S3 data exists.
+
+        Holds `_assignments_lock` for the whole sweep so concurrent
+        `get_assignment` cannot promote the same uid PENDING→DATA_READY
+        twice (which is harmless but wastes a `_resolve_data_keys` call).
+        Snapshotting first avoids the dict-mutated-during-iteration risk
+        on Python implementations where it isn't guaranteed.
+        """
+        with self._assignments_lock:
+            for uid, a in list(self._assignments.items()):
+                if a.get("_state") != "PENDING":
+                    continue
+                data_keys = self._resolve_data_keys(
+                    a["books"], a["ts_start"], a["ts_end"]
                 )
+                if data_keys:
+                    a["data"] = data_keys
+                    a["_state"] = "DATA_READY"
+                    logger.debug(
+                        "Assignment data ready: miner=%d round=%d files=%d",
+                        uid,
+                        a["round"],
+                        len(data_keys),
+                    )
 
     def _resolve_data_keys(
         self,
@@ -1355,11 +1402,35 @@ class GradientAggregator:
             if "rolled_back" in event and not event.get("sibling_only"):
                 self._rollback_history.append(bool(event["rolled_back"]))
                 if self._rollback_history:
-                    last10 = list(self._rollback_history)[-10:]
-                    self._last_aggregation["rollback_rate_10w"] = sum(last10) / len(last10)
+                    window = self._ROLLBACK_RATE_WINDOW
+                    recent = list(self._rollback_history)[-window:]
+                    rate_window = sum(recent) / len(recent)
+                    self._last_aggregation["rollback_rate_10w"] = rate_window
                     self._last_aggregation["rollback_rate_50w"] = (
                         sum(self._rollback_history) / len(self._rollback_history)
                     )
+                    # Loud warning at the rollback-rate edge. Sustained
+                    # high rate means the training signal is clearly
+                    # broken (bad data, bad model, miners colluding to
+                    # submit poison). We log per-round so it surfaces in
+                    # dashboards / pages; we DO NOT halt accepts here —
+                    # halting would prevent recovery. Operator's call.
+                    if (
+                        len(recent) >= window
+                        and rate_window >= self._ROLLBACK_RATE_THRESHOLD
+                    ):
+                        logger.warning(
+                            "[GTX] rollback circuit-breaker: %d/%d of last "
+                            "%d rounds rolled back (rate=%.2f >= %.2f). "
+                            "Training signal appears broken — investigate "
+                            "val data, model version, or coordinated "
+                            "bad-gradient miners.",
+                            int(rate_window * window),
+                            window,
+                            window,
+                            rate_window,
+                            self._ROLLBACK_RATE_THRESHOLD,
+                        )
         try:
             from GenTRX.src import wandb_ops
 
@@ -2048,6 +2119,14 @@ class GradientAggregator:
                 if self._round_complete():
                     self._aggregate_round()
                     self._agg_round += 1
+                    # Prune dedup keys for rounds older than the retention
+                    # window. Each (miner, round) string accumulates one
+                    # entry per miner per round, so on a 100-miner network
+                    # at 10 rounds/hour the set grows ~24 000/day if never
+                    # pruned. Keep the last `_DEDUP_RETENTION_ROUNDS`
+                    # rounds — long enough to absorb a late-arriving
+                    # gradient, short enough that the set stays bounded.
+                    self._prune_dedup_keys()
                     # Siblings: sync canonical model from uid-0 before the new
                     # round so scoring uses the latest checkpoint. Once per round.
                     if not self.is_aggregator:
@@ -2082,6 +2161,10 @@ class GradientAggregator:
             finally:
                 loop.close()
             t_query = time.time() - t_start
+            old_keys = {
+                (b.endpoint_url, b.bucket_name, b.access_key_id)
+                for b in self._miner_buckets.values()
+            } if self._miner_buckets else set()
             if fresh:
                 self._miner_buckets = fresh
             elif not self._miner_buckets:
@@ -2089,6 +2172,16 @@ class GradientAggregator:
             # Static buckets (benchmark miners not on-chain) always win.
             if self._static_buckets:
                 self._miner_buckets.update(self._static_buckets)
+            # Evict cached boto3 clients whose bucket triple no longer
+            # appears in the refreshed map (deregistration / credential
+            # rotation). Live keys keep their cached client — no reconnect
+            # storm on every refresh.
+            new_keys = {
+                (b.endpoint_url, b.bucket_name, b.access_key_id)
+                for b in self._miner_buckets.values()
+            }
+            for stale in old_keys - new_keys:
+                self._miner_s3_clients.pop(stale, None)
             self._miner_buckets_queried_at = now
             logger.info(
                 "[GTX] miner_buckets_refresh n=%d (static=%d) t=%.2fs",
@@ -2147,6 +2240,79 @@ class GradientAggregator:
                     # the drain pass re-attempts via _score_round.
                     self._score_eagerly(uid, a, grad_data)
 
+    def _get_miner_s3_client(self, bucket_info) -> Any:
+        """Return a cached boto3 S3 client for this miner's bucket.
+
+        Keyed by (endpoint_url, bucket_name, access_key_id) so a credential
+        rotation produces a fresh client. boto3.client construction is
+        ~50-100 ms; this cache keeps the per-tick gradient poll loop hot.
+        """
+        import boto3
+        from botocore.config import Config as BotoConfig
+
+        key = (
+            bucket_info.endpoint_url,
+            bucket_info.bucket_name,
+            bucket_info.access_key_id,
+        )
+        cached = self._miner_s3_clients.get(key)
+        if cached is not None:
+            return cached
+        client = boto3.client(
+            "s3",
+            endpoint_url=bucket_info.endpoint_url,
+            aws_access_key_id=bucket_info.access_key_id,
+            aws_secret_access_key=bucket_info.secret_access_key,
+            region_name=getattr(bucket_info, "region", "auto"),
+            config=BotoConfig(
+                signature_version="s3v4",
+                s3={"addressing_style": "path"},
+                connect_timeout=5,
+                read_timeout=10,
+                request_checksum_calculation="when_required",
+                response_checksum_validation="when_required",
+            ),
+        )
+        self._miner_s3_clients[key] = client
+        return client
+
+    # Dedup-set retention window. A gradient delivered late (during the
+    # grace window after a round closes) still needs to be filtered as a
+    # duplicate, so we keep at least a few rounds. Bounded so the sets
+    # don't grow forever.
+    _DEDUP_RETENTION_ROUNDS = 5
+    # Rollback-rate alarm thresholds. Window = `_ROLLBACK_RATE_WINDOW`
+    # most-recent rounds; warning fires when fraction-rolled-back ≥
+    # `_ROLLBACK_RATE_THRESHOLD`. Tuned so a noisy single round doesn't
+    # page anyone — a sustained pattern (8 of 10) does.
+    _ROLLBACK_RATE_WINDOW = 10
+    _ROLLBACK_RATE_THRESHOLD = 0.8
+
+    def _prune_dedup_keys(self) -> None:
+        """Drop `_processed_grad_keys` / `_failed_grad_keys` entries whose
+        round is older than the retention window. Without this the sets
+        grow ~ n_miners per round forever and OOM the process on long
+        sessions.
+        """
+        cutoff = self._agg_round - self._DEDUP_RETENTION_ROUNDS
+
+        def _stale(k: str) -> bool:
+            # Keys look like "miner_<uid>/round_<round_id>".
+            tail = k.rsplit("_", 1)
+            if len(tail) != 2:
+                return False
+            try:
+                return int(tail[1]) < cutoff
+            except ValueError:
+                return False
+
+        self._processed_grad_keys = {
+            k for k in self._processed_grad_keys if not _stale(k)
+        }
+        self._failed_grad_keys = {
+            k for k in self._failed_grad_keys if not _stale(k)
+        }
+
     def _try_read_miner_gradient(self, uid: int, round_id: int) -> bytes | None:
         """Try to read a gradient from a miner's S3 bucket. Returns None if not found."""
         dedup_key = f"miner_{uid}/round_{round_id}"
@@ -2163,25 +2329,9 @@ class GradientAggregator:
                 return None
 
             try:
-                import boto3
-                from botocore.config import Config as BotoConfig
                 from botocore.exceptions import ClientError
 
-                client = boto3.client(
-                    "s3",
-                    endpoint_url=bucket_info.endpoint_url,
-                    aws_access_key_id=bucket_info.access_key_id,
-                    aws_secret_access_key=bucket_info.secret_access_key,
-                    region_name=getattr(bucket_info, "region", "auto"),
-                    config=BotoConfig(
-                        signature_version="s3v4",
-                        s3={"addressing_style": "path"},
-                        connect_timeout=5,
-                        read_timeout=10,
-                        request_checksum_calculation="when_required",
-                        response_checksum_validation="when_required",
-                    ),
-                )
+                client = self._get_miner_s3_client(bucket_info)
                 key = f"{self._bucket_prefix}gradients/{uid}/{round_id:08d}.grad"
                 logger.debug(
                     "[GTX] gradient_get uid=%d round=%d bucket=%s key=%s",
@@ -2462,53 +2612,63 @@ class GradientAggregator:
         don't each pay the checkpoint-load cost. Evicted at aggregation
         boundaries (`_clear_scoring_cache`) because aggregation mutates
         the model in place.
+
+        Thread safety: held under `_scoring_cache_lock` so a concurrent
+        `_clear_scoring_cache` cannot null the cache mid-init, and two
+        siblings racing to load on a cold cache don't both pay the
+        checkpoint-load cost.
         """
-        if self._scoring_cache is not None and self._scoring_cache.get("round") == rnd:
-            return self._scoring_cache
+        with self._scoring_cache_lock:
+            if (
+                self._scoring_cache is not None
+                and self._scoring_cache.get("round") == rnd
+            ):
+                return self._scoring_cache
 
-        try:
-            import torch
+            try:
+                import torch
 
-            from GenTRX.src.model import ModelConfig, OrderModel
-            from GenTRX.src.tokenizer import OrderTokenizer, TokenizerConfig
-            from GenTRX.src.train import load_checkpoint
+                from GenTRX.src.model import ModelConfig, OrderModel
+                from GenTRX.src.tokenizer import OrderTokenizer, TokenizerConfig
+                from GenTRX.src.train import load_checkpoint
 
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            with self._lock:
-                ckpt = load_checkpoint(str(self.checkpoint_path), device="cpu")
-                raw_cfg = ckpt.get("model_config", {})
-                model_cfg = ModelConfig(
-                    **{
-                        k: v
-                        for k, v in raw_cfg.items()
-                        if k in ModelConfig.__dataclass_fields__
-                    }
-                )
-                tok_dict = ckpt.get("tokenizer_config")
-                tokenizer_cfg = (
-                    TokenizerConfig.from_dict(tok_dict)
-                    if tok_dict
-                    else TokenizerConfig()
-                )
-                model = OrderModel(model_cfg).to(device)
-                model.load_state_dict(ckpt["model_state_dict"])
-            tokenizer = OrderTokenizer(tokenizer_cfg)
-            self._scoring_cache = {
-                "round": rnd,
-                "model": model,
-                "model_cfg": model_cfg,
-                "tokenizer_cfg": tokenizer_cfg,
-                "tokenizer": tokenizer,
-                "device": device,
-            }
-            return self._scoring_cache
-        except Exception as exc:
-            logger.warning("Scoring model load failed for round %d: %s", rnd, exc)
-            return None
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                with self._lock:
+                    ckpt = load_checkpoint(str(self.checkpoint_path), device="cpu")
+                    raw_cfg = ckpt.get("model_config", {})
+                    model_cfg = ModelConfig(
+                        **{
+                            k: v
+                            for k, v in raw_cfg.items()
+                            if k in ModelConfig.__dataclass_fields__
+                        }
+                    )
+                    tok_dict = ckpt.get("tokenizer_config")
+                    tokenizer_cfg = (
+                        TokenizerConfig.from_dict(tok_dict)
+                        if tok_dict
+                        else TokenizerConfig()
+                    )
+                    model = OrderModel(model_cfg).to(device)
+                    model.load_state_dict(ckpt["model_state_dict"])
+                tokenizer = OrderTokenizer(tokenizer_cfg)
+                self._scoring_cache = {
+                    "round": rnd,
+                    "model": model,
+                    "model_cfg": model_cfg,
+                    "tokenizer_cfg": tokenizer_cfg,
+                    "tokenizer": tokenizer,
+                    "device": device,
+                }
+                return self._scoring_cache
+            except Exception as exc:
+                logger.warning("Scoring model load failed for round %d: %s", rnd, exc)
+                return None
 
     def _clear_scoring_cache(self) -> None:
         """Drop the cached scoring model. Called after aggregation."""
-        self._scoring_cache = None
+        with self._scoring_cache_lock:
+            self._scoring_cache = None
         # Loader cache lives for one round; cross-round reuse risks stale
         # _written_parquets snapshots when new data arrives.
         if self._loader_cache:
@@ -2591,6 +2751,10 @@ class GradientAggregator:
                 comp = deserialize(grad_bytes, expected_shapes=expected_shapes)
             except ValueError as exc:
                 logger.warning("  miner %d: gradient rejected: %s", miner_uid, exc)
+                # Stamp the rejection-reason enum so _deliver_scores can
+                # surface it in the per-miner JSON. Deserialization failures
+                # cover non-finite values, shape mismatches, schema errors.
+                assignment["_rejection_reason"] = "deserialize_failed"
                 return None
 
             expected_v = int(assignment.get("model_version", 0) or 0)
@@ -2599,17 +2763,22 @@ class GradientAggregator:
                 "  miner %d: trained=v%d expected=v%d",
                 miner_uid, trained_v, expected_v,
             )
-            # NOTE: strict rejection of untagged (`trained_v=0`) gradients is
-            # currently DISABLED to keep the network functional while the
-            # miner-side version-tagging patch hasn't propagated. When the
-            # public miner code has been updated, re-enable by flipping the
-            # condition below to also flag `not trained_v` as mismatched.
-            if False and not trained_v:  # noqa: SIM223 — gated rejection, see note above
+            # Strict version-check toggle. Off by default to keep the
+            # network functional while the miner-side version-tagging patch
+            # propagates. Set `GENTRX_STRICT_VERSION_CHECK=1` once the
+            # public miner code has been updated to flip this on without a
+            # code change. The previous `if False and …` literal made it
+            # impossible to flip without a re-deploy.
+            _strict_v_check = os.environ.get(
+                "GENTRX_STRICT_VERSION_CHECK", ""
+            ).strip().lower() in ("1", "true", "yes", "on")
+            if _strict_v_check and not trained_v:
                 logger.warning(
                     "  miner %d: gradient untagged (model_v_trained=0) — rejected",
                     miner_uid,
                 )
                 assignment["_version_mismatched"] = True
+                assignment["_rejection_reason"] = "untagged_strict"
             elif not trained_v:
                 # Soft path: log so we can still see who's submitting without
                 # version metadata, but accept the gradient into aggregation.
@@ -2640,12 +2809,14 @@ class GradientAggregator:
                     "  miner %d: gradient rejected, norm %.4g > max %.4g",
                     miner_uid, grad_norm, self.max_grad_norm,
                 )
+                assignment["_rejection_reason"] = "norm_too_large"
                 return None
 
             t_loader_start = time.time()
             miner_loader = self._build_miner_loader(assignment, tokenizer, device)
             if miner_loader is None:
                 logger.warning("  miner %d: no data for assigned books", miner_uid)
+                assignment["_rejection_reason"] = "no_miner_data"
                 return None
 
             t_own_start = time.time()
@@ -2817,8 +2988,12 @@ class GradientAggregator:
         anything above threshold is accepted.
         """
         if score <= self._effective_min_score:
+            # Don't overwrite a more specific reason set upstream (deserialize/
+            # norm/version) — only stamp `low_score` when no other reason exists.
+            assignment.setdefault("_rejection_reason", "low_score")
             return False
         if not self._in_warmup and assignment.get("_version_mismatched"):
+            assignment["_rejection_reason"] = "version_mismatch"
             return False
         return True
 
@@ -2928,6 +3103,7 @@ class GradientAggregator:
 
         from GenTRX.src.distributed import _eval_loss, _eval_loss_per_field
         from GenTRX.src.gradient import (
+            GradientDelta,
             aggregate, apply_gradient, compress, decompress, serialize,
         )
 
@@ -3050,7 +3226,19 @@ class GradientAggregator:
         # size budget as a single miner gradient and the model is updated
         # only on the top-k parameters instead of all of them.
         local_agg_dense = aggregate([c for _, _, _, c, _ in accepted])
-        local_agg = compress(decompress(local_agg_dense), top_k_frac=0.05)
+        # Skip the decompress→compress round trip. `aggregate()` already stored
+        # the dense values in `sparse[name][1]` with arange-indices, so we can
+        # build the GradientDelta directly from those values without the
+        # `zeros(N).index_assign` allocation that decompress would do per
+        # tensor (~50 MB of redundant memcopy on a 12M-param model per round).
+        local_agg_delta = GradientDelta(
+            delta={
+                name: vals.reshape(shape)
+                for name, (_indices, vals, shape) in local_agg_dense.sparse.items()
+            },
+            metadata=local_agg_dense.metadata,
+        )
+        local_agg = compress(local_agg_delta, top_k_frac=0.05)
 
         self._apply_agg_norm_caps(local_agg)
 
@@ -3433,12 +3621,39 @@ class GradientAggregator:
             score_own = a.get("_score_own")
             score_held = a.get("_score_held")
             grad_norm = a.get("_grad_norm")
+            accepted_flag = bool(is_submitter and score > threshold)
+            # Derive a stable rejection-reason enum so observability tools
+            # don't have to re-derive it from score thresholds. Values:
+            # not_submitted | overfitting | low_score | non_finite |
+            # version_mismatch | norm_too_large | rejected_other | None.
+            rejection_reason: str | None = None
+            if not is_submitter:
+                rejection_reason = "not_submitted"
+            elif not accepted_flag:
+                if a.get("_overfitting"):
+                    rejection_reason = "overfitting"
+                elif a.get("_rejection_reason"):
+                    # An upstream stage (gradient eval, norm cap, version
+                    # gate) may have stamped a more specific reason.
+                    rejection_reason = str(a.get("_rejection_reason"))
+                elif score is not None and score <= threshold:
+                    rejection_reason = "low_score"
+                else:
+                    rejection_reason = "rejected_other"
             scores_dict[str(uid)] = {
                 "score": score,
                 "score_own": float(score_own) if score_own is not None else 0.0,
                 "score_held": float(score_held) if score_held is not None else 0.0,
+                # `held_unavailable` distinguishes "score_held=0 because no
+                # held data was available" from "score_held=0 because the
+                # gradient actually scored 0 on held data". The validator
+                # treats these identically today (score = score_own when
+                # held is missing) but downstream observability needs to
+                # tell them apart to avoid alerting on data scarcity.
+                "held_unavailable": is_submitter and score_held is None,
                 "overfitting": bool(a.get("_overfitting", False)),
-                "accepted": bool(is_submitter and score > threshold),
+                "accepted": accepted_flag,
+                "rejection_reason": rejection_reason,
                 "was_rollback_winner": bool(a.get("_was_rollback_winner", False)),
                 "grad_norm": float(grad_norm) if grad_norm is not None else 0.0,
                 "books": a.get("books", []),

@@ -2598,7 +2598,7 @@ if __name__ != "__mp_main__":
                 while True:
                     await asyncio.sleep(30)
                     n += 1
-                    bt.logging.info(f"[hb] listener event loop alive #{n}")
+                    bt.logging.debug(f"[hb] listener event loop alive #{n}")
                     if n % 2 == 0:
                         # Dump every task's full await chain (get_stack only reports
                         # one frame for suspended coroutines) down to the awaited
@@ -2627,7 +2627,7 @@ if __name__ != "__mp_main__":
                                 desc = ' <- '.join(chain)
                             except Exception as _e:
                                 desc = f"<chain error: {_e}>"
-                            bt.logging.info(f"[hb] task {t.get_name()}: {desc or '<no frames>'}")
+                            bt.logging.debug(f"[hb] task {t.get_name()}: {desc or '<no frames>'}")
             _hb_task = asyncio.ensure_future(_listen_heartbeat())  # noqa: F841 — keep ref
 
             try:

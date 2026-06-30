@@ -15,6 +15,8 @@
 
 //-------------------------------------------------------------------------
 
+namespace taosim::process { class FuturesSignal; }
+
 namespace taosim::agent
 {
 
@@ -93,6 +95,8 @@ private:
     std::vector<uint32_t> m_factorCounter;
     std::vector<Timestamp> m_lastUpdate;
     std::vector<bool> m_orderFlag;
+    // Cached "external" FuturesSignal pointer per bookId.
+    std::vector<taosim::process::FuturesSignal*> m_externalSignal;
     // std::vector<TimestampedPrice> m_tradePrice;
 };
 

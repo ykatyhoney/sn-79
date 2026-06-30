@@ -18,7 +18,7 @@ MessageQueue::MessageQueue(std::vector<PrioritizedMessageWithId> messages) noexc
 //-------------------------------------------------------------------------
 
 bool MessageQueue::CompareQueueMessages::operator()(
-    PrioritizedMessageWithId lhs, PrioritizedMessageWithId rhs)
+    const PrioritizedMessageWithId& lhs, const PrioritizedMessageWithId& rhs)
 {
     if (lhs.pmsg.marginCallId != rhs.pmsg.marginCallId) [[unlikely]] {
         return lhs.pmsg.marginCallId > rhs.pmsg.marginCallId;

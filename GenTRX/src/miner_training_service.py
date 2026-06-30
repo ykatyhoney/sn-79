@@ -180,6 +180,11 @@ class MinerTrainingService:
         self._data_store: "GradientStore | None" = None  # default data store (== _store unless overridden)
         self._write_store: "GradientStore | None" = None  # per-miner write bucket
         self._discovered_aggregator_store: "GradientStore | None" = None  # cached chain-based discovery
+        # Guards the discovery cache so concurrent training threads don't both
+        # walk the metagraph + probe every uid's bucket. In practice the
+        # training loop is serialized, but the public API surface allows
+        # external callers (status endpoints, ad-hoc scripts) to land here too.
+        self._discovered_aggregator_store_lock = threading.Lock()
         self._discovered_aggregator_uid: int = self.cfg.aggregator_uid
         self._s3_cache_dir: Path | None = None
         self._s3_cached_files: dict[str, Path] = {}
@@ -620,10 +625,20 @@ class MinerTrainingService:
         """Return a GradientStore pointing at a validator bucket with a
         published checkpoint. See taos.im.agents.GenTRXAgent for the equivalent
         inline logic; this is a duplicate by design.
-        """
-        if self._discovered_aggregator_store is not None:
-            return self._discovered_aggregator_store
 
+        Discovery is cached under `_discovered_aggregator_store_lock` so two
+        concurrent callers don't both walk every uid; the second waits and
+        gets the cached result. The lock is also held during the bucket-probe
+        I/O so the cache is set atomically with a successful probe.
+        """
+        with self._discovered_aggregator_store_lock:
+            if self._discovered_aggregator_store is not None:
+                return self._discovered_aggregator_store
+            return self._discover_aggregator_store_locked(assignment)
+
+    def _discover_aggregator_store_locked(self, assignment: dict | None):
+        """Inner discovery body. Caller MUST hold
+        `_discovered_aggregator_store_lock`."""
         from GenTRX.src.gradient_store import GradientStore
 
         def _build_store(bi) -> GradientStore:

@@ -117,8 +117,8 @@ if [ -z "$NETUID" ]; then
     esac
 fi
 
-VALIDATOR_NAME="validator-sim"
-TMUX_SESSION="sim"
+VALIDATOR_NAME="validator"
+TMUX_SESSION="mvtrx"
 
 echo "ENDPOINT: $ENDPOINT"
 echo "WALLET_PATH: $WALLET_PATH"
@@ -312,4 +312,8 @@ if [ "$needs_update" = true ]; then
             echo "$line" | sudo tee -a /etc/sysctl.conf >/dev/null
         fi
     done
+fi
+
+if [ "$USE_TMUX" = "1" ]; then
+    tmux attach-session -t "$TMUX_SESSION"
 fi
