@@ -36,7 +36,7 @@ def check_repo(self : Validator) -> Tuple[bool, bool, bool, bool]:
         start_time = time.time()
         remote = self.repo.remotes[self.config.repo.remote]
         fetch_start = time.time()
-        fetch = remote.fetch(self.repo.active_branch.name)
+        remote.fetch(self.repo.active_branch.name)
         fetch_time = time.time() - fetch_start
         if fetch_time > 10.0:
             bt.logging.warning(f"Git fetch took {fetch_time:.1f}s (slow network?)")
@@ -104,7 +104,7 @@ def update_validator(self : Validator) -> None:
     """
     try:
         py_cmd = ["pip", "install", "-e", "."]
-        bt.logging.info(f"UPDATING VALIDATOR (PY)...")
+        bt.logging.info("UPDATING VALIDATOR (PY)...")
         
         update_start = time.time()
         make = run_process(py_cmd, cwd=(self.repo_path).resolve())
@@ -242,7 +242,7 @@ def rebuild_simulator(self : Validator) -> None:
                 "cmake", "-DENABLE_TRACES=1", "-DCMAKE_BUILD_TYPE=Release", ".."
             ]
 
-        bt.logging.info(f"REBUILDING SIMULATOR (MAKE)...")
+        bt.logging.info("REBUILDING SIMULATOR (MAKE)...")
         make_start = time.time()
         make = run_process(
             make_cmd, 
@@ -254,7 +254,7 @@ def rebuild_simulator(self : Validator) -> None:
             bt.logging.success(f"MAKE PROCESS SUCCESSFUL ({make_time:.1f}s). BUILDING...")
             
             build_cmd = ["cmake", "--build", "."]
-            bt.logging.info(f"REBUILDING SIMULATOR (BUILD)...")
+            bt.logging.info("REBUILDING SIMULATOR (BUILD)...")
             build_start = time.time()
             build = run_process(
                 build_cmd, 
@@ -272,7 +272,7 @@ def rebuild_simulator(self : Validator) -> None:
             raise Exception(f"FAILED TO COMPLETE SIMULATOR MAKE:\n{make.stderr}")
 
         py_cmd = ["pip", "install", "-e", "."]
-        bt.logging.info(f"REBUILDING SIMULATOR (PY)...")
+        bt.logging.info("REBUILDING SIMULATOR (PY)...")
         py_start = time.time()
         py = run_process(
             py_cmd, 
@@ -308,6 +308,9 @@ def restart_simulator(self : Validator, end : bool = False) -> None:
     from the latest checkpoint unless `end` is True or the checkpoint fails health
     check, in which case a fresh simulation is started from the config file.
 
+    In exchange mode this is a no-op — the external LOB engine must be restarted
+    manually.
+
     Args:
         self (Validator): The intelligent markets simulation validator.
         end (bool): If True, skip checkpoint resume and start a new simulation.
@@ -317,6 +320,12 @@ def restart_simulator(self : Validator, end : bool = False) -> None:
         subprocess.TimeoutExpired: If any subprocess exceeds its timeout.
         Exception: On any process-management failure.
     """
+    if getattr(getattr(self, 'engine', None), 'mode', 'simulation') == 'exchange':
+        bt.logging.warning(
+            "Exchange mode: cannot auto-restart the LOB exchange engine — "
+            "manual restart required"
+        )
+        return
     try:
         try:
             pm2_result = subprocess.run(
@@ -365,6 +374,46 @@ def restart_simulator(self : Validator, end : bool = False) -> None:
             bt.logging.info(f"Killed {killed_count} simulator process(es)")
             time.sleep(2.0)
 
+        # If the latest checkpoint sits at or past the configured sim duration, a
+        # `-c latest` resume loads EOF state and the sim exits immediately on its
+        # next tick — leaving the monitor in a restart loop. Detect that case here
+        # and force a fresh start instead. Checkpoint dirs are named
+        # `<sim_time_ns>.ckptd` and the duration is the XML `Simulation duration=`
+        # attribute (ns).
+        if not end:
+            try:
+                from pathlib import Path
+                import re
+                logs_root = (self.repo_path / 'simulate' / 'trading' / 'run' / 'logs').resolve()
+                run_dirs = sorted(
+                    (d for d in logs_root.iterdir() if d.is_dir() and (d / 'ckpt').is_dir()),
+                    key=lambda d: d.stat().st_mtime,
+                )
+                if run_dirs:
+                    ckpt_dir = run_dirs[-1] / 'ckpt'
+                    ckpts = sorted(
+                        d for d in ckpt_dir.iterdir()
+                        if d.is_dir() and d.name.endswith('.ckptd')
+                    )
+                    if ckpts:
+                        latest_ckpt_ns = int(ckpts[-1].name.split('.')[0])
+                        cfg_path = getattr(self, 'simulator_config_file', None)
+                        duration_ns = None
+                        if cfg_path and Path(cfg_path).is_file():
+                            with open(cfg_path) as _cf:
+                                m = re.search(r'\bduration\s*=\s*"(\d+)"', _cf.read())
+                                if m:
+                                    duration_ns = int(m.group(1))
+                        if duration_ns and latest_ckpt_ns >= duration_ns:
+                            bt.logging.warning(
+                                f"Latest checkpoint at {latest_ckpt_ns}ns is at/past sim "
+                                f"duration {duration_ns}ns ({ckpts[-1].name}) — forcing fresh "
+                                f"sim to break the EOF restart loop"
+                            )
+                            end = True
+            except Exception as _eof_ex:
+                bt.logging.debug(f"EOF-checkpoint pre-check failed (will attempt resume anyway): {_eof_ex}")
+
         if not end:
             resume_cmd = [
                 "pm2", "start", "--no-autorestart", "--name=simulator",
@@ -391,7 +440,7 @@ def restart_simulator(self : Validator, end : bool = False) -> None:
                     try:
                         subprocess.run(['pm2', 'delete', 'simulator'], capture_output=True, timeout=10.0)
                         time.sleep(1.0)
-                    except:
+                    except Exception:
                         pass
             else:
                 bt.logging.warning(
@@ -441,28 +490,85 @@ def restart_simulator(self : Validator, end : bool = False) -> None:
         )
         raise
 
-def check_simulator(self : Validator) -> bool:
+def check_exchange(self: Validator) -> bool:
     """
-    Check whether the simulator process is alive and healthy.
+    Check whether the exchange (LOB) / simulator process is alive and healthy.
 
     Returns True immediately if `last_state_time` indicates a recent heartbeat.
-    Otherwise queries PM2 for status, then falls back to scanning the process
-    table for the taosim binary.
+    Otherwise queries PM2 for a process named 'exchange', then falls back to
+    scanning the process table for the taosim binary invoked with the -e flag.
 
     Args:
         self (Validator): The intelligent markets simulation validator.
 
     Returns:
-        bool: True if the simulator is healthy, False otherwise.
+        bool: True if the exchange/simulator process is alive, False otherwise.
     """
     try:
         if not self.last_state_time or self.last_state_time >= time.time() - 300:
             return True
         try:
             pm2_result = subprocess.run(
-                ['pm2', 'jlist'], 
-                capture_output=True, 
-                text=True, 
+                ['pm2', 'jlist'],
+                capture_output=True,
+                text=True,
+                timeout=10.0,
+            )
+            pm2_js = json.loads(pm2_result.stdout) if pm2_result.stdout else []
+        except subprocess.TimeoutExpired:
+            bt.logging.error("PM2 jlist timed out after 10s during exchange health check")
+            pm2_js = []
+        except json.JSONDecodeError as e:
+            bt.logging.error(f"Failed to parse PM2 JSON during exchange health check: {e}")
+            pm2_js = []
+
+        pm2_processes = {p['name']: p for p in pm2_js}
+        if 'exchange' in pm2_processes:
+            status = pm2_processes['exchange']['pm2_env']['status']
+            if status != 'online':
+                self.pagerduty_alert(f"Exchange process (PM2) has stopped! Status={status}")
+                return False
+            return True
+
+        # Fall back to raw process scan: taosim with -e flag
+        try:
+            for proc in psutil.process_iter(['cmdline']):
+                args = proc.info['cmdline'] or []
+                if any('taosim' in a for a in args) and '-e' in args:
+                    return True
+        except Exception as e:
+            bt.logging.error(f"Error checking exchange processes: {e}")
+            return False
+
+        self.pagerduty_alert("Exchange (LOB) process has stopped — manual restart required")
+        return False
+    except Exception as ex:
+        bt.logging.error(f"Error during exchange health check: {ex}")
+        bt.logging.error(traceback.format_exc())
+        return False
+
+
+def check_simulator(self : Validator) -> bool:
+    """
+    Check if the simulator (or exchange) process is still running.
+
+    In exchange mode delegates to check_exchange(); in simulation mode checks
+    for the taosim C++ simulator process.
+
+    Returns:
+        bool: True if the engine process is healthy, False otherwise
+    """
+    if getattr(getattr(self, 'engine', None), 'mode', 'simulation') == 'exchange':
+        return check_exchange(self)
+
+    try:
+        if not self.last_state_time or self.last_state_time >= time.time() - 300:
+            return True
+        try:
+            pm2_result = subprocess.run(
+                ['pm2', 'jlist'],
+                capture_output=True,
+                text=True,
                 timeout=10.0
             )
             pm2_json = pm2_result.stdout
@@ -492,13 +598,17 @@ def check_simulator(self : Validator) -> bool:
         except Exception as e:
             bt.logging.error(f"Error checking simulator processes: {e}")
             return False
-        
+
         if not found:
             self.pagerduty_alert("Simulator process (No PM2) has stopped!")
             return False
-        
+
         return True
     except Exception as ex:
         bt.logging.error(f"Error during simulator health check: {ex}")
         bt.logging.error(traceback.format_exc())
         return False
+
+
+# SL/TP service helpers (check / notify-sim-dir / restart) live in the optional
+# taos.im.validator.exetrx module — testnet release omits them.

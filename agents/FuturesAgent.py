@@ -3,7 +3,7 @@
 import bittensor as bt
 
 from taos.common.agents import launch
-from taos.im.agents import FinanceSimulationAgent
+from taos.im.agents import GenTRXAgent
 from taos.im.protocol.models import *
 from taos.im.protocol.instructions import *
 from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
@@ -11,21 +11,17 @@ from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
 from taos.im.utils.streams import subscribe_coinbase_trades
 
 
-import random
-from enum import Enum
-import time
-import pandas as pd
-import numpy as np
 import logging
 """
 A simple example agent which places orders in line with the expectation of price movement due to the futures price connection in the simulator.
 """
-class FuturesAgent(FinanceSimulationAgent):
+class FuturesAgent(GenTRXAgent):
     def initialize(self):
         """
         Initializes properties, variables and quantities that will be used by the agent.
         The fields attached to `self.config` are defined in the launch parameters.
         """
+        super().initialize()
         # Quantity of BASE to attempt to buy/sell at each round
         self.quantity = self.config.quantity
         # Expiry period for limit orders in simulation timesteps (nanosecond scale)

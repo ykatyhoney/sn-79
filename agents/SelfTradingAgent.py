@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
 from taos.common.agents import launch
-from taos.im.agents import FinanceSimulationAgent
+from taos.im.agents import GenTRXAgent
 from taos.im.protocol.models import *
 from taos.im.protocol.instructions import *
 from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
@@ -11,12 +11,13 @@ import random
 """
 A simple example agent to demonstrate self-trade prevention behaviour.
 """
-class SelfTradingAgent(FinanceSimulationAgent):
+class SelfTradingAgent(GenTRXAgent):
     def initialize(self):
         """
         Initializes properties, variables and quantities that will be used by the agent.
         The fields attached to `self.config` are defined in the launch parameters.
         """
+        super().initialize()
         self.min_quantity = self.config.min_quantity
         self.max_quantity = self.config.max_quantity
         self.lastBid = None

@@ -71,6 +71,16 @@ class BaseNeuron(ABC):
         self.config.merge(base_config)
         self.check_config(self.config)
 
+        # Apply parsed log level — bt.logging starts in Default/WARNING state
+        # at import time; must be transitioned explicitly before any .info() calls.
+        _lc = getattr(self.config, 'logging', None)
+        if getattr(_lc, 'trace', False):
+            bt.logging.set_trace()
+        elif getattr(_lc, 'debug', False):
+            bt.logging.set_debug()
+        else:
+            bt.logging.set_info()
+
         # If a gpu is required, set the device to cuda:N (e.g. cuda:0)
         self.device = self.config.neuron.device
 
@@ -126,9 +136,8 @@ class BaseNeuron(ABC):
         self.check_registered()
 
         # Each registered hotkey gets a unique identity (UID) in the network for differentiation.
-        self.uid = self.metagraph.hotkeys.index(
-            self.wallet.hotkey.ss58_address
-        )
+        _hk = self.wallet.hotkey.ss58_address
+        self.uid = self.metagraph.hotkeys.index(_hk) if _hk in self.metagraph.hotkeys else -1
         # Retrieve the current block number
         self.update_block()
         # Retrieve the current subnet hyperparameters
@@ -182,7 +191,11 @@ class BaseNeuron(ABC):
     def check_registered(self):
         """
         Method to check if the hotkey configured to be used by the neuron is registered in the subnet.
+        Skipped in observe mode since no weight submission or axon ops are performed.
         """
+        if getattr(getattr(self.config, 'neuron', None), 'observe', False):
+            bt.logging.info("Observe mode: skipping registration check.")
+            return
         bt.logging.debug("Checking registration...")
         if not self.subtensor.is_hotkey_registered(
             netuid=self.config.netuid,
@@ -192,7 +205,7 @@ class BaseNeuron(ABC):
                 f"Wallet: {self.wallet} is not registered on netuid {self.config.netuid}."
                 f" Please register the hotkey using `btcli subnets register` before trying again"
             )
-            exit()        
+            exit()
         bt.logging.debug(f"Key {self.config.wallet.name}.{self.config.wallet.hotkey} ({self.wallet.hotkey.ss58_address}) is registered.")
 
     def update_block(self, max_retries=5):
@@ -273,4 +286,4 @@ class BaseNeuron(ABC):
                 dedup_key=dedup_key
             )
         else:
-            bt.logging.debug(f"pagerduty_alert : PagerDuty is not configured.")
+            bt.logging.debug("pagerduty_alert : PagerDuty is not configured.")

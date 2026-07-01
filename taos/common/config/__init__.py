@@ -37,9 +37,9 @@ class ParseKwargs(argparse.Action):
             key, value = value.split('=')
             try:
                 value = float(value)
-            except:
+            except (TypeError, ValueError):
                 pass
-            setattr(getattr(namespace, self.dest),key, value)
+            setattr(getattr(namespace, self.dest), key, value)
 
 def check_config(cls, config: "bt.Config"):
     r"""Checks/validates the config namespace object."""

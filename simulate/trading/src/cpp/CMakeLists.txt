@@ -7,7 +7,9 @@ add_subdirectory(decimal)
 add_subdirectory(dsa)
 add_subdirectory(event)
 add_subdirectory(exchange)
+add_subdirectory(matching)
 add_subdirectory(filesystem)
+add_subdirectory(fp)
 add_subdirectory(ipc)
 add_subdirectory(logging)
 add_subdirectory(message)
@@ -35,8 +37,8 @@ target_include_directories(simulator
         base
         decimal
         exchange
+        matching
         mp
-        net
         serialization
         stats
         util
@@ -44,7 +46,6 @@ target_include_directories(simulator
 
 target_link_libraries(simulator
     PUBLIC
-        mimalloc
         taosim::accounting
         taosim::agent
         taosim::book
@@ -53,7 +54,9 @@ target_link_libraries(simulator
         taosim::decimal
         taosim::event
         taosim::exchange
+        taosim::matching
         taosim::filesystem
+        taosim::fp
         taosim::ipc
         taosim::logging
         taosim::message
@@ -71,6 +74,7 @@ target_link_libraries(simulator
         bdl
         date::date date::date-tz
         fmt::fmt
+        mimalloc
         pybind11::embed
 )
 

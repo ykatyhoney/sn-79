@@ -5,7 +5,7 @@
 #pragma once
 
 #include <taosim/logging/RotatingLoggerBase.hpp>
-#include <taosim/exchange/ExchangeSignals.hpp>
+#include <taosim/matching/ExchangeSignals.hpp>
 #include "JsonSerializable.hpp"
 
 //-------------------------------------------------------------------------
@@ -25,7 +25,7 @@ public:
     L3EventLogger(
         const fs::path& filepath,
         std::chrono::system_clock::time_point startTimePoint,
-        decltype(exchange::ExchangeSignals::L3)& signal,
+        decltype(matching::ExchangeSignals::L3)& signal,
         Simulation* simulation) noexcept;
 
     static constexpr std::string_view s_header = "date,time,event";

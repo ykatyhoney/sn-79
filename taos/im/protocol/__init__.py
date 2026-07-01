@@ -115,7 +115,7 @@ class MarketSimulationStateUpdate(SimulationStateUpdate):
             agentId = int(sagentId)
             if agentId >= 0:
                 for book_id, balances in enumerate(account['holdings']):
-                    if not agentId in accounts:
+                    if agentId not in accounts:
                         accounts[agentId] = {}
                     accounts[agentId][book_id] = Account(
                         agent_id=account['agentId'],book_id=book_id,
@@ -353,3 +353,4 @@ class MarketSimulationStateUpdate(SimulationStateUpdate):
         except Exception as ex:
             bt.logging.error(f"Failed to decompress {self.name} synapse data! {ex}\n{traceback.format_exc()}")
             return None
+

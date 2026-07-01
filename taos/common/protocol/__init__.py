@@ -52,7 +52,7 @@ class AgentResponse(BaseModel):
     def add_instruction(self, instruction : AgentInstruction):
         self.instructions.append(instruction)
 
-    def serialize(self) -> dict:
+    def serialize(self) -> list[dict]:
         return [
             instruction.serialize() for instruction in self.instructions
         ]
@@ -80,10 +80,10 @@ class SimulationStateUpdate(bt.Synapse):
     # Optional request output, filled by recieving axon.
     response: Optional[AgentResponse] = None
 
-    def deserialize(self) -> int:
+    def deserialize(self) -> Optional[AgentResponse]:
         """
-        Deserialize the output written by the miner. 
-        This method retrieves the response from the miner in the form of an AgentResponse, 
+        Deserialize the output written by the miner.
+        This method retrieves the response from the miner in the form of an AgentResponse,
         and returns it as the output of the dendrite.query() call.
         """
         return self.response

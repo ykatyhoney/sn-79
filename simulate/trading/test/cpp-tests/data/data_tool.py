@@ -6,7 +6,6 @@
 
 import itertools as it
 import json
-import math
 from pathlib import Path
 import random
 
@@ -66,7 +65,8 @@ def create_responses(**opts):
                 "clientOrderId": None
             }
         })
-    if opts["shuffle"]: random.shuffle(responses)
+    if opts["shuffle"]:
+        random.shuffle(responses)
     responses_json["responses"] = responses
 
     # Generate the reference state.

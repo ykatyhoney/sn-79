@@ -2,7 +2,7 @@
 
 GenTRX runs on top of a standard MVTRX (SN-79) miner or validator host. This guide covers a `uv`-based install that works across most Linux distros and macOS, needs sudo only for a tiny list of system packages, and pins the Python toolchain without touching your system Python.
 
-If you would rather follow the project's shell scripts (`install_validator.sh`, `install_miner.sh`, `install_simulator.sh`), see the [README's Install section](../../README.md#install-) first and then jump to [§4 GenTRX-specific additions](#_4-gentrx-specific-additions) for Docker, `btcli`, and `wandb`. The scripts remain supported; this doc is an alternative path with a lighter sudo surface.
+If you would rather follow the project's shell scripts (`install_validator.sh`, `install_miner.sh`, `install_simulator.sh`), see the [README's Install section](../../README.md#install) first and then jump to [§4 GenTRX-specific additions](#_4-gentrx-specific-additions) for Docker, `btcli`, and `wandb`. The scripts remain supported; this doc is an alternative path with a lighter sudo surface.
 
 > **Running on WSL2?** It works for casual development, but the validator's POSIX-SHM IPC with the simulator and query subprocess has been observed to SIGBUS under memory pressure on WSL2. Native Linux is recommended for anything longer than a quick test.
 

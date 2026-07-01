@@ -22,9 +22,12 @@ Balances::Balances(const BalancesDesc& desc) noexcept
 //-------------------------------------------------------------------------
 
 Balances::Balances(
-    Balance base, Balance quote, uint32_t baseDecimals, uint32_t quoteDecimals) noexcept
+    Balance base,
+    std::shared_ptr<Balance> quote,
+    uint32_t baseDecimals,
+    uint32_t quoteDecimals) noexcept
     : base{std::move(base)},
-      quote{std::move(quote)},
+      quote{quote},
       m_baseDecimals{baseDecimals},
       m_quoteDecimals{quoteDecimals},
       m_roundParams{.baseDecimals = baseDecimals, .quoteDecimals = quoteDecimals}
@@ -45,7 +48,7 @@ bool Balances::canBorrow(
 bool Balances::canFree(OrderID id) const noexcept
 {
     bool hasBaseReservation = base.getReservation(id).has_value();
-    bool hasQuoteReservation = quote.getReservation(id).has_value();
+    bool hasQuoteReservation = quote->getReservation(id).has_value();
     return hasBaseReservation || hasQuoteReservation;
 }
 
@@ -54,7 +57,7 @@ bool Balances::canFree(OrderID id) const noexcept
 void Balances::releaseReservation(OrderID id, BookId bookId)
 {
     base.tryFreeReservation(id, bookId);
-    quote.tryFreeReservation(id, bookId);
+    quote->tryFreeReservation(id, bookId);
     if (canFree(id) && m_loans.find(id) == m_loans.end()) {
         m_buyLeverages.erase(id);
         m_sellLeverages.erase(id);
@@ -68,7 +71,7 @@ ReservationAmounts Balances::freeReservation(OrderID id, decimal_t price, decima
 {
     if (getLeverage(id, direction) == 0_dec) {
         if (direction == OrderDirection::BUY) {
-            const auto freed = ReservationAmounts{.quote = quote.freeReservation(id, bookId, amount)};
+            const auto freed = ReservationAmounts{.quote = quote->freeReservation(id, bookId, amount)};
             return freed;
         } else {
             const auto freed = ReservationAmounts{.base = base.freeReservation(id, bookId, amount)};
@@ -79,7 +82,7 @@ ReservationAmounts Balances::freeReservation(OrderID id, decimal_t price, decima
     const auto freed = [&] -> ReservationAmounts {
         if (!amount.has_value()) {
             return ReservationAmounts{
-                .base = base.tryFreeReservation(id, bookId), .quote = quote.tryFreeReservation(id, bookId)};
+                .base = base.tryFreeReservation(id, bookId), .quote = quote->tryFreeReservation(id, bookId)};
         }
         if (direction == OrderDirection::BUY) {
             const decimal_t baseQuoteValue =
@@ -89,19 +92,19 @@ ReservationAmounts Balances::freeReservation(OrderID id, decimal_t price, decima
             } else {
                 return ReservationAmounts{
                     .base = base.tryFreeReservation(id, bookId),
-                    .quote = quote.tryFreeReservation(id, bookId, amount.value() - baseQuoteValue)
+                    .quote = quote->tryFreeReservation(id, bookId, amount.value() - baseQuoteValue)
                 };
             }
         }
         else {
             const decimal_t quoteBaseValue =
-                roundBase(quote.getReservation(id).value_or(0_dec) / price);
+                roundBase(quote->getReservation(id).value_or(0_dec) / price);
             if (amount.value() <= quoteBaseValue) {
-                return ReservationAmounts{.quote = quote.tryFreeReservation(id, bookId, amount.value())};
+                return ReservationAmounts{.quote = quote->tryFreeReservation(id, bookId, amount.value())};
             } else {
                 return ReservationAmounts{
                     .base = base.tryFreeReservation(id, bookId, amount.value() - quoteBaseValue),
-                    .quote = quote.tryFreeReservation(id, bookId)
+                    .quote = quote->tryFreeReservation(id, bookId)
                 };
             }
         }
@@ -125,7 +128,7 @@ ReservationAmounts Balances::makeReservation(OrderID id, decimal_t price, decima
 
     if (leverage == 0_dec) {
         if (direction == OrderDirection::BUY) {
-            return {.quote = quote.makeReservation(id, amount, bookId)};
+            return {.quote = quote->makeReservation(id, amount, bookId)};
         } else {
             return {.base = base.makeReservation(id, amount, bookId)};
         }
@@ -134,13 +137,13 @@ ReservationAmounts Balances::makeReservation(OrderID id, decimal_t price, decima
     const auto reserved = [&] -> ReservationAmounts {
         if (direction == OrderDirection::BUY) {
             const auto reserved = [&] {
-                if (quote.canReserve(amount)) {
-                    return ReservationAmounts{.quote = quote.makeReservation(id, amount, bookId)};
+                if (quote->canReserve(amount)) {
+                    return ReservationAmounts{.quote = quote->makeReservation(id, amount, bookId)};
                 } else {
-                    const decimal_t requiredBase = roundUpBase((amount - quote.getFree()) / price);
+                    const decimal_t requiredBase = roundUpBase((amount - quote->getFree()) / price);
                     return ReservationAmounts{
                         .base = base.makeReservation(id, requiredBase, bookId),
-                        .quote = quote.makeReservation(id, quote.getFree(), bookId)
+                        .quote = quote->makeReservation(id, quote->getFree(), bookId)
                     };
                 }
             }();
@@ -155,7 +158,7 @@ ReservationAmounts Balances::makeReservation(OrderID id, decimal_t price, decima
                     const decimal_t requiredQuote = roundUpQuote((amount - base.getFree()) * price);
                     return ReservationAmounts{
                         .base = base.makeReservation(id, base.getFree(), bookId),
-                        .quote = quote.makeReservation(id, requiredQuote, bookId)
+                        .quote = quote->makeReservation(id, requiredQuote, bookId)
                     };
                 }
             }();
@@ -182,10 +185,9 @@ std::vector<std::pair<OrderID, decimal_t>> Balances::commit(
     BookId bookId,
     SettleFlag settleFlag)
 {
-    
     amount = roundAmount(amount, direction);
     if (direction == OrderDirection::BUY && feeQuote < 0_dec){
-        quote.deposit(roundQuote(-feeQuote), bookId);
+        quote->deposit(roundQuote(-feeQuote), bookId);
         feeQuote = 0_dec;
     }
     decimal_t fee = (direction == OrderDirection::BUY) ? roundBase(feeBase) : roundQuote(feeQuote);
@@ -193,18 +195,18 @@ std::vector<std::pair<OrderID, decimal_t>> Balances::commit(
 
     if (leverage == 0_dec) {
         if (direction == OrderDirection::BUY) {
-            quote.voidReservation(id, bookId, amount);
+            quote->voidReservation(id, bookId, amount);
             base.deposit(counterAmount - fee, bookId);
         } else {
             base.voidReservation(id, bookId, amount);
-            quote.deposit(counterAmount - fee, bookId);
+            quote->deposit(counterAmount - fee, bookId);
         }
     } else {
         borrow(id, direction, amount, leverage, bestBid, bestAsk, marginCallPrice, bookId);
         if (direction == OrderDirection::BUY) {
             base.deposit(counterAmount - fee, bookId);
         } else {
-            quote.deposit(counterAmount - fee, bookId);
+            quote->deposit(counterAmount - fee, bookId);
         }
     }
 
@@ -245,7 +247,7 @@ decimal_t Balances::getLeverage(OrderID id, OrderDirection direction) const noex
 
 decimal_t Balances::getWealth(decimal_t price) const noexcept
 {
-    return util::fma(base.getFree(), price, quote.getFree());
+    return util::fma(base.getFree(), price, quote->getFree());
 }
 
 //-------------------------------------------------------------------------
@@ -253,7 +255,7 @@ decimal_t Balances::getWealth(decimal_t price) const noexcept
 decimal_t Balances::getReservationInQuote(OrderID id, decimal_t price) const noexcept
 {
     const decimal_t reserved = roundQuote(base.getReservation(id).value_or(0_dec) * price + 
-                        quote.getReservation(id).value_or(0_dec));
+                        quote->getReservation(id).value_or(0_dec));
     return reserved;
 }
 
@@ -262,7 +264,7 @@ decimal_t Balances::getReservationInQuote(OrderID id, decimal_t price) const noe
 decimal_t Balances::getReservationInBase(OrderID id, decimal_t price) const noexcept
 {
     const decimal_t reserved = base.getReservation(id).value_or(0_dec) +
-        roundBase(quote.getReservation(id).value_or(0_dec) / price); 
+        roundBase(quote->getReservation(id).value_or(0_dec) / price); 
     return reserved;
 }
 
@@ -295,7 +297,7 @@ void Balances::jsonSerialize(rapidjson::Document& json, const std::string& key) 
         json.AddMember("quoteCollateral", rapidjson::Value{taosim::util::decimal2double(m_quoteCollateral)}, allocator);
         json.AddMember("baseCollateral", rapidjson::Value{taosim::util::decimal2double(m_baseCollateral)}, allocator);
         base.jsonSerialize(json, "base");
-        quote.jsonSerialize(json, "quote");
+        quote->jsonSerialize(json, "quote");
         json::serializeHelper(
             json,
             "Loans",
@@ -324,7 +326,7 @@ Balances Balances::fromJson(const rapidjson::Value& json)
 {
     return Balances{
         Balance::fromJson(json["base"]),
-        Balance::fromJson(json["quote"]),
+        std::make_shared<Balance>(Balance::fromJson(json["quote"])),
         json["baseDecimals"].GetUint(),
         json["quoteDecimals"].GetUint()
     };
@@ -346,9 +348,10 @@ Balances Balances::fromXML(pugi::xml_node node, const RoundParams& roundParams)
         return Balances({
             .base = Balance{
                 decimal_t{1 / (1 + r) * wealth / price}, symbol, roundParams.baseDecimals},
-            .quote = Balance{
-                decimal_t{r / (1 + r) * wealth}, symbol, roundParams.quoteDecimals},
-            .roundParams = roundParams});
+            .quote = std::make_shared<Balance>(
+                decimal_t{r / (1 + r) * wealth}, symbol, roundParams.quoteDecimals),
+            .roundParams = roundParams
+        });
     }
     else if (std::string_view{node.attribute("type").as_string()} == "pareto-50") {
         std::mt19937 rng{std::random_device{}()};
@@ -363,16 +366,18 @@ Balances Balances::fromXML(pugi::xml_node node, const RoundParams& roundParams)
         const auto u = std::uniform_real_distribution{0.0, 1.0}(rng);
         const auto r = scale * std::pow(1.0 - u, -1.0 / shape);
         return Balances({
-                .base = Balance{
-                    decimal_t{1 / (1 + r) * wealth / price}, symbol, roundParams.baseDecimals},
-                .quote = Balance{
-                    decimal_t{r / (1 + r) * wealth}, symbol, roundParams.quoteDecimals},
-                .roundParams = roundParams});
+            .base = Balance{
+                decimal_t{1 / (1 + r) * wealth / price}, symbol, roundParams.baseDecimals},
+            .quote = std::make_shared<Balance>(
+                decimal_t{r / (1 + r) * wealth}, symbol, roundParams.quoteDecimals),
+            .roundParams = roundParams
+        });
     }
     return Balances({
         .base = Balance::fromXML(node.child("Base"), roundParams.baseDecimals),
-        .quote = Balance::fromXML(node.child("Quote"), roundParams.quoteDecimals),
-        .roundParams = roundParams});
+        .quote = std::make_shared<Balance>(Balance::fromXML(node.child("Quote"), roundParams.quoteDecimals)),
+        .roundParams = roundParams
+    });
 }
 
 //-------------------------------------------------------------------------
@@ -405,11 +410,11 @@ std::vector<std::pair<OrderID, decimal_t>> Balances::settleLoan(
 
         if (direction == OrderDirection::BUY) {
             base.deposit(collateral.base() - settleAmount, bookId);
-            quote.deposit(collateral.quote(), bookId);
+            quote->deposit(collateral.quote(), bookId);
             m_baseLoan -= settleAmount;
         } else {
             base.deposit(collateral.base(), bookId);
-            quote.deposit(collateral.quote() - settleAmount, bookId);
+            quote->deposit(collateral.quote() - settleAmount, bookId);
             m_quoteLoan -= settleAmount;
         }
 
@@ -446,7 +451,6 @@ std::vector<std::pair<OrderID, decimal_t>> Balances::settleLoan(
     return settledLoanIds;
 }
 
-
 //-------------------------------------------------------------------------
 
 void Balances::borrow(
@@ -463,7 +467,7 @@ void Balances::borrow(
     const decimal_t collateralAmount = roundAmount(amount / util::dec1p(leverage), direction);
 
     if (direction == OrderDirection::BUY) {
-        const auto quoteReserved = quote.getReservation(id).value_or(0_dec);
+        const auto quoteReserved = quote->getReservation(id).value_or(0_dec);
         if (quoteReserved >= collateralAmount) {
             collateral.quote() = collateralAmount;
         } else {
@@ -481,7 +485,7 @@ void Balances::borrow(
             collateral.base() = collateralAmount;
         } else {
             decimal_t remainingQuote = roundUpQuote((collateralAmount - baseReserved) * bestBid);
-            const auto quoteReserved = quote.getReservation(id).value_or(0_dec);
+            const auto quoteReserved = quote->getReservation(id).value_or(0_dec);
             if (remainingQuote > quoteReserved) {
                 remainingQuote = quoteReserved;
             }
@@ -499,8 +503,8 @@ void Balances::borrow(
                 roundQuote(collateral.valueInQuote(bestAsk) * util::dec1p(leverage));
             if (loanAmount > amount){
                 decimal_t diff = roundQuote((loanAmount - amount) / util::dec1p(leverage));
-                quote.deposit(diff, bookId);
-                quote.makeReservation(id, diff, bookId);
+                quote->deposit(diff, bookId);
+                quote->makeReservation(id, diff, bookId);
             }
             return std::min(loanAmount, amount);
         } else {
@@ -508,18 +512,18 @@ void Balances::borrow(
                 roundBase(collateral.valueInBase(bestBid) * util::dec1p(leverage));
             if (loanAmount > amount){
                 decimal_t diff = roundQuote((loanAmount - amount) * bestBid / util::dec1p(leverage));
-                quote.deposit(diff, bookId);
-                quote.makeReservation(id, diff, bookId);
+                quote->deposit(diff, bookId);
+                quote->makeReservation(id, diff, bookId);
             }
             return std::min(loanAmount, amount);
         }
     }();
 
     if (collateral.base() > 0_dec) base.voidReservation(id, bookId, collateral.base());
-    if (collateral.quote() > 0_dec) quote.voidReservation(id, bookId, collateral.quote());
+    if (collateral.quote() > 0_dec) quote->voidReservation(id, bookId, collateral.quote());
 
      // checking if there is no reservation left
-    if (!base.getReservation(id).has_value() && !quote.getReservation(id).has_value()) {
+    if (!base.getReservation(id).has_value() && !quote->getReservation(id).has_value()) {
         loanAmount = amount;
     }
 
@@ -623,7 +627,7 @@ void Balances::checkNegative(std::source_location sl, OrderID id, BookId bookId)
     if (m_quoteLoan < 0_dec){
         fmt::println("Book {} order #{}: Quote loan {} cannot be negative!", 
             bookId, id, m_quoteLoan);
-        quote.deposit(-m_quoteLoan, bookId);
+        quote->deposit(-m_quoteLoan, bookId);
         m_quoteLoan = 0_dec;
     }
 }

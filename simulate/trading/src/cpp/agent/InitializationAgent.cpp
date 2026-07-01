@@ -73,7 +73,7 @@ void InitializationAgent::placeBuyOrders()
     const auto& account = simulation()->account(name());
 
     for (BookId bookId = 0; bookId < m_bookCount; ++bookId) {
-        const double freeQuote = taosim::util::decimal2double(account.at(bookId).quote.getFree());
+        const double freeQuote = taosim::util::decimal2double(account.at(bookId).quote->getFree());
         const double maxQuantity = freeQuote / m_price / 2;
         double usedQuote = 0.0;
         while (usedQuote < freeQuote) {
@@ -147,7 +147,7 @@ void InitializationAgent::placeSellOrders()
 
 void InitializationAgent::handleLimitOrderPlacementResponse(Message::Ptr msg)
 {
-    const auto payload = std::dynamic_pointer_cast<PlaceOrderLimitResponsePayload>(msg->payload);
+    const auto payload = std::static_pointer_cast<PlaceOrderLimitResponsePayload>(msg->payload);
     simulation()->dispatchMessage(
         simulation()->currentTimestamp(),
         m_tau,

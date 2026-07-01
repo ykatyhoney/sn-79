@@ -513,7 +513,7 @@ void ALGOTraderAgent::handleSimulationStart(Message::Ptr msg)
 
 void ALGOTraderAgent::handleTrade(Message::Ptr msg)
 {
-    const auto payload = std::dynamic_pointer_cast<EventTradePayload>(msg->payload);
+    const auto payload = std::static_pointer_cast<EventTradePayload>(msg->payload);
     const BookId bookId = payload->bookId;
     m_lastPrice.at(bookId) = payload->trade.price();
     m_state.at(payload->bookId).volumeStats.push(payload->trade);
@@ -523,7 +523,7 @@ void ALGOTraderAgent::handleTrade(Message::Ptr msg)
 
 void ALGOTraderAgent::handleBookResponse(Message::Ptr msg) 
 {
-    const auto payload = std::dynamic_pointer_cast<RetrieveL2ResponsePayload>(msg->payload);
+    const auto payload = std::static_pointer_cast<RetrieveL2ResponsePayload>(msg->payload);
     BookId bookId = payload->bookId;
     m_state.at(bookId).volumeStats.pushLevels(
         static_cast<Timestamp>(payload->time / m_period), payload->bids, payload->asks);
@@ -568,7 +568,7 @@ void ALGOTraderAgent::handleBookResponse(Message::Ptr msg)
 
 void ALGOTraderAgent::handleL1Response(Message::Ptr msg)
 {
-    const auto payload = std::dynamic_pointer_cast<RetrieveL1ResponsePayload>(msg->payload);    
+    const auto payload = std::static_pointer_cast<RetrieveL1ResponsePayload>(msg->payload);    
     const BookId bookId = payload->bookId;
     auto& topLevel = m_topLevel.at(bookId);
     topLevel.bid = taosim::util::decimal2double(payload->bestBidVolume);
@@ -597,7 +597,7 @@ void ALGOTraderAgent::handleWakeup(Message::Ptr msg)
             if (fundamental >= lastPrice) {
                 state.direction = OrderDirection::BUY;
                 state.volumeToBeExecuted = std::min(volumeToBeExecuted,
-                    balances.quote.getFree()*decimal_t{0.99}/m_lastPrice.at(bookId));
+                    balances.quote->getFree()*decimal_t{0.99}/m_lastPrice.at(bookId));
             } else if (fundamental <= lastPrice) {
                 state.direction = OrderDirection::SELL;
                 state.volumeToBeExecuted = std::min(volumeToBeExecuted,
@@ -631,7 +631,7 @@ void ALGOTraderAgent::handleWakeup(Message::Ptr msg)
 
 void ALGOTraderAgent::handleMarketOrderResponse(Message::Ptr msg)
 {
-    const auto payload = std::dynamic_pointer_cast<PlaceOrderMarketResponsePayload>(msg->payload);
+    const auto payload = std::static_pointer_cast<PlaceOrderMarketResponsePayload>(msg->payload);
     const auto requestPayload = payload->requestPayload;
 
     const decimal_t executedVolume = requestPayload->volume;
@@ -662,7 +662,7 @@ void ALGOTraderAgent::handleMarketOrderResponse(Message::Ptr msg)
 void ALGOTraderAgent::handleMarketOrderPlacementErrorResponse(Message::Ptr msg)
 {
     const auto payload =
-        std::dynamic_pointer_cast<PlaceOrderMarketErrorResponsePayload>(msg->payload);
+        std::static_pointer_cast<PlaceOrderMarketErrorResponsePayload>(msg->payload);
 
     const BookId bookId = payload->requestPayload->bookId;
 
@@ -683,7 +683,7 @@ void ALGOTraderAgent::execute(BookId bookId, ALGOTraderState& state)
     const decimal_t volume = std::min(drawnQty,
                                          state.volumeToBeExecuted);
     const decimal_t volumeToExecute = state.direction == OrderDirection::BUY ? 
-    std::min(volume, (balances.quote.getFree()* decimal_t{0.99}) /m_lastPrice.at(bookId))
+    std::min(volume, (balances.quote->getFree()* decimal_t{0.99}) /m_lastPrice.at(bookId))
         : std::min(volume, (baseBalance.getFree() * (decimal_t{0.99}) ));
 
     simulation()->logDebug(

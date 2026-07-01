@@ -42,6 +42,7 @@ void L2Logger::log(const Book* book)
     if (newLog != "" && newLog != m_lastLog) {
         m_logger->trace(newLog);
         m_logger->flush();
+        m_loggedSignal(newLog);
     }
     m_lastLog = newLog;
 }
@@ -50,9 +51,14 @@ void L2Logger::log(const Book* book)
 
 std::string L2Logger::createEntryAS(const Book* book) const noexcept
 {
-    if (book->buyQueue().empty() || book->sellQueue().empty()) [[unlikely]] {
+    const auto bestBuyLevel = book->bestBuyLevel();
+    const auto bestSellLevel = book->bestSellLevel();
+
+    if (!bestBuyLevel || !bestSellLevel) [[unlikely]] {
         return {};
     }
+
+    auto isActive = [](const auto& level) { return level.hasActiveOrders(); };
 
     auto levelFormatter = [](const auto& level) -> std::string {
         return fmt::format("({}@{})", level.volume(), level.price());
@@ -75,20 +81,25 @@ std::string L2Logger::createEntryAS(const Book* book) const noexcept
         "{},",
         m_startTimePoint + m_timeConverter(m_simulation->currentTimestamp()),
         book->id(), 3,
-        book->buyQueue().back().volume(), book->buyQueue().back().price(),
-        book->sellQueue().front().volume(), book->sellQueue().front().price(),
+        bestBuyLevel->get().volume(), bestBuyLevel->get().price(),
+        bestSellLevel->get().volume(), bestSellLevel->get().price(),
         fmt::join(
             book->buyQueue()
-            | views::reverse
-            | views::take(m_depth)
-            | views::reverse
-            | views::transform(levelFormatter),
-            " "),
+            | ranges::views::filter(isActive)
+            | ranges::views::reverse
+            | ranges::views::take(m_depth)
+            | ranges::views::reverse
+            | ranges::views::transform(levelFormatter),
+            " "
+        ),
         fmt::join(
             book->sellQueue()
-            | views::take(m_depth)
-            | views::transform(levelFormatter),
-            " "));
+            | ranges::views::filter(isActive)
+            | ranges::views::take(m_depth)
+            | ranges::views::transform(levelFormatter),
+            " "
+        )
+    );
 }
 
 //-------------------------------------------------------------------------

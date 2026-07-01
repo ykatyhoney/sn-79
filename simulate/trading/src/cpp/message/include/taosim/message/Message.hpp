@@ -14,11 +14,11 @@ struct Message : public JsonSerializable
 {
     using Ptr = std::shared_ptr<Message>;
 
-    Timestamp occurrence;
-    Timestamp arrival;
+    Timestamp occurrence{};
+    Timestamp arrival{};
     std::string source;
     std::vector<std::string> targets;
-    std::string type;
+    std::string type{};
     MessagePayload::Ptr payload;
 
     static constexpr char s_targetDelim = '|';

@@ -18,24 +18,41 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
+import sys
 import torch
 import argparse
 import bittensor as bt
 from loguru import logger
 
 from taos.common.config import add_validator_args
+from taos.im.config.simulation import add_simulation_args
+# taos.im.config.exchange is loaded lazily inside add_im_validator_args when
+# engine='exchange' is requested — the module is in the private overlay and
+# absent from the public release tree.
+
+
+def _detect_engine_mode() -> str:
+    """Pre-scan sys.argv to detect --engine value before the full argparse pass."""
+    args = sys.argv[1:]
+    for i, arg in enumerate(args):
+        if arg == '--engine' and i + 1 < len(args):
+            return args[i + 1]
+        if arg.startswith('--engine='):
+            return arg.split('=', 1)[1]
+    return 'simulation'
+
 
 def add_im_validator_args(cls, parser):
     """Add validator specific arguments to the parser."""
     add_validator_args(cls, parser)
-    
+
     parser.add_argument(
         "--repo.remote",
         type=str,
         help="Repository remote name.",
         default="origin",
     )
-    
+
     parser.add_argument(
         '--benchmark.enabled',
         type=bool,
@@ -48,48 +65,6 @@ def add_im_validator_args(cls, parser):
         type=str,
         default='../config/benchmark_agents.json',
         help='JSON file path with benchmark agent configurations'
-    )
-    
-    parser.add_argument(
-        "--simulation.seeding.fundamental.symbol.coinbase",
-        type=str,
-        help="Coinbase spot market symbol price to be used to seed simulation price.",
-        default="BTC-USD",
-    )
-    
-    parser.add_argument(
-        "--simulation.seeding.fundamental.symbol.binance",
-        type=str,
-        help="Binance spot market symbol price to be used to seed simulation price.",
-        default="btcusdt",
-    )
-    
-    parser.add_argument(
-        "--simulation.seeding.external.symbol.coinbase",
-        type=str,
-        help="Coinbase futures market symbol price to be used to seed external price used in simulation.",
-        default="TAO-PERP-INTX",
-    )
-    
-    parser.add_argument(
-        "--simulation.seeding.external.symbol.binance",
-        type=str,
-        help="Binance futures market symbol price to be used to seed external price used in simulation.",
-        default="taousdt",
-    )
-    
-    parser.add_argument(
-        "--simulation.seeding.external.sampling_seconds",
-        type=int,
-        help="real time period in seconds over which external trade prices are written to file.",
-        default=60,
-    )
-
-    parser.add_argument(
-        "--simulation.xml_config",
-        type=str,
-        help="Path to XML file containing simulation configuration.",
-        default="../../../simulate/trading/run/config/simulation_0.xml",
     )
 
     parser.add_argument(
@@ -412,84 +387,43 @@ def add_im_validator_args(cls, parser):
         default=False,
     )
 
-    # ── Exchange engine arguments ──────────────────────────────────────────────
     parser.add_argument(
-        "--exchange.netuids",
-        type=str,
-        help="Comma-separated subnet UIDs to include as exchange books. "
-             "Empty = auto-discover from chain state on first tick.",
-        default="",
-    )
-
-    parser.add_argument(
-        "--exchange.wallet.mode",
-        type=str,
-        choices=["single", "per_agent"],
-        help="Wallet mode for on-chain execution. "
-             "'single': one default wallet for all agents; "
-             "'per_agent': each agent UID uses a dedicated wallet.",
-        default="single",
-    )
-
-    parser.add_argument(
-        "--exchange.wallet.path",
-        type=str,
-        help="Filesystem path to the bittensor wallets directory.",
-        default="~/.bittensor/wallets",
-    )
-
-    parser.add_argument(
-        "--exchange.timeout",
-        type=float,
-        help="IPC response timeout in seconds for LOB exchange communication.",
-        default=60.0,
-    )
-
-    parser.add_argument(
-        "--exchange.max_retries",
+        "--neuron.mechid",
         type=int,
-        help="Maximum number of send+receive attempts before giving up on a batch.",
-        default=3,
+        help="Bittensor submechanism ID for weight submission. Defaults to 0 for simulation engine, 1 for exchange engine.",
+        default=None,
     )
 
     parser.add_argument(
-        "--exchange.ipc.request_queue",
+        "--engine",
         type=str,
-        help="POSIX message queue name for LOB batch requests.",
-        default="/mvtrx_req_queue",
+        choices=["simulation", "exchange"],
+        help="Validator engine mode: 'simulation' (default) or 'exchange'.",
+        default="simulation",
     )
 
     parser.add_argument(
-        "--exchange.ipc.response_queue",
-        type=str,
-        help="POSIX message queue name for LOB batch responses.",
-        default="/mvtrx_res_queue",
+        "--neuron.observe",
+        action="store_true",
+        default=False,
+        help=(
+            "Observe mode: collect chain state and push to the data service for UI display, "
+            "but skip all miner queries and weight submission. "
+            "Useful for connecting to mainnet/testnet to preview the UI without any chain interaction."
+        ),
     )
 
-    parser.add_argument(
-        "--exchange.ipc.request_shm",
-        type=str,
-        help="POSIX shared memory name for LOB batch request payloads.",
-        default="/mvtrx_req_shm",
-    )
-
-    parser.add_argument(
-        "--exchange.ipc.response_shm",
-        type=str,
-        help="POSIX shared memory name for LOB batch response payloads.",
-        default="/mvtrx_res_shm",
-    )
-
-    parser.add_argument(
-        "--exchange.ipc.request_semaphore",
-        type=str,
-        help="POSIX semaphore name used to signal the LOB that a request is ready.",
-        default="/mvtrx_req_sem",
-    )
-
-    parser.add_argument(
-        "--exchange.ipc.response_semaphore",
-        type=str,
-        help="POSIX semaphore name used by the LOB to signal that a response is ready.",
-        default="/mvtrx_res_sem",
-    )
+    # ── Engine-specific arguments (loaded conditionally) ──────────────────────
+    engine_mode = _detect_engine_mode()
+    if engine_mode == 'exchange':
+        try:
+            from taos.im.config.exchange import add_exchange_args
+        except ImportError as e:
+            raise RuntimeError(
+                "engine='exchange' requested but taos.im.config.exchange is not "
+                "available in this release — exchange-mode runs require the "
+                "private overlay (taos-im/mvtrx-overlay) to be laid down."
+            ) from e
+        add_exchange_args(cls, parser)
+    else:
+        add_simulation_args(cls, parser)

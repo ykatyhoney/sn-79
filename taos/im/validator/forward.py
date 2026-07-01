@@ -26,7 +26,6 @@ import time
 import bittensor as bt
 import uvloop
 import asyncio
-import aiohttp
 import posix_ipc
 import struct
 import traceback
@@ -40,45 +39,6 @@ from taos.im.validator.reward import set_delays
 from taos.im.utils import duration_from_timestamp
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-
-class DendriteManager:
-    @staticmethod
-    def configure_session(validator):
-        """
-        Ensures the validator's dendrite client session is properly configured.
-
-        Creates a new aiohttp session if none exists or the previous one is closed.
-        Reuses an existing session if available.
-
-        Args:
-            validator (Validator): The validator whose dendrite session should be configured.
-        Returns:
-            None
-        """
-        if not validator.dendrite._session or validator.dendrite._session.closed:
-            connector = aiohttp.TCPConnector(
-                ssl=False,
-                limit=0,
-                limit_per_host=0,
-                ttl_dns_cache=300,
-                enable_cleanup_closed=True,
-            )
-
-            timeout = aiohttp.ClientTimeout(
-                total=validator.config.neuron.timeout,
-                connect=1.0,
-                sock_read=None,
-                sock_connect=1.0,
-            )
-
-            validator.dendrite._session = aiohttp.ClientSession(
-                connector=connector,
-                timeout=timeout,
-                skip_auto_headers={'User-Agent'},
-            )
-            bt.logging.debug("Created new aiohttp session")
-        else:
-            bt.logging.debug("Reusing existing aiohttp session")
 
 def update_stats(self : Validator, synapses : dict[int, MarketSimulationStateUpdate]) -> None:
     """
@@ -120,6 +80,9 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
     """
     responses = []
 
+    if getattr(getattr(self.config, 'neuron', None), 'observe', False):
+        return responses
+
     if self.deregistered_uids != []:
         response = FinanceAgentResponse(agent_id=self.uid)
         response.reset_agents(agent_ids=self.deregistered_uids)
@@ -147,6 +110,10 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
             'config': synapse.config.model_dump(mode='json'),
             'version': synapse.version,
             'timestamp': synapse.timestamp,
+            'block': synapse.block,
+            'pools': synapse.pools or {},
+            'book_ids': list(self.engine.book_ids),
+            'engine_mode': self.engine.mode,
             'metagraph_axons': [
                 {
                     'hotkey': axon.hotkey,
@@ -166,8 +133,13 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
             'volume_sums': {uid: dict(books) for uid, books in self.volume_sums.items()},
             'capital_turnover_cap': self.config.scoring.activity.capital_turnover_cap,
             'max_instructions_per_book': self.config.scoring.max_instructions_per_book,
+            'exchange_volume_cap': getattr(getattr(self.config, 'exchange', None), 'volume_cap', 50000.0),
         }
         bt.logging.info(f"Request Data Prepared ({time.time()-data_start:.4f}s).")
+
+        if getattr(self.config.neuron, 'observe', False):
+            bt.logging.info("Observe mode — skipping miner queries")
+            return responses
 
         if self.should_block_queries():
             last_log_time = time.time()
@@ -177,7 +149,7 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
                 if current_time - last_log_time >= 1.0:
                     bt.logging.warning(f"Waiting for rewarding to catch up before querying ({self._pending_reward_tasks} tasks pending)...")
                     last_log_time = current_time
-        bt.logging.info(f"Rewarding up to date, proceeding with query!")
+        bt.logging.info("Rewarding up to date, proceeding with query!")
 
         # Mutual exclusion with GTX assignment delivery (deliver_gentrx): both
         # use the same IPC request queue / notify pipe AND the same miner
@@ -215,6 +187,22 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
             if drained_pipe > 0:
                 bt.logging.warning(f"Drained {drained_pipe} stale pipe notification(s) before query")
 
+            # Drain stale completion bytes from the notification pipe. The query service
+            # can finish a cycle before the validator loops back around; the b'1' sits in
+            # the pipe and would be read as an instant (false) completion on the next send.
+            drained_pipe = 0
+            try:
+                while True:
+                    data = os.read(self.query_notify_read, 1)
+                    if data:
+                        drained_pipe += 1
+                    else:
+                        break
+            except (BlockingIOError, OSError):
+                pass
+            if drained_pipe > 0:
+                bt.logging.warning(f"Drained {drained_pipe} stale pipe notification(s) before query")
+
             write_start = time.time()
             data_bytes = pickle.dumps(request_data, protocol=5)
             bt.logging.info(f"Query request data size: {len(data_bytes) / 1024 / 1024:.2f} MB")
@@ -229,34 +217,40 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
 
             receive_start = time.time()
             self.request_queue.send(b'query')
-            bt.logging.info(f"Sent query request, waiting for notification...")
+            bt.logging.info("Sent query request, waiting for notification...")
 
             max_wait = self.config.neuron.global_query_timeout + 10
-            
+
             try:
                 loop = asyncio.get_event_loop()
-                future = asyncio.Future()
-                
-                def pipe_readable():
-                    """Callback when pipe becomes readable"""
-                    loop.remove_reader(self.query_notify_read)
+                notify_result = None
+                deadline = time.time() + max_wait
+                while True:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError()
+                    future = asyncio.Future()
+
+                    def pipe_readable():
+                        loop.remove_reader(self.query_notify_read)
+                        try:
+                            data = os.read(self.query_notify_read, 1)
+                            future.set_result(data)
+                        except Exception as e:
+                            future.set_exception(e)
+                    loop.add_reader(self.query_notify_read, pipe_readable)
                     try:
-                        data = os.read(self.query_notify_read, 1)
-                        future.set_result(data)
-                    except Exception as e:
-                        future.set_exception(e)
-                loop.add_reader(self.query_notify_read, pipe_readable)
-                try:
-                    notify_result = await asyncio.wait_for(future, timeout=max_wait)
-                except asyncio.TimeoutError:
-                    loop.remove_reader(self.query_notify_read)
-                    raise
+                        notify_result = await asyncio.wait_for(future, timeout=remaining)
+                    except asyncio.TimeoutError:
+                        loop.remove_reader(self.query_notify_read)
+                        raise
+                    if notify_result == b'R':
+                        bt.logging.debug("Ignoring stray ready signal, re-waiting")
+                        continue
+                    break
                 pipe_wait_time = time.time() - receive_start
                 if notify_result == b'1':
                     bt.logging.info(f"Received query completion notification ({pipe_wait_time:.4f}s)")
-                elif notify_result == b'R':
-                    bt.logging.debug("Ignoring stray ready signal")
-                    return await forward(self, synapse)
                 else:
                     bt.logging.warning(f"Unexpected notification: {notify_result}")
                     return responses
@@ -290,7 +284,7 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
                 return responses
 
         except posix_ipc.BusyError:
-            self.pagerduty_alert(f"Query service response timeout")
+            self.pagerduty_alert("Query service response timeout")
             return responses
         except Exception as e:
             self.pagerduty_alert(f"Error communicating with query service: {e}", details={"traceback" : traceback.format_exc()})
@@ -323,15 +317,14 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
         self.miner_net_lock.release()
         bt.logging.debug("Query flag cleared")
 
-    return responses
-
 async def deliver_gentrx(self: Validator, deliveries: list) -> None:
     """Deliver GenTRX assignment synapses to miners via the query service IPC.
 
     Serializes delivery requests into shared memory, sends a 'deliver_gentrx'
     command to the query service, and waits for the b'G' pipe notification.
-    Uses the same IPC channel as forward() so queries and deliveries are
-    naturally serialized by the single request queue — they cannot overlap.
+    Uses the same IPC channel as forward(); the caller must hold
+    self.miner_net_lock so queries and deliveries never overlap — neither on
+    the IPC channel nor on the miner network.
 
     Args:
         self (Validator): The validator instance.
@@ -474,4 +467,4 @@ async def notify(self : Validator, notices : List[FinanceEventNotification]) -> 
         ))
     for response in responses:
         if response and response.acknowledged:
-            bt.logging.info(f"{response[0].type} EventNotification Acknowledged by {response[0].axon.hotkey}")
+            bt.logging.info(f"{response.type} EventNotification Acknowledged by {response.axon.hotkey}")

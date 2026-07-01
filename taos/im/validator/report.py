@@ -33,7 +33,36 @@ from fastapi.responses import Response
 import uvicorn
 import threading
 
+async def _push_to_mvtrx_data_service(state_dict: dict, url: str) -> None:
+    """Delegate to the optional data-service push module when present."""
+    try:
+        from taos.im.validator.mvtrx_push import push_to_data_service as _push
+    except ImportError:
+        return
+    await _push(state_dict, url)
+
+
 class ReportingService:
+    # Shared validator state pushed in via IPC before each report (not set in
+    # __init__). Annotation-only declarations — no runtime effect — so static
+    # analysis resolves these attributes.
+    kappa_values: dict
+    activity_factors: dict
+    pnl_factors: dict
+    scores: dict
+    unnormalized_scores: dict
+    miner_stats: dict
+    initial_balances: dict
+    initial_balances_published: dict
+    step_rates: dict
+    validator_config: dict
+    current_block: int
+    simulation_timestamp: int
+    step: int
+    uid: int
+    fundamental_price: float
+    shared_state_reporting: bool
+
     def __init__(self, config):
         """
         Initialise the reporting service, setting up IPC channels and Prometheus metrics.
@@ -55,25 +84,27 @@ class ReportingService:
         self.prometheus_initialized = False
         self.current_sim_id = None
         
+        _pfx = getattr(config, 'ipc_prefix', 'validator')
+        bt.logging.info(f"Reporting service IPC prefix: {_pfx!r}")
         self.request_queue = posix_ipc.MessageQueue(
-            "/validator-report-req",
+            f"/{_pfx}-report-req",
             flags=posix_ipc.O_CREAT,
             max_messages=2,
             max_message_size=1024
         )
         self.response_queue = posix_ipc.MessageQueue(
-            "/validator-report-res",
+            f"/{_pfx}-report-res",
             flags=posix_ipc.O_CREAT,
             max_messages=2,
             max_message_size=1024
         )
         self.request_shm = posix_ipc.SharedMemory(
-            "/validator-report-data",
+            f"/{_pfx}-report-data",
             flags=posix_ipc.O_CREAT,
             size=200 * 1024 * 1024
         )
         self.response_shm = posix_ipc.SharedMemory(
-            f"/validator-report-response-data",
+            f"/{_pfx}-report-response-data",
             flags=posix_ipc.O_CREAT,
             size=100 * 1024 * 1024
         )
@@ -241,7 +272,7 @@ class ReportingService:
         This is called when a new simulation starts to prevent stale metrics
         from the previous simulation from persisting in graphs.
         """
-        bt.logging.info(f"Clearing all metrics for simulation changeover...")
+        bt.logging.info("Clearing all metrics for simulation changeover...")
         start = time.time()
         
         try:
@@ -328,12 +359,10 @@ class ReportingService:
                         bt.logging.warning(f"Drained {drained} stale reporting response signals ({time.time()-drain_start:.4f}s)")
                     send_start = time.time()
                     max_retries = 3
-                    sent = False
                     for attempt in range(max_retries):
                         try:
                             self.response_queue.send(b'ready', timeout=1.0)
                             bt.logging.info(f"Reporting Response signal sent ({time.time()-send_start:.4f}s)")
-                            sent = True
                             break
                         except posix_ipc.BusyError:
                             bt.logging.warning(f"Reporting Response queue full, retry {attempt+1}/{max_retries}")
@@ -372,21 +401,33 @@ class ReportingService:
         """
         new_sim_id = data['simulation']['simulation_id']
         
-        if self.current_sim_id is None:
-            # First run after startup - clear any stale metrics from previous validator instance
-            bt.logging.info(
-                f"First metrics publish after startup (sim_id={new_sim_id}). "
-                f"Clearing all metrics to ensure clean slate..."
-            )
-            self.clear_all_metrics()
-        elif new_sim_id != self.current_sim_id:
-            # Simulation ID changed during runtime
+        if new_sim_id is None:
+            # simulation_id is transiently None — on_start() resets it and on_tick()
+            # re-derives it on the next state frame. Treat None as "not yet known":
+            # skip this publish entirely rather than treating it as a sim change,
+            # which would trigger a spurious clear and possibly a double-clear on recovery.
+            bt.logging.debug("publish_metrics: simulation_id is None, deferring until valid")
+            return
+
+        if self.current_sim_id is not None and new_sim_id != self.current_sim_id:
+            # Genuine simulation changeover: both IDs are real and they differ.
+            # Clear so stale metrics from the old simulation don't bleed into the new one.
             bt.logging.warning(
                 f"Simulation ID changed: {self.current_sim_id} → {new_sim_id}. "
                 f"Clearing all metrics..."
             )
             self.clear_all_metrics()
-        
+        else:
+            # First valid sim_id seen (fresh start, exchange mode, or reporting-service
+            # restart mid-simulation). Do NOT clear: a mid-sim restart would wipe valid
+            # accumulating metrics, and stale gauges from a prior instance are overwritten
+            # naturally on the next publish cycle.
+            if self.current_sim_id is None:
+                bt.logging.info(
+                    f"First valid metrics publish (sim_id={new_sim_id}). "
+                    f"Resuming without clearing existing metrics."
+                )
+
         self.current_sim_id = new_sim_id
         
         def deserialize_to_nested_dict(d):
@@ -398,12 +439,12 @@ class ReportingService:
             return result
 
         self.recent_trades = {
-            int(bookId): [TradeInfo(**t) for t in trades] 
+            int(bookId): [TradeInfo.model_construct(**t) for t in trades]
             for bookId, trades in data['recent_trades'].items()
         }
         self.recent_miner_trades = {
             int(uid): {
-                int(bookId): [(TradeEvent(**item['trade']), item['role']) for item in trades]
+                int(bookId): [(TradeEvent.model_construct(**item['trade']), item['role']) for item in trades]
                 for bookId, trades in book_trades.items()
             }
             for uid, book_trades in data['recent_miner_trades'].items()
@@ -413,6 +454,7 @@ class ReportingService:
         self.maker_volume_sums = deserialize_to_nested_dict(data['maker_volume_sums'])
         self.taker_volume_sums = deserialize_to_nested_dict(data['taker_volume_sums'])
         self.self_volume_sums = deserialize_to_nested_dict(data['self_volume_sums'])
+        self.fee_sums = deserialize_to_nested_dict(data.get('fee_sums', {}))
         self.roundtrip_volume_sums = deserialize_to_nested_dict(data['roundtrip_volume_sums'])
         self.inventory_history = data['inventory_history']
 
@@ -452,12 +494,123 @@ class ReportingService:
         for key, value in self.metagraph_data.items():
             setattr(self.metagraph, key, value)
         
-        self.simulation = MarketSimulationConfig(**data['simulation'])
+        sim_data = data['simulation']
+        if 'block_count' in sim_data:
+            self.simulation = MarketSimulationConfig(**sim_data)
+        else:
+            try:
+                from taos.im.protocol.exchange_config import ExchangeConfig
+            except ImportError:
+                # Exchange-engine sim_data only ever arrives when --engine exchange
+                # is active. The public release excludes the exchange engine + its
+                # config model; reaching this branch there means a misconfiguration.
+                raise RuntimeError(
+                    "Exchange engine mode is not supported in this build "
+                    "(taos.im.protocol.exchange_config is excluded from the public release). "
+                    "Run with --engine simulation (default)."
+                )
+            self.simulation = ExchangeConfig(**sim_data)
         
         if not self.prometheus_initialized:
             self._init_prometheus()
-        
-        await report(self)
+
+        # Build per-agent stats from scoring data available in this context.
+        # volume_sums / maker_volume_sums are already deserialized as {uid: {book_id: float}}.
+        def _sum_books(d):
+            return {uid: sum(float(v) for v in books.values())
+                    for uid, books in d.items()}
+
+        # In simulation mode open_positions tracks longs/shorts counts.
+        # In exchange mode the LOB accounts['o'] field holds resting orders directly.
+        is_exchange = not hasattr(self.simulation, 'block_count')
+        agent_open_orders = {}
+        agent_orders_detail: dict = {}
+
+        if is_exchange:
+            # Build open-order counts and per-order detail from LOB accounts['o'].
+            # accounts format: {uid: {netuid: {'o': [{i,s,p,q,...}], 'bb':..., ...}}}
+            lob_accounts = data.get('last_state', {}).get('accounts') or {}
+            for uid_key, uid_books in lob_accounts.items():
+                try:
+                    uid = int(uid_key)
+                    if not isinstance(uid_books, dict):
+                        continue
+                    for nid_key, acct in uid_books.items():
+                        if not isinstance(acct, dict):
+                            continue
+                        nid = int(nid_key)
+                        for ord_ in (acct.get('o') or []):
+                            if not isinstance(ord_, dict):
+                                continue
+                            lob_id = ord_.get('i', ord_.get('id'))
+                            if lob_id is None:
+                                continue
+                            agent_open_orders[uid] = agent_open_orders.get(uid, 0) + 1
+                            agent_orders_detail.setdefault(uid, []).append({
+                                "order_id": int(lob_id),
+                                "netuid":   nid,
+                                "side":     int(ord_.get('s', ord_.get('side', 0))),
+                                "price":    float(ord_.get('p', ord_.get('price', 0.0))),
+                                "quantity": float(ord_.get('q', ord_.get('quantity', 0.0))),
+                            })
+                except Exception:
+                    continue
+            # Stale-Redis fix: explicitly write an empty list for UIDs with no orders
+            # so Redis overwrites the key instead of leaving the previous value until TTL.
+            for uid_key in lob_accounts:
+                try:
+                    uid = int(uid_key)
+                    if uid not in agent_orders_detail:
+                        agent_orders_detail[uid] = []
+                except Exception:
+                    pass
+        else:
+            for uid, book_pos in (data.get('open_positions') or {}).items():
+                total = sum(
+                    p.get('longs_count', 0) + p.get('shorts_count', 0)
+                    for p in (book_pos.values() if isinstance(book_pos, dict) else [])
+                )
+                agent_open_orders[uid] = total
+
+        _ingest_url = (
+            getattr(getattr(self.config, 'exchange', None), 'data_service_url', '')
+            if is_exchange else
+            (getattr(getattr(self.config, 'simulation', None), 'data_service_url', '')
+             or getattr(getattr(self.config, 'exchange', None), 'data_service_url', ''))
+        )
+        is_observe = bool((data.get('validator_config') or {}).get('observe', False))
+
+        asyncio.create_task(_push_to_mvtrx_data_service({
+            "mode":           "exchange" if is_exchange else "simulation",
+            "network":        getattr(getattr(self.config, 'subtensor', None), 'network', ''),
+            "timestamp":      int(time.time() * 1e9),
+            "block":          data.get('current_block', 0),
+            "books":          data['last_state']['books'],
+            "accounts":       data['last_state']['accounts'],
+            "pools":          data['last_state'].get('pools'),
+            "reconciliation": data.get('reconciliation', {}),
+            # per-agent scoring — used by data service to build agent:stats
+            "agent_scores":          self.scores,
+            "agent_kappa":           {uid: float((kv or {}).get('score', 0.0))
+                                      for uid, kv in self.kappa_values.items()},
+            "agent_volume":          _sum_books(self.volume_sums),
+            "agent_maker_volume":    _sum_books(self.maker_volume_sums),
+            "agent_roundtrip_volume":_sum_books(self.roundtrip_volume_sums),
+            "agent_pnl":             {uid: float(pnl) for uid, pnl in self.total_realized_pnl.items()},
+            "agent_open_orders":     agent_open_orders,
+            "agent_orders_detail":   agent_orders_detail,
+            # chain-level data forwarded from exchange engine's last chain state
+            "block_events":   data.get('block_events', []),
+            "delegates":      data.get('delegates', {}),
+            # metagraph for identity + validator panel
+            "metagraph":      self.metagraph_data,
+            "validator_uid":  self.uid,
+            # simulation only: fundamental prices
+            "fundamental_price": self.fundamental_price,
+        }, url=_ingest_url))
+
+        if not is_observe:
+            await report(self)
     
     def pagerduty_alert(self, message, details=None):
         """
@@ -495,7 +648,7 @@ def publish_validator_gauges(self: ReportingService):
     Returns:
         None
     """
-    bt.logging.debug(f"Publishing validator metrics...")
+    bt.logging.debug("Publishing validator metrics...")
     start = time.time()
     self.prometheus_validator_gauges.labels( wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, validator_gauge_name="uid").set( self.uid )
     self.prometheus_validator_gauges.labels( wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, validator_gauge_name="stake").set( self.metagraph.stake[self.uid] )
@@ -654,7 +807,7 @@ def publish_info(self: ReportingService) -> None:
         for name, value in self.validator_config['scoring'].items()
     } | {
          f"simulation_{name}" : str(value) for name, value in self.simulation.model_dump().items() if name != 'logDir' and name != 'fee_policy'
-    } | self.simulation.fee_policy.to_prom_info()
+    } | (self.simulation.fee_policy.to_prom_info() if getattr(self.simulation, 'fee_policy', None) else {})
     self.prometheus_info.labels( wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id ).info (prometheus_info)
     publish_validator_gauges(self)
     publish_gentrx_gauges(self)
@@ -760,8 +913,8 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
         'error': None
     }
     try:
-        simulation_timestamp = validator_data['simulation_timestamp']
-        step = validator_data['step']
+        validator_data['simulation_timestamp']
+        validator_data['step']
         accounts = state_data['accounts']
         books = state_data['books']
         if not accounts:
@@ -769,6 +922,7 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
         
         total_realized_pnl = validator_data['total_realized_pnl']
         realized_pnl_by_book = validator_data['realized_pnl_by_book']
+        fee_sums_by_book = validator_data.get('fee_sums', {})
 
         volume_sums = validator_data['volume_sums']
         maker_volume_sums = validator_data['maker_volume_sums']
@@ -892,11 +1046,11 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
             activity_factor = (
                 sum(validator_data['activity_factors'][agentId].values()) /
                 len(validator_data['activity_factors'][agentId])
-            )
+            ) if validator_data['activity_factors'][agentId] else 0.0
             pnl_factor = (
                 sum(validator_data['pnl_factors'][agentId].values()) /
                 len(validator_data['pnl_factors'][agentId])
-            )
+            ) if validator_data['pnl_factors'][agentId] else 0.0
             kappa_values = validator_data['kappa_values'][agentId] if agentId in validator_data['kappa_values'] else None
 
             miner_metrics[agentId] = {
@@ -944,6 +1098,7 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
             'total_inventory_history': total_inventory_history,
             'total_realized_pnl': total_realized_pnl,
             'realized_pnl_by_book': realized_pnl_by_book,
+            'fee_sums_by_book': fee_sums_by_book,
             'pnl': pnl,
             'scores': scores.tolist(),
             'placements': placements.tolist(),
@@ -970,7 +1125,7 @@ async def report(self: ReportingService) -> None:
         bt.logging.info(f"Publishing Metrics at Step {self.step} ({simulation_duration})...")
         report_start = time.time()
         updates = deque()    
-        bt.logging.debug(f"Collecting simulation metrics...")
+        bt.logging.debug("Collecting simulation metrics...")
         start = time.time()
         
         agent_gauges = self.prometheus_agent_gauges
@@ -1004,7 +1159,7 @@ async def report(self: ReportingService) -> None:
 
         publish_info(self)
 
-        bt.logging.debug(f"Collecting book metrics...")
+        bt.logging.debug("Collecting book metrics...")
         book_start = time.time()
         for bookId, book in self.last_state.books.items():
             if book['b']:
@@ -1017,7 +1172,8 @@ async def report(self: ReportingService) -> None:
                     bid_cumsum += level['q']
                     updates.append((book_gauges, bid_cumsum,
                         wallet_addr, netuid, simid, bookId, i, "bid_vol_sum"))
-                    if i == 20: break
+                    if i == 20:
+                        break
             if book['a']:
                 ask_cumsum = 0
                 for i, level in enumerate(book['a']):
@@ -1028,7 +1184,8 @@ async def report(self: ReportingService) -> None:
                     ask_cumsum += level['q']
                     updates.append((book_gauges, ask_cumsum,
                         wallet_addr, netuid, simid, bookId, i, "ask_vol_sum"))
-                    if i == 20: break
+                    if i == 20:
+                        break
             if book['b'] and book['a']:
                 mid = (book['b'][0]['p'] + book['a'][0]['p']) / 2
                 updates.append((book_gauges, mid,
@@ -1058,14 +1215,15 @@ async def report(self: ReportingService) -> None:
                 trades = [event for event in book['e'] if event['y'] == 't']
                 if trades:
                     last_trade = trades[-1]
-                    if isinstance(self.fundamental_price[0], pd.Series):
-                        updates.append((book_gauges,
-                            self.fundamental_price[bookId].iloc[-1],
-                            wallet_addr, netuid, simid, bookId, 0, "fundamental_price"))
-                    else:
-                        if self.fundamental_price[bookId]:
+                    fp = self.fundamental_price.get(bookId) if self.fundamental_price else None
+                    if fp is not None:
+                        if isinstance(fp, pd.Series):
                             updates.append((book_gauges,
-                                self.fundamental_price[bookId],
+                                fp.iloc[-1],
+                                wallet_addr, netuid, simid, bookId, 0, "fundamental_price"))
+                        elif fp:
+                            updates.append((book_gauges,
+                                fp,
                                 wallet_addr, netuid, simid, bookId, 0, "fundamental_price"))
                         else:
                             _remove_and_evict(self._child_cache, book_gauges,
@@ -1081,8 +1239,8 @@ async def report(self: ReportingService) -> None:
                         wallet_addr, netuid, simid, bookId, 0, "trade_sell_volume"))
 
                     has_new_trades = True
-            if self.simulation.fee_policy.fee_type == 'dynamic':
-                DISMTR = self.last_state.books[bookId]['mtr']
+            if getattr(self.simulation, 'fee_policy', None) and self.simulation.fee_policy.fee_type == 'dynamic':
+                DISMTR = self.last_state.books[bookId].get('r', self.last_state.books[bookId].get('mtr', 0))
                 DISmakerRate = self.last_state.accounts[0][bookId]['f']['m']
                 DIStakerRate = self.last_state.accounts[0][bookId]['f']['t']
                 updates.append((book_gauges, DISmakerRate,
@@ -1094,7 +1252,7 @@ async def report(self: ReportingService) -> None:
         bt.logging.debug(f"Book metrics collected ({time.time()-book_start:.4f}s).")
 
         if has_new_trades:
-            bt.logging.debug(f"Collecting trade metrics...")
+            bt.logging.debug("Collecting trade metrics...")
             start = time.time()
             for bookId, trades in self.recent_trades.items():
                 # slot=0 is the most recent trade; values that were labels become
@@ -1129,7 +1287,7 @@ async def report(self: ReportingService) -> None:
             bt.logging.info(f"Metrics Published for Step {report_step} ({time.time()-report_start}s).")
             return
             
-        bt.logging.debug(f"Computing miner metrics in worker process...")
+        bt.logging.debug("Computing miner metrics in worker process...")
         computation_start = time.time()
         volume_sums_snapshot = {uid: dict(books) for uid, books in self.volume_sums.items()}
         maker_volume_sums_snapshot = {uid: dict(books) for uid, books in self.maker_volume_sums.items()}
@@ -1147,6 +1305,7 @@ async def report(self: ReportingService) -> None:
             'inventory_history': self.inventory_history,
             'total_realized_pnl': self.total_realized_pnl,
             'realized_pnl_by_book': self.realized_pnl_by_book,
+            'fee_sums': {uid: dict(books) for uid, books in self.fee_sums.items()},
             'activity_factors': self.activity_factors,
             'pnl_factors': self.pnl_factors,
             'kappa_values': self.kappa_values,
@@ -1156,8 +1315,8 @@ async def report(self: ReportingService) -> None:
             'book_count': self.simulation.book_count,
             'simulation_config': {
                 'volumeDecimals': self.simulation.volumeDecimals,
-                'baseDecimals': self.simulation.baseDecimals,
-                'quoteDecimals': self.simulation.quoteDecimals,
+                'baseDecimals': getattr(self.simulation, 'baseDecimals', self.simulation.volumeDecimals),
+                'quoteDecimals': getattr(self.simulation, 'quoteDecimals', self.simulation.volumeDecimals),
             }
         }
 
@@ -1183,11 +1342,12 @@ async def report(self: ReportingService) -> None:
         daily_volumes = metrics['daily_volumes']
         daily_roundtrip_volumes = metrics['daily_roundtrip_volumes']
         self.realized_pnl_by_book = metrics['realized_pnl_by_book']
+        _fee_sums_by_book = metrics.get('fee_sums_by_book', {})
 
-        bt.logging.debug(f"Collecting agent book metrics...")
+        bt.logging.debug("Collecting agent book metrics...")
         start = time.time()
 
-        bt.logging.debug(f"Pre-extracting inventory/kappa data...")
+        bt.logging.debug("Pre-extracting inventory/kappa data...")
         extract_start = time.time()
 
         start_inventories = {}
@@ -1208,7 +1368,7 @@ async def report(self: ReportingService) -> None:
 
         for agentId, accounts in self.last_state.accounts.items():
             initial_balance_publish_status = {bookId: False for bookId in range(self.simulation.book_count)}
-            for bookId, account in accounts.items():
+            for bookId, _account in accounts.items():
                 if agentId in self.initial_balances and self.initial_balances[agentId][bookId]['BASE'] is not None and not self.initial_balances_published.get(agentId, False):
                     updates.append((agent_gauges, self.initial_balances[agentId][bookId]['BASE'],
                         wallet_addr, netuid, simid, bookId, agentId, "base_balance_initial"))
@@ -1242,13 +1402,16 @@ async def report(self: ReportingService) -> None:
                     updates.append((agent_gauges, account['f']['v'], wallet_addr, netuid, simid, bookId, agentId, "fees_traded_volume"))
                 updates.append((agent_gauges, account['f']['m'], wallet_addr, netuid, simid, bookId, agentId, "fees_maker_rate"))
                 updates.append((agent_gauges, account['f']['t'], wallet_addr, netuid, simid, bookId, agentId, "fees_taker_rate"))
-                updates.append((agent_gauges, last_inv[bookId], wallet_addr, netuid, simid, bookId, agentId, "inventory_value"))
-                updates.append((agent_gauges, last_inv[bookId] - start_inv[bookId], wallet_addr, netuid, simid, bookId, agentId, "pnl"))
+                updates.append((agent_gauges, last_inv.get(bookId, 0.0), wallet_addr, netuid, simid, bookId, agentId, "inventory_value"))
+                updates.append((agent_gauges, last_inv.get(bookId, 0.0) - start_inv.get(bookId, 0.0), wallet_addr, netuid, simid, bookId, agentId, "pnl"))
                 if agentId in self.realized_pnl_by_book:
                     book_realized_pnl = self.realized_pnl_by_book[agentId].get(bookId, 0.0)
                     updates.append((agent_gauges, book_realized_pnl, wallet_addr, netuid, simid, bookId, agentId, "realized_pnl"))
                 else:
                     updates.append((agent_gauges, 0.0, wallet_addr, netuid, simid, bookId, agentId, "realized_pnl"))
+                _agent_fee_books = _fee_sums_by_book.get(agentId, _fee_sums_by_book.get(str(agentId), {}))
+                updates.append((agent_gauges, _agent_fee_books.get(bookId, _agent_fee_books.get(str(bookId), 0.0)),
+                                wallet_addr, netuid, simid, bookId, agentId, "net_fee"))
                 updates.append((agent_gauges, daily_volumes[agentId][bookId]['total'], wallet_addr, netuid, simid, bookId, agentId, "daily_volume"))
                 updates.append((agent_gauges, daily_volumes[agentId][bookId]['maker'], wallet_addr, netuid, simid, bookId, agentId, "daily_maker_volume"))
                 updates.append((agent_gauges, daily_volumes[agentId][bookId]['taker'], wallet_addr, netuid, simid, bookId, agentId, "daily_taker_volume"))
@@ -1269,7 +1432,7 @@ async def report(self: ReportingService) -> None:
                     _remove_and_evict(self._child_cache, agent_gauges, wallet_addr, netuid, simid, bookId, agentId, "kappa")
         bt.logging.debug(f"Agent book metrics collected ({time.time()-start:.4f}s).")
 
-        bt.logging.debug(f"Collecting miner trade metrics...")
+        bt.logging.debug("Collecting miner trade metrics...")
         start = time.time()
         for agentId, notices in self.last_state.notices.items():
             if agentId < 0:
@@ -1312,7 +1475,7 @@ async def report(self: ReportingService) -> None:
                             updates.append((agent_gauges, last_taker_trade.takerFeeRate, wallet_addr, netuid, simid, bookId, uid, "fees_last_taker_rate"))
         bt.logging.debug(f"Miner trade metrics collected ({time.time()-start:.4f}s).")
 
-        bt.logging.debug(f"Collecting miner metrics...")
+        bt.logging.debug("Collecting miner metrics...")
         self.prometheus_miners.clear()
         start = time.time()
         for agentId in miner_metrics:
@@ -1466,7 +1629,9 @@ if __name__ == '__main__':
     parser.add_argument('--prometheus.port', type=int, default=9001)
     parser.add_argument('--prometheus.level', type=str, default='INFO')
     parser.add_argument('--cpu-cores', type=str, default=None)
-    
+    parser.add_argument('--ipc-prefix', type=str, default='validator',
+                        help='Prefix for POSIX IPC resource names — "validator" for simulation, "exchange" for exchange mode')
+
     config = bt.Config(parser)
     bt.logging(config=config)
 

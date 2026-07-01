@@ -30,7 +30,6 @@ import threading
 import bittensor as bt
 
 from typing import List, Optional, Tuple
-from traceback import print_exception
 
 
 def compute_two_pool_allocation(
@@ -147,10 +146,14 @@ class BaseValidatorNeuron(BaseNeuron):
         self.sync(save_state=False)
 
         # Serve axon to enable external connections.
-        if not self.config.neuron.axon_off:
+        _observe = getattr(getattr(self.config, 'neuron', None), 'observe', False)
+        if not self.config.neuron.axon_off and not _observe:
             self.serve_axon()
         else:
-            bt.logging.warning("`neuron.axon_off=True` - IP will not be served to chain.")
+            if _observe:
+                bt.logging.info("Observe mode — skipping axon registration.")
+            else:
+                bt.logging.warning("`neuron.axon_off=True` - IP will not be served to chain.")
 
         # Instantiate runners
         self.should_exit: bool = False
@@ -330,17 +333,25 @@ class BaseValidatorNeuron(BaseNeuron):
         """
         Weight setting function
         """
+        if getattr(self.config.neuron, 'observe', False):
+            bt.logging.info("Observe mode — skipping weight submission")
+            return
+
         # Get relevant hyperparameters
-        version_key = self.hyperparams.weights_version
         commit_reveal_weights_enabled = bool(self.hyperparams.commit_reveal_weights_enabled)
+        mechid = getattr(self.config.neuron, 'mechid', None)
+        if mechid is None:
+            mechid = 1 if getattr(self.config, 'engine', 'simulation') == 'exchange' else 0
         # Prepare weights for submission
         uint_uids, uint_weights = self.prepare_weights()
         bt.logging.info(f"`commit_reveal_weights_enabled` : {commit_reveal_weights_enabled}")
+        bt.logging.info(f"`mechid` : {mechid}")
         result, msg = self.subtensor.set_weights(
             wallet=self.wallet,
             netuid=self.config.netuid,
             uids=uint_uids,
             weights=uint_weights,
+            mechid=mechid,
             wait_for_inclusion=False,
             wait_for_finalization=False,
             version_key=self.spec_version,

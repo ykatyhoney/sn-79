@@ -75,7 +75,7 @@ def maintain_coinbase(client: CoinbaseClient, reconnect: Callable[[], None], che
         client.sleep_with_exception_check(interval)
     except WSClientException as e:
         bt.logging.warning(f"Error in Coinbase websocket : {e}")
-    except WSClientConnectionClosedException as e:
+    except WSClientConnectionClosedException:
         bt.logging.error(f"Coinbase connection closed! Sleeping for {interval} seconds before reconnecting...")
         time.sleep(interval)
     if not client._is_websocket_open() or not check():
@@ -101,7 +101,9 @@ def subscribe_coinbase_trades(
     def _on_trade(trade: dict):
         # Handle each trade, possibly marking for sampling.
         global last_trade, next_sampled
-        if 'next_external_sampling_time' in globals() and trade['received'] <= next_external_sampling_time:
+        # next_external_sampling_time is a module global initialised lazily by the
+        # sampling handler below; the `in globals()` guard makes the read safe.
+        if 'next_external_sampling_time' in globals() and trade['received'] <= next_external_sampling_time:  # noqa: F821
             next_sampled = trade
         last_trade = trade
         on_trade(trade)
@@ -126,7 +128,7 @@ def subscribe_coinbase_trades(
 
             current_time = time.time()
 
-            if not 'next_external_sampling_time' in globals() or not 'next_sampled' in globals():
+            if 'next_external_sampling_time' not in globals() or 'next_sampled' not in globals():
                 # Calculate the next sampling time aligned to the nearest interval.
                 seconds_since_start_of_day = current_time % 86400
                 start_of_day = current_time - seconds_since_start_of_day

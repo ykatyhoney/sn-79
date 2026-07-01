@@ -122,7 +122,7 @@ void RandomTraderAgent::handleTradeSubscriptionResponse()
 
 void RandomTraderAgent::handleRetrieveResponse(Message::Ptr msg)
 {
-    const auto payload = std::dynamic_pointer_cast<RetrieveL1ResponsePayload>(msg->payload);
+    const auto payload = std::static_pointer_cast<RetrieveL1ResponsePayload>(msg->payload);
     BookId bookId = payload->bookId;
 
     std::random_device rd;
@@ -156,7 +156,7 @@ void RandomTraderAgent::handleRetrieveResponse(Message::Ptr msg)
 
 void RandomTraderAgent::handleLimitOrderPlacementResponse(Message::Ptr msg)
 {
-    const auto payload = std::dynamic_pointer_cast<PlaceOrderLimitResponsePayload>(msg->payload);
+    const auto payload = std::static_pointer_cast<PlaceOrderLimitResponsePayload>(msg->payload);
 
     simulation()->dispatchMessage(
         simulation()->currentTimestamp(),
@@ -175,7 +175,7 @@ void RandomTraderAgent::handleLimitOrderPlacementResponse(Message::Ptr msg)
 void RandomTraderAgent::handleLimitOrderPlacementErrorResponse(Message::Ptr msg)
 {
     const auto payload =
-        std::dynamic_pointer_cast<PlaceOrderLimitErrorResponsePayload>(msg->payload);
+        std::static_pointer_cast<PlaceOrderLimitErrorResponsePayload>(msg->payload);
 
     const BookId bookId = payload->requestPayload->bookId;
 

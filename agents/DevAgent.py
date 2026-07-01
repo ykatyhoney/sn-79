@@ -25,7 +25,7 @@ from enum import IntEnum
 
 from taos.common.agents import launch
 from taos.im.agents import (
-    FinanceSimulationAgent,
+    GenTRXAgent,
     Positions,
     RollingWindow,
     Signals,
@@ -191,7 +191,7 @@ class Prediction:
                 f"Confidence({self.confidence:.4f}) "
                 f"Signal({self.direction.name})")
 
-class DevAgent(FinanceSimulationAgent):
+class DevAgent(GenTRXAgent):
     """Volume-Bucket Momentum/Mean-Reversion Trading Agent.
     
     Strategy Overview:
@@ -229,10 +229,11 @@ class DevAgent(FinanceSimulationAgent):
     
     def initialize(self) -> None:
         """Initialize agent configuration, thresholds, rolling windows, and buffers.
-        
+
         This method is called once during agent startup to set up all strategy
         parameters and data structures.
         """
+        super().initialize()
         # Order sizing
         self.quantity = getattr(self.config, 'quantity', 2.0)
         self.expiry_period = getattr(self.config, 'expiry_period', 120e9)

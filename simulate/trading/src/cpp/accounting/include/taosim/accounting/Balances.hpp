@@ -24,7 +24,7 @@ namespace taosim::accounting
 struct BalancesDesc
 {
     Balance base;
-    Balance quote;
+    std::shared_ptr<Balance> quote;
     RoundParams roundParams;
 };
 
@@ -40,7 +40,7 @@ class Balances : public JsonSerializable
 {
 public:
     Balance base{};
-    Balance quote{};
+    std::shared_ptr<Balance> quote{};
     std::map<OrderID, decimal_t> m_buyLeverages;
     std::map<OrderID, decimal_t> m_sellLeverages;
     std::map<OrderID, Loan> m_loans;
@@ -54,7 +54,11 @@ public:
 
     Balances() noexcept = default;
     explicit Balances(const BalancesDesc& desc) noexcept;
-    Balances(Balance base, Balance quote, uint32_t baseDecimals, uint32_t quoteDecimals) noexcept;
+    Balances(
+        Balance base,
+        std::shared_ptr<Balance> quote,
+        uint32_t baseDecimals,
+        uint32_t quoteDecimals) noexcept;
 
     [[nodiscard]] bool canBorrow(
         decimal_t collateralAmount, decimal_t price, OrderDirection direction) const noexcept;
@@ -122,7 +126,7 @@ struct fmt::formatter<taosim::accounting::Balances>
     template<typename FormatContext>
     auto format(const taosim::accounting::Balances& bals, FormatContext& ctx) const
     {
-        return fmt::format_to(ctx.out(), "Base: {}\nQuote: {}\n", bals.base, bals.quote);
+        return fmt::format_to(ctx.out(), "Balances{{base: {}, quote: {}}}", bals.base, *bals.quote);
     }
 };
 

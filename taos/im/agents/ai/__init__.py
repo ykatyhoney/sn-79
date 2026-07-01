@@ -40,7 +40,7 @@ class FinanceSimulationAIAgent(FinanceSimulationAgent):
             FinanceAgentResponse: The agent's generated response for the current state.
         """
         self.update(state)
-        for book_id, book in state.books.items():
+        for book_id, _book in state.books.items():
             if state.dendrite.hotkey in self.last_train_time and book_id in self.last_train_time[state.dendrite.hotkey] and int(state.timestamp - self.last_train_time[state.dendrite.hotkey][book_id]) > self.train_interval * 1_000_000_000:
                 if self.trained_events[state.dendrite.hotkey][book_id] == 0:
                     self._train(state.dendrite.hotkey, book_id, state.timestamp, test=True)
@@ -223,7 +223,7 @@ class FinanceSimulationAIAgent(FinanceSimulationAgent):
                     attrib = getattr(self.config, name)
                     try:
                         self.model_kwargs[name] = ast.literal_eval(attrib)
-                    except:
+                    except Exception:
                         self.model_kwargs[name] = attrib
                 else:
                     self.model_kwargs[name] = param.default
@@ -262,13 +262,13 @@ Output Directory : {self.output_dir}
         self.reset = bool(self.config.reset) if hasattr(self.config,'reset') else False
         
         # Set the time window for the features in simulation seconds, if no value specified this defaults to 1 second
-        self.sampling_interval = self.config.sampling_interval if hasattr(self.config, 'sampling_interval') else 1
+        self.sampling_interval = int(self.config.sampling_interval) if hasattr(self.config, 'sampling_interval') else 1
         # Set the number of observations to use in training, if no value specified this defaults to 60 observations
         self.train_n = int(self.config.train_n) if hasattr(self.config,'train_n') else 60
         # Set the interval at which training should be executed in simulation seconds, if no value specified this defaults to 1 simulation minute
-        self.train_interval = self.config.train_interval if hasattr(self.config, 'train_interval') else 60
+        self.train_interval = int(self.config.train_interval) if hasattr(self.config, 'train_interval') else 60
         # Set the number of times training must be completed before beginning inference, if no value specified this defaults to 1 training execution
-        self.min_train_events = self.config.min_train_events if hasattr(self.config, 'min_train_events') else 3
+        self.min_train_events = int(self.config.min_train_events) if hasattr(self.config, 'min_train_events') else 3
         
         self.model_trained = {}
         self.last_train_time = {}
@@ -289,7 +289,7 @@ Output Directory : {self.output_dir}
         Initialize model utilized in response processing for the specified book
         """
         if not self.reset:
-            if not validator in self.models:
+            if validator not in self.models:
                 self.models[validator] = {}
                 self.model_trained[validator] = {}
                 self.trained_events[validator] = {}
@@ -307,7 +307,7 @@ Output Directory : {self.output_dir}
                     self.model_trained[validator][book_id] = True
                     self.trained_events[validator][book_id] = self.min_train_events
                     self.last_train_time[validator][book_id] = 0
-                elif not book_id in self.models[validator]:
+                elif book_id not in self.models[validator]:
                     bt.logging.info(f'No {self.model} checkpoint for book {book_id} - initializing new model.')
                     self.models[validator][book_id] = self.init_model(validator, book_id)
                     self.model_trained[validator][book_id] = False

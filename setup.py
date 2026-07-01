@@ -25,27 +25,39 @@ from os import path
 from io import open
 from setuptools import setup, find_packages
 
-def read_requirements(path):
+def _parse_req(req):
+    """Normalise one requirements.txt line; return None for skippable entries."""
+    if not req or req.startswith("#") or req.startswith("-"):
+        return None
+    if req.startswith("git+") or "@" in req:
+        m = re.search(r"(#egg=)([\w\-_]+)", req)
+        return m.group(2) if m else None
+    return req
+
+
+def read_requirements_split(path, marker_substring="GenTRX"):
+    """Split ``requirements.txt`` into (core, extras) at a marker comment.
+
+    Lines before the first comment whose body contains ``marker_substring`` go
+    into ``install_requires``; everything after goes into the ``gentrx`` extra.
+    This keeps ``pip install -e .`` lean by default while preserving the
+    full-fat install via ``pip install -e .[gentrx]``.
+    """
     with open(path, "r") as f:
-        requirements = f.read().splitlines()
-        processed_requirements = []
-
-        for req in requirements:
-            # For git or other VCS links
-            if req.startswith("git+") or "@" in req:
-                pkg_name = re.search(r"(#egg=)([\w\-_]+)", req)
-                if pkg_name:
-                    processed_requirements.append(pkg_name.group(2))
-                else:
-                    # You may decide to raise an exception here,
-                    # if you want to ensure every VCS link has an #egg=<package_name> at the end
-                    continue
-            else:
-                processed_requirements.append(req)
-        return processed_requirements
+        lines = f.read().splitlines()
+    core, extra = [], []
+    bucket = core
+    for line in lines:
+        if line.startswith("#") and marker_substring in line:
+            bucket = extra
+            continue
+        parsed = _parse_req(line)
+        if parsed is not None:
+            bucket.append(parsed)
+    return core, extra
 
 
-requirements = read_requirements("requirements.txt")
+requirements, gentrx_requirements = read_requirements_split("requirements.txt")
 here = path.abspath(path.dirname(__file__))
 
 with open(path.join(here, "README.md"), encoding="utf-8") as f:
@@ -74,6 +86,7 @@ setup(
     license="MIT",
     python_requires=">=3.10",
     install_requires=requirements,
+    extras_require={"gentrx": gentrx_requirements},
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Developers",

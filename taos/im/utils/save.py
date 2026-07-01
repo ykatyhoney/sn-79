@@ -5,10 +5,29 @@ Validator and simulation state persistence: atomic msgpack serialisation to
 disk, designed for use in a ProcessPoolExecutor worker.
 """
 import os
-import time
-import traceback
 from typing import Dict
 import msgpack
+
+
+def _fsync_dir(path):
+    """fsync the directory entry so a preceding os.replace is durable.
+
+    Without this, a power loss right after the rename can leave the directory
+    pointing at the OLD inode on remount (the temp's bytes are already fsynced,
+    but the rename itself isn't). Best-effort: filesystems without O_DIRECTORY
+    support raise OSError and we silently fall through — at worst we lose the
+    same durability guarantee that's missing without the fix.
+    """
+    try:
+        dfd = os.open(path or ".", os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        os.fsync(dfd)
+    except OSError:
+        pass
+    finally:
+        os.close(dfd)
 
 
 def _pack_stream_fsync(path, obj):
@@ -20,7 +39,9 @@ def _pack_stream_fsync(path, obj):
     overlaps serialization with the file write. fsync BEFORE the atomic
     os.replace guarantees the temp file's bytes are durable before it takes the
     state file's place — without it a power loss right after the rename could
-    leave a truncated state with the previous good file already gone.
+    leave a truncated state with the previous good file already gone. Pair this
+    with _fsync_dir on the parent after os.replace to make the rename itself
+    durable.
     """
     packer = msgpack.Packer(use_bin_type=True)
     total = 0
@@ -59,7 +80,6 @@ def save_state_worker(simulation_state_data: Dict, validator_state_data: Dict,
     Returns:
         Dict: Result with success status and timing information
     """
-    import msgpack
     import os
     import time
     import traceback
@@ -79,12 +99,14 @@ def save_state_worker(simulation_state_data: Dict, validator_state_data: Dict,
         sim_tmp = simulation_state_file + ".tmp"
         _pack_stream_fsync(sim_tmp, simulation_state_data)
         os.replace(sim_tmp, simulation_state_file)
+        _fsync_dir(os.path.dirname(simulation_state_file))
         result['simulation_save_time'] = time.time() - sim_start
 
         val_start = time.time()
         val_tmp = validator_state_file + ".tmp"
         _pack_stream_fsync(val_tmp, validator_state_data)
         os.replace(val_tmp, validator_state_file)
+        _fsync_dir(os.path.dirname(validator_state_file))
         result['validator_save_time'] = time.time() - val_start
         result['total_time'] = time.time() - total_start
         result['success'] = True
@@ -96,6 +118,6 @@ def save_state_worker(simulation_state_data: Dict, validator_state_data: Dict,
             if os.path.exists(tmp):
                 try:
                     os.remove(tmp)
-                except:
-                    pass    
+                except Exception:
+                    pass
     return result

@@ -67,6 +67,8 @@ class PlaceOrderInstruction(FinanceAgentInstruction):
     currency: Literal[OrderCurrency.BASE, OrderCurrency.QUOTE] = OrderCurrency.BASE
     leverage: NonNegativeFloat = 0.0
     settleFlag: Literal[LoanSettlementOption.NONE, LoanSettlementOption.FIFO] | NonNegativeInt = LoanSettlementOption.NONE
+    delegate: str = ""
+    max_slippage: float | None = None
 
     
     def __str__(self):
@@ -80,9 +82,11 @@ class PlaceMarketOrderInstruction(PlaceOrderInstruction):
         type (Literal['PLACE_ORDER_MARKET']): Fixed to 'PLACE_ORDER_MARKET'.
     """
     type: Literal['PLACE_ORDER_MARKET'] = 'PLACE_ORDER_MARKET'
+    stop_loss:   float | None = None
+    take_profit: float | None = None
 
     def payload(self) -> dict:
-        return {
+        d = {
             "direction": self.direction,
             "volume": self.quantity,
             "bookId":self.bookId,
@@ -90,8 +94,15 @@ class PlaceMarketOrderInstruction(PlaceOrderInstruction):
             "stpFlag":self.stp,
             "currency":self.currency,
             "leverage":self.leverage,
-            "settleFlag":self.settleFlag
+            "settleFlag":self.settleFlag,
+            "delegate": self.delegate,
+            "max_slippage": self.max_slippage if self.max_slippage is not None else 0.0,
         }
+        if self.stop_loss is not None:
+            d["stopLoss"] = self.stop_loss
+        if self.take_profit is not None:
+            d["takeProfit"] = self.take_profit
+        return d
     
     def __str__(self):
         return f"{'BUY ' if self.direction == OrderDirection.BUY else 'SELL'} {f'{1+self.leverage:.2f}x' if self.leverage > 0 else ''}{self.quantity}{'' if self.currency==OrderCurrency.BASE else 'QUOTE'}@MARKET ON BOOK {self.bookId}"
@@ -114,9 +125,11 @@ class PlaceLimitOrderInstruction(PlaceOrderInstruction):
     postOnly: bool = False
     timeInForce: Literal[TimeInForce.GTC, TimeInForce.GTT, TimeInForce.IOC, TimeInForce.FOK] = TimeInForce.GTC
     expiryPeriod: PositiveInt | None = None
+    stop_loss:   float | None = None
+    take_profit: float | None = None
 
     def payload(self) -> dict:
-        return {
+        d = {
             "direction": self.direction,
             "volume": self.quantity,
             "price": self.price,
@@ -127,8 +140,14 @@ class PlaceLimitOrderInstruction(PlaceOrderInstruction):
             "expiryPeriod" : self.expiryPeriod,
             "stpFlag" : self.stp,
             "leverage":self.leverage,
-            "settleFlag":self.settleFlag
+            "settleFlag":self.settleFlag,
+            "delegate": self.delegate,
         }
+        if self.stop_loss is not None:
+            d["stopLoss"] = self.stop_loss
+        if self.take_profit is not None:
+            d["takeProfit"] = self.take_profit
+        return d
     
     def __str__(self):
         return f"{'BUY ' if self.direction == OrderDirection.BUY else 'SELL'} {f'{1+self.leverage:.2f}x' if self.leverage > 0 else ''}{self.quantity}@{self.price} ON BOOK {self.bookId}"

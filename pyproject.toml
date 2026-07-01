@@ -1,0 +1,170 @@
+# Lint / type-check / complexity config for the PUBLIC sn-79 surface
+# (taos/, agents/, GenTRX/src, simulate/trading/run, bin/).
+#
+# This file intentionally has NO [build-system] table: setup.py remains the
+# build driver (`pip install -e .` keeps using the legacy setuptools path).
+#
+# The mvtrx/ submodules carry their own pyproject.toml (line-length 120,
+# py3.12) and are excluded here. ExeTRX / exchange / GenTRX/serve are not part
+# of the public release and are excluded too.
+
+[tool.black]
+line-length = 120
+target-version = ["py310"]
+extend-exclude = '''
+/(
+    mvtrx
+  | simulate/trading/build
+  | simulate/trading/vcpkg
+  | agents/exchange
+  | GenTRX/serve
+)/
+'''
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+# Mirror apply_testnet.sh: exclude everything not in the public sn-79 surface
+# (exchange-mode engine, chain reconciliation, ExeTRX, MVTRX push, exchange
+# protocol/config, and the exchange/dev-only example agents).
+extend-exclude = [
+    "mvtrx",
+    "simulate/trading/build",
+    "simulate/trading/vcpkg",
+    "GenTRX/serve",
+    "ExeTRX",
+    "external",
+    "bench",
+    "simulate/trading/run/prof",
+    # dev-only root scripts (not shipped by apply_testnet.sh)
+    "ising_movie.py",
+    "pcloud_size.py",
+    "shift.py",
+    "time_check.py",
+    "upload.py",
+    "xtract.py",
+    "reuse_annot.py",
+    "agents/exchange",
+    "agents/ActiveAgent.py",
+    "agents/SimpleAgent.py",
+    "agents/proxy/mvtrx_push.py",
+    "taos/im/agents/exchange",
+    "taos/im/validator/chain",
+    "taos/im/validator/engines/exchange.py",
+    "taos/im/validator/engines/exchange_ipc.py",
+    "taos/im/validator/engines/exetrx.py",
+    "taos/im/validator/exetrx.py",
+    "taos/im/validator/mvtrx_push.py",
+    "taos/im/protocol/exchange",
+    "taos/im/protocol/exchange_config.py",
+    "taos/im/config/exchange.py",
+]
+
+[tool.ruff.lint]
+# E + F (pyflakes/pycodestyle) + S (flake8-bandit security) match the review's
+# scope; B007 is the only flake8-bugbear rule the review surfaced.
+select = ["E", "F", "S", "B007"]
+ignore = [
+    "E501",  # line length: governed by black; never historically enforced here
+    "E741",  # ambiguous names (l, I, O): pervasive in quant/math code, low value
+    "S101",  # assert: used as runtime invariants here; not a security concern
+    "S311",  # non-crypto random: correct for Monte-Carlo sims / example agents
+    "S310",  # urlopen scheme check: URLs are trusted local/config endpoints
+    # The protocol package is a star-import facade by design (`from
+    # taos.im.protocol.models import *`), and the example agents copy that
+    # convention. mypy's name-defined check is the real undefined-name guard;
+    # F821 (below, kept) still flags undefined names outside star scope.
+    "F403",  # star import present (intentional protocol-facade convention)
+    "F405",  # name may come from star import (mypy name-defined covers this)
+    # try-except-pass / try-except-continue. Reviewed representatively across the
+    # flagged sites: all are deliberate best-effort patterns — telemetry that must
+    # never break the caller (wandb logging, log rotation), idempotent cleanup
+    # (unlink/rename), and parse loops that skip malformed entries. Several already
+    # carry justifying comments. Correctness is covered by mypy + tests, not by
+    # surfacing these intentional swallows. New genuinely-risky swallows should
+    # still be avoided in review.
+    "S110",  # try-except-pass (intentional best-effort error handling)
+    "S112",  # try-except-continue (intentional skip-bad-entry in parse loops)
+    # Imports placed below module-level code are deliberate here: neuron modules
+    # import from their own package late to avoid import cycles, and several utils
+    # gate heavy/optional imports behind setup. Hoisting them risks ImportError.
+    "E402",  # module import not at top (intentional cycle-avoidance / gated imports)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Package __init__ files re-export submodule names as the package API; their
+# "unused" imports are intentional re-exports.
+"**/__init__.py" = ["F401"]
+# Tests legitimately use asserts and dummy secrets.
+"GenTRX/tests/*" = ["S101", "S105", "S106"]
+"**/tests/*" = ["S101", "S105", "S106"]
+"simulate/trading/test/*" = ["S603", "S607"]  # integration harness runs fixed local binaries
+# Sim run-helpers (reporting/LaTeX/logging/trader scaffolding): parse trusted
+# local config XML and shell out to fixed local commands.
+"simulate/trading/run/*" = ["S314", "S603", "S607"]
+# Texifier embeds LaTeX templates as raw triple-quoted strings whose content is
+# tab-indented on purpose; E101 there flags string content, not code indentation.
+"simulate/trading/run/Texifier.py" = ["S314", "S603", "S607", "E101", "W191"]
+# Servers bind 0.0.0.0 by design (containerised services).
+"GenTRX/src/gradient_server.py" = ["S104"]
+"GenTRX/src/miner_training_service.py" = ["S104", "S324"]  # S324: md5 = non-crypto assignment digest
+"GenTRX/src/service.py" = ["S104"]
+"GenTRX/src/gradient_store.py" = ["S106", "S107"]  # env-var-NAME suffixes, not secrets (review DISPUTED)
+# Validator/sim run fixed local commands (git, pm2, engine binary) and bind
+# service sockets on 0.0.0.0; XML/pickle inputs are trusted local config/checkpoints.
+"taos/im/neurons/validator.py" = ["S603", "S104"]
+"taos/im/neurons/miner.py" = ["S606"]
+"taos/im/neurons/benchmark.py" = ["S606"]
+"taos/im/validator/update.py" = ["S603", "S607"]
+"taos/im/validator/engines/simulation.py" = ["S603", "S104", "S314", "S108"]
+"taos/im/validator/query.py" = ["S104", "S301"]
+"taos/im/validator/report.py" = ["S104"]
+"taos/im/validator/forward.py" = ["S301"]  # unpickles own trusted-local checkpoints
+"taos/im/validator/seed.py" = ["S108"]
+"taos/im/agents/ai/regressor.py" = ["S301"]
+"taos/im/agents/gentrx.py" = ["S324"]
+"taos/common/utils/misc.py" = ["S603"]
+"agents/RevengAgent.py" = ["S301"]  # pickle.load of agent's own Optuna study (review DISPUTED)
+"agents/proxy/proxy.py" = ["S314"]  # parses trusted local simulation config XML
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+explicit_package_bases = true
+namespace_packages = true
+# Pragmatic: report real type errors, but don't enable whole-codebase strictness
+# the review didn't run. Goal is a clean run, not --strict.
+warn_unused_ignores = true
+# Mirror apply_testnet.sh public-surface carve-out (see [tool.ruff].extend-exclude).
+exclude = [
+    '^mvtrx/',
+    '^simulate/trading/build/',
+    '^simulate/trading/vcpkg/',
+    '^GenTRX/serve/',
+    '^ExeTRX/',
+    '^external/',
+    '^bench/',
+    '^simulate/trading/run/prof/',
+    '^(ising_movie|pcloud_size|shift|time_check|upload|xtract|reuse_annot)\.py$',
+    '^agents/exchange/',
+    '^agents/ActiveAgent\.py$',
+    '^agents/SimpleAgent\.py$',
+    '^agents/proxy/mvtrx_push\.py$',
+    '^taos/im/agents/exchange/',
+    '^taos/im/validator/chain/',
+    '^taos/im/validator/engines/exchange\.py$',
+    '^taos/im/validator/engines/exchange_ipc\.py$',
+    '^taos/im/validator/engines/exetrx\.py$',
+    '^taos/im/validator/exetrx\.py$',
+    '^taos/im/validator/mvtrx_push\.py$',
+    '^taos/im/protocol/exchange/',
+    '^taos/im/protocol/exchange_config\.py$',
+    '^taos/im/config/exchange\.py$',
+]
+
+[tool.vulture]
+# Vulture cannot see Pydantic field access, FastAPI handlers, or abstract hooks;
+# whitelist lives in vulture_whitelist.py. Min confidence trims framework noise.
+min_confidence = 80
+paths = ["taos", "agents", "GenTRX/src", "vulture_whitelist.py"]
+exclude = ["mvtrx/", "agents/exchange/", "GenTRX/serve/"]

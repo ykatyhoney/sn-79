@@ -106,9 +106,13 @@ Order::Order(
     taosim::decimal_t leverage,
     STPFlag stpFlag,
     SettleFlag settleFlag,
-    Currency currency) noexcept
+    Currency currency,
+    std::optional<taosim::decimal_t> stopLoss,
+    std::optional<taosim::decimal_t> takeProfit,
+    std::optional<taosim::decimal_t> placeholder) noexcept
     : BasicOrder(orderId, timestamp, volume, leverage),
-      m_direction{direction}, m_stpFlag{stpFlag}, m_settleFlag{settleFlag}, m_currency{currency}
+      m_direction{direction}, m_stpFlag{stpFlag}, m_settleFlag{settleFlag}, m_currency{currency},
+      m_stopLoss{stopLoss}, m_takeProfit{takeProfit}, m_placeholder{placeholder}
 {}
 
 //-------------------------------------------------------------------------
@@ -140,6 +144,9 @@ void Order::jsonSerialize(rapidjson::Document& json, const std::string& key) con
             "currency",
             rapidjson::Value{magic_enum::enum_name(m_currency).data(), allocator},
             allocator);
+        taosim::json::setOptionalMember(json, "stopLoss", m_stopLoss);
+        taosim::json::setOptionalMember(json, "takeProfit", m_takeProfit);
+        taosim::json::setOptionalMember(json, "placeholder", m_placeholder);
     };
     taosim::json::serializeHelper(json, key, serialize);
 }
@@ -154,8 +161,14 @@ MarketOrder::MarketOrder(
     taosim::decimal_t leverage,
     STPFlag stpFlag,
     SettleFlag settleFlag,
-    Currency currency) noexcept
-    : Order(orderId, timestamp, volume, direction, leverage, stpFlag, settleFlag, currency)
+    Currency currency,
+    taosim::decimal_t maxSlippage,
+    std::optional<taosim::decimal_t> stopLoss,
+    std::optional<taosim::decimal_t> takeProfit,
+    std::optional<taosim::decimal_t> placeholder) noexcept
+    : Order(orderId, timestamp, volume, direction, leverage, stpFlag, settleFlag, currency,
+            stopLoss, takeProfit, placeholder),
+      m_maxSlippage{maxSlippage}
 {}
 
 //-------------------------------------------------------------------------
@@ -191,6 +204,9 @@ void MarketOrder::L3Serialize(rapidjson::Document& json, const std::string& key)
             "n",
             rapidjson::Value{magic_enum::enum_name(currency()).data(), allocator},
             allocator);
+        taosim::json::setOptionalMember(json, "sl", stopLoss());
+        taosim::json::setOptionalMember(json, "tp", takeProfit());
+        taosim::json::setOptionalMember(json, "ph", placeholder());
     };
     taosim::json::serializeHelper(json, key, serialize);
 }
@@ -211,6 +227,13 @@ void MarketOrder::jsonSerialize(rapidjson::Document& json, const std::string& ke
 
 MarketOrder::Ptr MarketOrder::fromJson(const rapidjson::Value& json)
 {
+    auto getOptDec = [&](const char* key) -> std::optional<taosim::decimal_t> {
+        if (!json.HasMember(key) || json[key].IsNull()) {
+            return std::nullopt;
+        }
+        return std::make_optional(taosim::json::getDecimal(json[key]));
+    };
+
     return Ptr{new MarketOrder(
         json["orderId"].GetUint64(),
         json["timestamp"].GetUint64(),
@@ -221,7 +244,11 @@ MarketOrder::Ptr MarketOrder::fromJson(const rapidjson::Value& json)
         json["settleFlag"].IsInt() && magic_enum::enum_cast<SettleType>(json["settleFlag"].GetInt()).has_value()
             ? SettleFlag(magic_enum::enum_cast<SettleType>(json["settleFlag"].GetInt()).value())
             : SettleFlag(static_cast<OrderID>(json["settleFlag"].GetUint())),
-        magic_enum::enum_cast<Currency>(json["currency"].GetInt()).value_or(Currency::BASE)
+        magic_enum::enum_cast<Currency>(json["currency"].GetInt()).value_or(Currency::BASE),
+        0_dec,
+        getOptDec("stopLoss"),
+        getOptDec("takeProfit"),
+        getOptDec("placeholder")
     )};
 }
 
@@ -239,8 +266,12 @@ LimitOrder::LimitOrder(
     bool postOnly,
     taosim::TimeInForce timeInForce,
     std::optional<Timestamp> expiryPeriod,
-    Currency currency) noexcept
-    : Order(orderId, timestamp, volume, direction, leverage, stpFlag, settleFlag, currency),
+    Currency currency,
+    std::optional<taosim::decimal_t> stopLoss,
+    std::optional<taosim::decimal_t> takeProfit,
+    std::optional<taosim::decimal_t> placeholder) noexcept
+    : Order(orderId, timestamp, volume, direction, leverage, stpFlag, settleFlag, currency,
+            stopLoss, takeProfit, placeholder),
       m_price{price},
       m_postOnly{postOnly},
       m_timeInForce{timeInForce},
@@ -300,6 +331,9 @@ void LimitOrder::L3Serialize(rapidjson::Document& json, const std::string& key) 
             rapidjson::Value{magic_enum::enum_name(m_timeInForce).data(), allocator},
             allocator);
         taosim::json::setOptionalMember(json, "x", m_expiryPeriod);
+        taosim::json::setOptionalMember(json, "sl", stopLoss());
+        taosim::json::setOptionalMember(json, "tp", takeProfit());
+        taosim::json::setOptionalMember(json, "ph", placeholder());
     };
     taosim::json::serializeHelper(json, key, serialize);
 }
@@ -327,6 +361,13 @@ void LimitOrder::jsonSerialize(rapidjson::Document &json, const std::string &key
 LimitOrder::Ptr LimitOrder::fromJson(
     const rapidjson::Value& json, [[maybe_unused]] int priceDecimals, int volumeDecimals)
 {
+    auto getOptDec = [&](const char* key) -> std::optional<taosim::decimal_t> {
+        if (!json.HasMember(key) || json[key].IsNull()) {
+            return std::nullopt;
+        }
+        return std::make_optional(taosim::json::getDecimal(json[key]));
+    };
+
     return Ptr{new LimitOrder(
         json["orderId"].GetUint64(),
         json["timestamp"].GetUint64(),
@@ -337,7 +378,14 @@ LimitOrder::Ptr LimitOrder::fromJson(
         STPFlag{json["stpFlag"].GetUint()},
         json["settleFlag"].IsInt() && magic_enum::enum_cast<SettleType>(json["settleFlag"].GetInt()).has_value()
             ? SettleFlag(magic_enum::enum_cast<SettleType>(json["settleFlag"].GetInt()).value())
-            : SettleFlag(static_cast<OrderID>(json["settleFlag"].GetUint()))
+            : SettleFlag(static_cast<OrderID>(json["settleFlag"].GetUint())),
+        false,
+        taosim::TimeInForce::GTC,
+        std::nullopt,
+        Currency::BASE,
+        getOptDec("stopLoss"),
+        getOptDec("takeProfit"),
+        getOptDec("placeholder")
     )};
 }
 
@@ -349,7 +397,8 @@ OrderClientContext OrderClientContext::fromJson(const rapidjson::Value& json)
         json["agentId"].GetInt(),
         !json["clientOrderId"].IsNull()
             ? std::make_optional(json["clientOrderId"].GetUint())
-            : std::nullopt};
+            : std::nullopt
+    };
 }
 
 //-------------------------------------------------------------------------

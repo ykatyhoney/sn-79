@@ -7,10 +7,9 @@
 #include <taosim/replay/helpers.hpp>
 #include <taosim/simulation/SimulationManager.hpp>
 
-#include <fmt/format.h>
-
 #include <CLI/CLI.hpp>
 #include <cstdio>
+#include <fmt/format.h>
 #ifdef OVERRIDE_NEW_DELETE
 #include <mimalloc-new-delete.h>
 #endif
@@ -19,6 +18,7 @@
 
 int main(int argc, char* argv[])
 {
+    // Force line-buffered stdout/stderr so pm2/pipe environments don't batch log lines.
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     std::setvbuf(stderr, nullptr, _IOLBF, 0);
 
@@ -50,9 +50,7 @@ int main(int argc, char* argv[])
             fmt::join(taosim::checkpoint::s_specialTokens, ", ")))
         ->transform(&taosim::checkpoint::postProcessToken);
 
-    fs::path exchangeConfigPath;
-    initGroup->add_option("-e,--exchange-mode", exchangeConfigPath, "Run in exchange mode")
-        ->transform([](auto&& p) { return fs::absolute(p); });
+    fs::path exchangeSvcConfigPath;
 
     taosim::replay::ReplayDesc replayDesc;
 

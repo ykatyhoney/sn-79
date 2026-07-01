@@ -52,7 +52,7 @@ public:
     [[nodiscard]] bool empty() const { return m_queue.empty(); }
     [[nodiscard]] size_t size() const { return m_queue.size(); }
 
-    void push(PrioritizedMessage pmsg) { m_queue.emplace(pmsg, m_idCounter++); }
+    void push(const PrioritizedMessage& pmsg) { m_queue.emplace(pmsg, m_idCounter++); }
     void pop() { m_queue.pop(); }
     void clear() { m_queue.clear(); }
 
@@ -62,7 +62,10 @@ public:
 private:
     struct CompareQueueMessages
     {
-        bool operator()(PrioritizedMessageWithId lhs, PrioritizedMessageWithId rhs);
+        // Pass-by-const-ref avoids a shared_ptr refcount bump (two atomic ops
+        // per call: copy-in + destroy) on every heap compare. With ~thousands
+        // of messages per tick this is a real cost.
+        bool operator()(const PrioritizedMessageWithId& lhs, const PrioritizedMessageWithId& rhs);
     };
 
     [[nodiscard]] const PrioritizedMessageWithId& prioTop() const { return m_queue.top(); }

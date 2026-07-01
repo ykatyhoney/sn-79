@@ -54,6 +54,9 @@ void PlaceOrderMarketPayload::L3Serialize(rapidjson::Document& json, const std::
                     static_assert(false, "Non-exhaustive visitor");
                 }
             }, settleFlag);
+        taosim::json::setOptionalMember(json, "sl", stopLoss);
+        taosim::json::setOptionalMember(json, "tp", takeProfit);
+        taosim::json::setOptionalMember(json, "ph", placeholder);
     };
     return taosim::json::serializeHelper(json, key, serialize);
 }
@@ -89,6 +92,12 @@ void PlaceOrderMarketPayload::jsonSerialize(
                 static_assert(false, "Non-exhaustive visitor");
             }
         }, settleFlag);
+        json.AddMember(
+            "maxSlippage", rapidjson::Value{taosim::util::decimal2double(maxSlippage)}, allocator);
+        json.AddMember("delegate", rapidjson::Value{delegate.c_str(), allocator}, allocator);
+        taosim::json::setOptionalMember(json, "stopLoss", stopLoss);
+        taosim::json::setOptionalMember(json, "takeProfit", takeProfit);
+        taosim::json::setOptionalMember(json, "placeholder", placeholder);
     };
     taosim::json::serializeHelper(json, key, serialize);
 }
@@ -97,6 +106,13 @@ void PlaceOrderMarketPayload::jsonSerialize(
 
 PlaceOrderMarketPayload::Ptr PlaceOrderMarketPayload::fromJson(const rapidjson::Value& json)
 {
+    auto getOptDec = [&](const char* k) -> std::optional<taosim::decimal_t> {
+        if (!json.HasMember(k) || json[k].IsNull()) {
+            return std::nullopt;
+        }
+        return std::make_optional(taosim::json::getDecimal(json[k]));
+    };
+
     return MessagePayload::create<PlaceOrderMarketPayload>(
         OrderDirection{json["direction"].GetUint()},
         taosim::json::getDecimal(json["volume"]),
@@ -116,7 +132,10 @@ PlaceOrderMarketPayload::Ptr PlaceOrderMarketPayload::fromJson(const rapidjson::
             ? (json["settleFlag"].IsInt() && magic_enum::enum_cast<SettleType>(json["settleFlag"].GetInt()).has_value()
                 ? SettleFlag(magic_enum::enum_cast<SettleType>(json["settleFlag"].GetInt()).value())
                 : SettleFlag(static_cast<OrderID>(json["settleFlag"].GetUint())))
-            : SettleFlag(SettleType::FIFO)
+            : SettleFlag(SettleType::FIFO),
+        getOptDec("stopLoss"),
+        getOptDec("takeProfit"),
+        getOptDec("placeholder")
         );
 }
 
@@ -201,6 +220,9 @@ void PlaceOrderLimitPayload::L3Serialize(rapidjson::Document& json, const std::s
                 }
             },
             settleFlag);
+        taosim::json::setOptionalMember(json, "sl", stopLoss);
+        taosim::json::setOptionalMember(json, "tp", takeProfit);
+        taosim::json::setOptionalMember(json, "ph", placeholder);
     };
     taosim::json::serializeHelper(json, key, serialize);
 }
@@ -241,6 +263,10 @@ void PlaceOrderLimitPayload::jsonSerialize(
                 json.AddMember("settleFlag", rapidjson::Value{flag}, allocator);
             }
         }, settleFlag);
+        json.AddMember("delegate", rapidjson::Value{delegate.c_str(), allocator}, allocator);
+        taosim::json::setOptionalMember(json, "stopLoss", stopLoss);
+        taosim::json::setOptionalMember(json, "takeProfit", takeProfit);
+        taosim::json::setOptionalMember(json, "placeholder", placeholder);
     };
     taosim::json::serializeHelper(json, key, serialize);
 }
@@ -249,6 +275,13 @@ void PlaceOrderLimitPayload::jsonSerialize(
 
 PlaceOrderLimitPayload::Ptr PlaceOrderLimitPayload::fromJson(const rapidjson::Value& json)
 {
+    auto getOptDec = [&](const char* k) -> std::optional<taosim::decimal_t> {
+        if (!json.HasMember(k) || json[k].IsNull()) {
+            return std::nullopt;
+        }
+        return std::make_optional(taosim::json::getDecimal(json[k]));
+    };
+
     return MessagePayload::create<PlaceOrderLimitPayload>(
         OrderDirection{json["direction"].GetUint()},
         taosim::json::getDecimal(json["volume"]),
@@ -279,7 +312,10 @@ PlaceOrderLimitPayload::Ptr PlaceOrderLimitPayload::fromJson(const rapidjson::Va
             ? (json["settleFlag"].IsInt() && magic_enum::enum_cast<SettleType>(json["settleFlag"].GetInt()).has_value()
                 ? SettleFlag(magic_enum::enum_cast<SettleType>(json["settleFlag"].GetInt()).value())
                 : SettleFlag(static_cast<OrderID>(json["settleFlag"].GetUint())))
-            : SettleFlag(SettleType::FIFO)
+            : SettleFlag(SettleType::FIFO),
+        getOptDec("stopLoss"),
+        getOptDec("takeProfit"),
+        getOptDec("placeholder")
         );
 }
 
@@ -846,6 +882,9 @@ void EventTradePayload::jsonSerialize(rapidjson::Document& json, const std::stri
         context.jsonSerialize(json, "context");
         json.AddMember("bookId", rapidjson::Value{bookId}, allocator);
         taosim::json::setOptionalMember(json, "clientOrderId", clientOrderId);
+        if (!delegate.empty()) {
+            json.AddMember("delegate", rapidjson::Value{delegate.c_str(), allocator}, allocator);
+        }
     };
     taosim::json::serializeHelper(json, key, serialize);
 }
@@ -867,7 +906,7 @@ EventTradePayload::Ptr EventTradePayload::fromJson(const rapidjson::Value& json)
             json["aggressingAgentId"].GetUint(),
             json["restingAgentId"].GetUint(),
             json["bookId"].GetUint(),
-            taosim::exchange::Fees{
+            taosim::matching::Fees{
                 .maker = taosim::json::getDecimal(json["fees"]["maker"]),
                 .taker = taosim::json::getDecimal(json["fees"]["taker"])}
         ),

@@ -23,6 +23,14 @@ Account::Account(uint32_t bookCount, std::optional<Balances> balances) noexcept
 
 //-------------------------------------------------------------------------
 
+Account::Account(Account::Holdings balances) noexcept
+{
+    m_holdings = std::move(balances);
+    m_activeOrders.resize(m_holdings.size());
+}
+
+//-------------------------------------------------------------------------
+
 void Account::jsonSerialize(rapidjson::Document& json, const std::string& key) const
 {
     auto serialize = [this](rapidjson::Document& json) {

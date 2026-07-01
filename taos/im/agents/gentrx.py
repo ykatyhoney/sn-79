@@ -109,8 +109,8 @@ import pyarrow.parquet as pq
 import bittensor as bt
 
 from fastapi import Request
-from taos.im.agents import FinanceSimulationAgent
-from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
+from taos.im.agents import FinanceAgent, UnifiedAgentResponse, ExchangeStateUpdate
+from taos.im.protocol import MarketSimulationStateUpdate
 from taos.im.protocol.instructions import OrderDirection
 from taos.im.protocol.events import SimulationEndEvent
 
@@ -235,14 +235,36 @@ class _GenTRXState:
     retry_last_at: float
     retry_cooldown: float
 
+    # ---- Lazy first-tick init guard ----
+    # Mode-dependent setup (gtx_mode → bucket_prefix → S3 stores → checkpoint
+    # bootstrap) cannot run in initialize() because _exchange_mode is only set
+    # after the first update(). _ensure_gentrx_inited() flips this on the first
+    # respond() call and short-circuits subsequent ticks.
+    gentrx_inited: bool
+
+    # ---- Co-base signal cache ----
+    # When a composed agent extends both ComposedAgentBase AND GenTRXAgent, the
+    # composer's engines.gentrx in_process module reads the latest per-book
+    # signal via :meth:`GenTRXAgent.gentrx_signal`. The cache is populated each
+    # tick by ``_execute_signal`` regardless of co-base status (the standalone
+    # path also places orders; the co-base path only reads the cache and lets
+    # the composer's weapons module decide what to do).
+    last_signals: dict[int, float]
+
 
 # ---------------------------------------------------------------------------
 # Agent
 # ---------------------------------------------------------------------------
 
 
-class GenTRXAgent(FinanceSimulationAgent):
-    """GenTRX data collection + optional inference + optional distributed training."""
+class GenTRXAgent(FinanceAgent):
+    """GenTRX data collection + optional inference + optional distributed training.
+
+    Mode-agnostic: runs under both ``MarketSimulationStateUpdate`` and
+    ``ExchangeStateUpdate``. ``gtx_mode`` (bucket shard) is derived from the
+    actual run mode on the first ``respond()`` call — see
+    ``_ensure_gentrx_inited()``.
+    """
 
     def initialize(self) -> None:
         bt.logging.set_info()
@@ -363,62 +385,9 @@ class GenTRXAgent(FinanceSimulationAgent):
         g.write_store = None
         g.discovered_aggregator_store = None
         g.discovered_aggregator_uid = int(getattr(self.config, "gtx_aggregator_uid", 0))
-        from GenTRX.src.gradient_store import gentrx_prefix, network_from_config
-        _mode = str(getattr(self.config, "gtx_mode", "simulation") or "simulation")
-        # gtx_network operator override → env var; network_from_subtensor
-        # (called via network_from_config) reads GENTRX_NETWORK first.
-        _network_override = str(getattr(self.config, "gtx_network", "") or "")
-        if _network_override:
-            import os as _os
-            _os.environ["GENTRX_NETWORK"] = _network_override
-        # Pass netuid so network_from_config falls back to the deterministic
-        # mapping (79 → mainnet, 366 → testnet, else → localnet) when
-        # subtensor.network is "unknown" — happens when operator passes only
-        # --subtensor.chain_endpoint without --subtensor.network.
-        _netuid = getattr(self.config, "netuid", None)
-        try:
-            _netuid = int(_netuid) if _netuid is not None else None
-        except (TypeError, ValueError):
-            _netuid = None
-        _network = network_from_config(
-            getattr(self.config, "subtensor", None), netuid=_netuid
-        )
-        g.bucket_prefix = gentrx_prefix(_network, _mode)
-        gtx_log.info(
-            f"GenTRX bucket prefix: {g.bucket_prefix} "
-            f"(network={_network}, mode={_mode})"
-        )
-        try:
-            from GenTRX.src.gradient_store import (
-                create_aggregator_store_from_env,
-                GradientStore,
-            )
-
-            g.store = create_aggregator_store_from_env(prefix=g.bucket_prefix)
-            if g.store:
-                gtx_log.info(
-                    f"S3 aggregator bucket fallback: {g.store.endpoint_url}/{g.store.bucket}"
-                )
-            g.data_store = g.store
-
-            agent_bucket = os.environ.get("GENTRX_AGENT_S3_BUCKET")
-            if agent_bucket:
-                g.write_store = GradientStore(
-                    endpoint_url=os.environ.get(
-                        "GENTRX_AGENT_S3_ENDPOINT_URL",
-                        g.store.endpoint_url if g.store else "",
-                    ),
-                    bucket=agent_bucket,
-                    access_key=os.environ.get("GENTRX_AGENT_S3_ACCESS_KEY", ""),
-                    secret_key=os.environ.get("GENTRX_AGENT_S3_SECRET_KEY", ""),
-                    region=os.environ.get("GENTRX_AGENT_S3_REGION", "auto"),
-                    prefix=g.bucket_prefix,
-                )
-                gtx_log.info(
-                    f"S3 write (gradients): {g.write_store.endpoint_url}/{g.write_store.bucket}"
-                )
-        except ImportError:
-            pass
+        g.bucket_prefix = ""  # populated by _ensure_gentrx_inited() on first respond()
+        g.gentrx_inited = False
+        g.last_signals = {}  # book_id → last signal float; read by composer co-base
 
         # ---- Training logger ----
         # logging.getLogger returns the same module-global Logger by name on
@@ -470,32 +439,11 @@ class GenTRXAgent(FinanceSimulationAgent):
                 gtx_log.error(f"Failed to load local checkpoint: {exc}")
         elif checkpoint:
             gtx_log.warning(f"Checkpoint not found locally: {checkpoint}")
-        # If no local checkpoint, bootstrap from S3 (load latest published).
-        # After bootstrap, model versions are pulled on-demand by _maybe_train
-        # using the model_version named in each assignment, no background poll.
-        if g.model is None:
-            self._ensure_model_version()
-
-        mode_parts = []
-        if g.model:
-            mode_parts.append("inference")
-        if g.training_enabled:
-            mode_parts.append("training")
-        if g.collect_data:
-            mode_parts.append("collect")
-
-        train_desc = (
-            f"assignment-driven training from S3, {g.train_steps} steps"
-            if g.training_enabled else ""
-        )
-        gtx_log.info(
-            f"GenTRXAgent | output={g.output_dir} "
-            f"| mode={'+'.join(mode_parts) or 'idle'}"
-            f" | device={g.device}"
-            f" | write_store={'configured' if g.write_store else 'NOT SET (gradient upload disabled)'}"
-            f"{'| gtx_collect_data=false (S3 only)' if not g.collect_data else ''}"
-            f"{f' | {train_desc}' if train_desc else ''}"
-        )
+        # S3 bootstrap (latest published checkpoint) is deferred to the first
+        # respond() — see _ensure_gentrx_inited().  Local-file checkpoint above
+        # is mode-independent so it stays here; the S3 path needs gtx_mode,
+        # which derives from _exchange_mode, which is only known after the
+        # first update() runs.
 
         # Apply retention to any data already on disk from a previous run.
         # Without this, a long-running miner restarted with a tighter cap (or
@@ -529,11 +477,126 @@ class GenTRXAgent(FinanceSimulationAgent):
             return {"status": "ok"}
 
     # ------------------------------------------------------------------
+    # Lazy first-tick init (mode-dependent setup)
+    # ------------------------------------------------------------------
+
+    def _ensure_gentrx_inited(self) -> None:
+        """Resolve mode-dependent GenTRX state on the first tick.
+
+        ``self._exchange_mode`` is unknown at ``initialize()`` time — it's only
+        set per-state in ``FinanceAgent.update()``. So the bucket-prefix
+        resolution + S3 store creation + checkpoint bootstrap must wait until
+        we've seen the first state update. The ``gentrx_inited`` guard
+        short-circuits subsequent calls.
+        """
+        g = self._gtx
+        if g.gentrx_inited:
+            return
+        g.gentrx_inited = True
+
+        from GenTRX.src.gradient_store import gentrx_prefix, network_from_config
+
+        # gtx_mode override: explicit param wins, else derive from actual run mode.
+        _explicit_mode = str(getattr(self.config, "gtx_mode", "") or "")
+        _mode = _explicit_mode or ("exchange" if self._exchange_mode else "simulation")
+
+        # gtx_network operator override → env var; network_from_subtensor
+        # (called via network_from_config) reads GENTRX_NETWORK first.
+        _network_override = str(getattr(self.config, "gtx_network", "") or "")
+        if _network_override:
+            os.environ["GENTRX_NETWORK"] = _network_override
+
+        # Pass netuid so network_from_config falls back to the deterministic
+        # mapping (79 → mainnet, 366 → testnet, else → localnet) when
+        # subtensor.network is "unknown" — happens when operator passes only
+        # --subtensor.chain_endpoint without --subtensor.network.
+        _netuid = getattr(self.config, "netuid", None)
+        try:
+            _netuid = int(_netuid) if _netuid is not None else None
+        except (TypeError, ValueError):
+            _netuid = None
+        _network = network_from_config(
+            getattr(self.config, "subtensor", None), netuid=_netuid
+        )
+        g.bucket_prefix = gentrx_prefix(_network, _mode)
+        gtx_log.info(
+            f"GenTRX bucket prefix: {g.bucket_prefix} "
+            f"(network={_network}, mode={_mode})"
+        )
+
+        try:
+            from GenTRX.src.gradient_store import (
+                create_aggregator_store_from_env,
+                GradientStore,
+            )
+
+            g.store = create_aggregator_store_from_env(prefix=g.bucket_prefix)
+            if g.store:
+                gtx_log.info(
+                    f"S3 aggregator bucket fallback: {g.store.endpoint_url}/{g.store.bucket}"
+                )
+            g.data_store = g.store
+
+            agent_bucket = os.environ.get("GENTRX_AGENT_S3_BUCKET")
+            if agent_bucket:
+                g.write_store = GradientStore(
+                    endpoint_url=os.environ.get(
+                        "GENTRX_AGENT_S3_ENDPOINT_URL",
+                        g.store.endpoint_url if g.store else "",
+                    ),
+                    bucket=agent_bucket,
+                    access_key=os.environ.get("GENTRX_AGENT_S3_ACCESS_KEY", ""),
+                    secret_key=os.environ.get("GENTRX_AGENT_S3_SECRET_KEY", ""),
+                    region=os.environ.get("GENTRX_AGENT_S3_REGION", "auto"),
+                    prefix=g.bucket_prefix,
+                )
+                gtx_log.info(
+                    f"S3 write (gradients): {g.write_store.endpoint_url}/{g.write_store.bucket}"
+                )
+        except ImportError:
+            pass
+
+        # Bootstrap from S3 only if no local checkpoint was loaded in initialize().
+        # After bootstrap, model versions are pulled on-demand by _maybe_train
+        # using the model_version named in each assignment, no background poll.
+        if g.model is None:
+            self._ensure_model_version()
+
+        mode_parts = []
+        if g.model:
+            mode_parts.append("inference")
+        if g.training_enabled:
+            mode_parts.append("training")
+        if g.collect_data:
+            mode_parts.append("collect")
+        train_desc = (
+            f"assignment-driven training from S3, {g.train_steps} steps"
+            if g.training_enabled else ""
+        )
+        gtx_log.info(
+            f"GenTRXAgent ready (mode={_mode}) | output={g.output_dir} "
+            f"| roles={'+'.join(mode_parts) or 'idle'}"
+            f" | device={g.device}"
+            f" | write_store={'configured' if g.write_store else 'NOT SET (gradient upload disabled)'}"
+            f"{'| gtx_collect_data=false (S3 only)' if not g.collect_data else ''}"
+            f"{f' | {train_desc}' if train_desc else ''}"
+        )
+
+    # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
 
-    def respond(self, state: MarketSimulationStateUpdate) -> FinanceAgentResponse:
-        response = FinanceAgentResponse(agent_id=self.uid)
+    def respond(
+        self,
+        state: MarketSimulationStateUpdate | ExchangeStateUpdate,
+    ) -> UnifiedAgentResponse:
+        # First-tick lazy init: _exchange_mode is only set after update() runs
+        # (FinanceAgent.handle dispatches update() before respond() each tick),
+        # so this is the earliest the actual run mode is known. Subsequent
+        # ticks short-circuit on the guard flag.
+        self._ensure_gentrx_inited()
+
+        response = self.make_response()
 
         if self._gtx.price_scale is None:
             self._gtx.price_scale = 10**state.config.priceDecimals
@@ -935,10 +998,6 @@ class GenTRXAgent(FinanceSimulationAgent):
         tag_end = _ts_to_tag(interval_end)
         # Row-cap early flushes write multiple partials per interval; the seq
         # suffix keeps each unique. First flush of an interval has no suffix.
-        # Mirrors gradient-server's 0b474676 disambiguation — the validator's
-        # _tag_to_ns strips `_NNNN` when parsing timestamps, and dataset
-        # readers glob *.parquet without parsing filenames, so downstream
-        # paths are unaffected.
         suffix = f"_{buf.flush_seq:04d}" if buf.flush_seq else ""
         out_path = out_dir / f"{tag_start}-{tag_end}{suffix}.parquet"
 
@@ -1634,6 +1693,14 @@ class GenTRXAgent(FinanceSimulationAgent):
         Returns True if the local model is at the requested version after the
         call (already current or freshly downloaded). Returns False on failure.
         """
+        # Pre-respond bootstrap path: miner.py / benchmark.py both call this
+        # before any state has arrived (so `_exchange_mode` is still the
+        # default False = simulation). The env-var store + bucket_prefix are
+        # populated lazily in _ensure_gentrx_inited — trigger it now so the
+        # fast env-var path is available below. Idempotent: the gentrx_inited
+        # flag is set BEFORE the inner _ensure_model_version recursion bottoms
+        # out, so this never loops.
+        self._ensure_gentrx_inited()
         if assignment is not None:
             store = self._get_aggregator_store_for_assignment(assignment)
         elif self._gtx.store is not None:
@@ -1892,9 +1959,28 @@ class GenTRXAgent(FinanceSimulationAgent):
             "mid_deltas": _t(enc["mid_deltas"]),
         }
 
+    # Co-base order-suppression flag. The composer's codegen sets this to True
+    # on the generated ComposedAgent class when engines.gentrx (in_process) is
+    # in the manifest, so the composer's weapons module owns execution and
+    # GenTRX only contributes the signal via :meth:`gentrx_signal`.
+    _gtx_signal_only: bool = False
+
+    def gentrx_signal(self, book_id: int) -> float | None:
+        """Latest cached per-book GenTRX signal (sign = direction, magnitude
+        compared against ``gtx_signal_threshold``).  ``None`` until the first
+        ``respond()`` populates the cache for that book.  Read by the composer
+        co-base bridge (engines.gentrx in_process module).
+        """
+        return self._gtx.last_signals.get(book_id)
+
     def _execute_signal(
-        self, response: FinanceAgentResponse, book_id: int, signal: float
-    ) -> FinanceAgentResponse:
+        self, response: UnifiedAgentResponse, book_id: int, signal: float
+    ) -> UnifiedAgentResponse:
+        # Always cache so the composer co-base bridge can read the latest
+        # value regardless of whether the standalone order path is suppressed.
+        self._gtx.last_signals[book_id] = float(signal)
+        if self._gtx_signal_only:
+            return response
         if signal > self._gtx.signal_threshold:
             response.market_order(book_id, OrderDirection.BUY, self._gtx.order_qty)
         elif signal < -self._gtx.signal_threshold:

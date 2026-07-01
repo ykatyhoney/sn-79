@@ -86,6 +86,14 @@ void FuturesTraderAgent::configure(const pugi::xml_node& node)
     
     m_orderFlag = std::vector<bool>(m_bookCount, false);
 
+    // Cache "external" FuturesSignal per book — eliminates per-tick string
+    // lookup + RTTI cast in placeOrder/getProcessDetails hot paths.
+    m_externalSignal.reserve(m_bookCount);
+    for (BookId b = 0; b < m_bookCount; ++b) {
+        m_externalSignal.push_back(dynamic_cast<process::FuturesSignal*>(
+            simulation()->exchange()->process("external", b)));
+    }
+
     m_priceIncrement = 1 / std::pow(10, simulation()->exchange()->config().parameters().priceIncrementDecimals);
     m_volumeIncrement = 1 / std::pow(10, simulation()->exchange()->config().parameters().volumeIncrementDecimals);
 
@@ -242,7 +250,7 @@ void FuturesTraderAgent::handleWakeup(Message::Ptr &msg)
 
 void FuturesTraderAgent::handleRetrieveL1Response(Message::Ptr msg)
 {
-    const auto payload = std::dynamic_pointer_cast<RetrieveL1ResponsePayload>(msg->payload);
+    const auto payload = std::static_pointer_cast<RetrieveL1ResponsePayload>(msg->payload);
 
     const BookId bookId = payload->bookId;
 
@@ -256,7 +264,7 @@ void FuturesTraderAgent::handleRetrieveL1Response(Message::Ptr msg)
         MessagePayload::create<RetrieveL1Payload>(bookId));
 
 
-    if (m_orderFlag.at(bookId)) return;
+    if (m_orderFlag[bookId]) return;
     
 
     const double bestBid = taosim::util::decimal2double(payload->bestBidPrice);
@@ -268,8 +276,8 @@ void FuturesTraderAgent::handleRetrieveL1Response(Message::Ptr msg)
 
 void FuturesTraderAgent::handleMarketOrderPlacementResponse(Message::Ptr msg)
 {
-    const auto payload = std::dynamic_pointer_cast<PlaceOrderMarketResponsePayload>(msg->payload);
-    m_orderFlag.at(payload->requestPayload->bookId) = false;
+    const auto payload = std::static_pointer_cast<PlaceOrderMarketResponsePayload>(msg->payload);
+    m_orderFlag[payload->requestPayload->bookId] = false;
 }
 
 //-------------------------------------------------------------------------
@@ -277,18 +285,18 @@ void FuturesTraderAgent::handleMarketOrderPlacementResponse(Message::Ptr msg)
 void FuturesTraderAgent::handleMarketOrderPlacementErrorResponse(Message::Ptr msg)
 {
     const auto payload =
-        std::dynamic_pointer_cast<PlaceOrderMarketErrorResponsePayload>(msg->payload);
+        std::static_pointer_cast<PlaceOrderMarketErrorResponsePayload>(msg->payload);
 
     const BookId bookId = payload->requestPayload->bookId;
 
-    m_orderFlag.at(bookId) = false;
+    m_orderFlag[bookId] = false;
 }
 
 //-------------------------------------------------------------------------
 
 void FuturesTraderAgent::handleLimitOrderPlacementResponse(Message::Ptr msg)
 {
-    const auto payload = std::dynamic_pointer_cast<PlaceOrderLimitResponsePayload>(msg->payload);
+    const auto payload = std::static_pointer_cast<PlaceOrderLimitResponsePayload>(msg->payload);
 
     simulation()->dispatchMessage(
         simulation()->currentTimestamp(),
@@ -299,7 +307,7 @@ void FuturesTraderAgent::handleLimitOrderPlacementResponse(Message::Ptr msg)
         MessagePayload::create<CancelOrdersPayload>(
             std::vector{taosim::event::Cancellation(payload->id)}, payload->requestPayload->bookId));
 
-    m_orderFlag.at(payload->requestPayload->bookId) = false;
+    m_orderFlag[payload->requestPayload->bookId] = false;
 }
 
 //-------------------------------------------------------------------------
@@ -307,11 +315,11 @@ void FuturesTraderAgent::handleLimitOrderPlacementResponse(Message::Ptr msg)
 void FuturesTraderAgent::handleLimitOrderPlacementErrorResponse(Message::Ptr msg)
 {
     const auto payload =
-        std::dynamic_pointer_cast<PlaceOrderLimitErrorResponsePayload>(msg->payload);
+        std::static_pointer_cast<PlaceOrderLimitErrorResponsePayload>(msg->payload);
 
     const BookId bookId = payload->requestPayload->bookId;
 
-    m_orderFlag.at(bookId) = false;
+    m_orderFlag[bookId] = false;
 }
 
 //-------------------------------------------------------------------------
@@ -328,7 +336,7 @@ void FuturesTraderAgent::handleCancelOrdersErrorResponse(Message::Ptr msg)
 
 void FuturesTraderAgent::handleTrade(Message::Ptr msg)
 {
-    const auto payload = std::dynamic_pointer_cast<EventTradePayload>(msg->payload);
+    const auto payload = std::static_pointer_cast<EventTradePayload>(msg->payload);
 }
 
 
@@ -369,7 +377,7 @@ void FuturesTraderAgent::placeOrder(BookId bookId, double bestAsk, double bestBi
 
 void FuturesTraderAgent::placeBid(BookId bookId, double volume, double price)
 {
-    m_orderFlag.at(bookId) = true;
+    m_orderFlag[bookId] = true;
 
     simulation()->dispatchMessage(
         simulation()->currentTimestamp(),
@@ -387,7 +395,7 @@ void FuturesTraderAgent::placeBid(BookId bookId, double volume, double price)
 
 void FuturesTraderAgent::placeBuy(BookId bookId, double volume)
 {
-    m_orderFlag.at(bookId) = true;
+    m_orderFlag[bookId] = true;
 
     simulation()->dispatchMessage(
         simulation()->currentTimestamp(),
@@ -405,7 +413,7 @@ void FuturesTraderAgent::placeBuy(BookId bookId, double volume)
 
 void FuturesTraderAgent::placeAsk(BookId bookId, double volume, double price)
 {
-    m_orderFlag.at(bookId) = true;
+    m_orderFlag[bookId] = true;
     simulation()->dispatchMessage(
         simulation()->currentTimestamp(),
         orderPlacementLatency(),
@@ -423,7 +431,7 @@ void FuturesTraderAgent::placeAsk(BookId bookId, double volume, double price)
 
 void FuturesTraderAgent::placeSell(BookId bookId, double volume)
 {
-    m_orderFlag.at(bookId) = true;
+    m_orderFlag[bookId] = true;
     simulation()->dispatchMessage(
         simulation()->currentTimestamp(),
         orderPlacementLatency(),
@@ -473,8 +481,10 @@ double FuturesTraderAgent::getProcessValue(BookId bookId, const std::string& nam
 FuturesTraderAgent::FuturesDetails FuturesTraderAgent::getProcessDetails(
     BookId bookId, const std::string& name)
 {
-    const auto externalProcess =
-        dynamic_cast<process::FuturesSignal*>(simulation()->exchange()->process(name, bookId));    
+    // Fast path: placeOrder's hot loop only ever asks for "external".
+    const auto externalProcess = (name == "external")
+        ? m_externalSignal[bookId]
+        : dynamic_cast<process::FuturesSignal*>(simulation()->exchange()->process(name, bookId));
     return {
         .logReturn = externalProcess->state().logReturn,
         .volumeFactor = externalProcess->state().volumeFactor

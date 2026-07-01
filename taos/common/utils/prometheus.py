@@ -4,7 +4,6 @@
 Prometheus metrics server wrapper: starts a singleton HTTP server on a configured
 port and exposes a `prometheus` class for server lifecycle management.
 """
-import os
 import argparse
 import bittensor as bt
 from typing import Union
@@ -51,14 +50,14 @@ class prometheus:
             start_server (bool): If True, start the built-in HTTP server. If False,
                 configure for use with an external server. Defaults to True.
         """
-        if config == None:
+        if config is None:
             config = prometheus.config()
 
         if isinstance(level, prometheus.level):
             level = level.name  # Convert ENUM to str.
 
-        config.prometheus.port = port if port != None else config.prometheus.port
-        config.prometheus.level = level if level != None else config.prometheus.level
+        config.prometheus.port = port if port is not None else config.prometheus.port
+        config.prometheus.level = level if level is not None else config.prometheus.level
 
         if isinstance(config.prometheus.level, str):
             config.prometheus.level = (
@@ -147,7 +146,7 @@ class prometheus:
                 default="INFO",
                 help="""Prometheus logging level. <OFF | INFO | DEBUG>""",
             )
-        except argparse.ArgumentError as e:
+        except argparse.ArgumentError:
             pass
 
     @classmethod

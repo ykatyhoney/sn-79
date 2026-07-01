@@ -2,38 +2,48 @@
 # SPDX-License-Identifier: MIT
 """
 CPU core allocation: distributes logical cores across validator sub-processes
-(validator, query, reward, reporting, IPC, and optional gradient server).
+(validator, query, reward, reporting, IPC, and optional co-located servers —
+SL/TP service and/or GenTRX gradient server).
 """
-import os
 import multiprocessing
 
-def get_core_allocation(grad_server_cores: int = 0):
+def get_core_allocation(sltp_cores_count: int = 0, grad_server_cores: int = 0):
     """
     Allocate CPU cores across validator components using percentage-based allocation.
 
-    Reserves the last `grad_server_cores` logical cores for the gradient server
-    and distributes the remainder across the validator, query, reward, reporting,
-    and IPC sub-processes.
+    Reserves the last `sltp_cores_count` logical cores for the SL/TP service,
+    then the next-to-last `grad_server_cores` for the GenTRX gradient server, and
+    distributes the remainder across the validator, query, reward, reporting, and IPC
+    sub-processes.
 
     Args:
-        grad_server_cores (int): Number of logical cores to reserve for the gradient
-            server process. Defaults to 0 (no reservation).
+        sltp_cores_count: Cores to reserve for the SL/TP service (last N). 0 = no reservation.
+        grad_server_cores: Cores to reserve for the GenTRX gradient server. 0 = no reservation.
 
     Returns:
-        dict: Mapping of component name to list of core indices. Keys are 'validator',
-            'query', 'reward', 'reporting', 'ipc', and optionally 'gradient_server'.
+        dict: Mapping of component name to list of core indices. Keys include 'validator',
+            'query', 'reward', 'reporting', 'ipc', and optionally 'sltp' and 'gradient_server'.
 
     Raises:
-        Exception: If fewer than 8 cores remain after the gradient server reservation.
+        Exception: If fewer than 8 cores remain after all reservations.
     """
     total_cores = multiprocessing.cpu_count()
-    available_cores = total_cores - grad_server_cores
-    grad_cores = list(range(available_cores, total_cores)) if grad_server_cores > 0 else []
+    available_cores = total_cores - sltp_cores_count - grad_server_cores
+
+    sltp_cores = (
+        list(range(total_cores - sltp_cores_count, total_cores))
+        if sltp_cores_count > 0 else []
+    )
+    grad_cores = (
+        list(range(available_cores, available_cores + grad_server_cores))
+        if grad_server_cores > 0 else []
+    )
 
     if available_cores < 8:
         raise Exception(
             f"Validator requires a minimum of 8 cores to run! "
-            f"(total={total_cores}, grad_server_cores={grad_server_cores}, available={available_cores})"
+            f"(total={total_cores}, sltp_cores_count={sltp_cores_count}, "
+            f"grad_server_cores={grad_server_cores}, available={available_cores})"
         )
 
     if available_cores == 8:
@@ -44,6 +54,8 @@ def get_core_allocation(grad_server_cores: int = 0):
             'reporting': [6],
             'ipc': [7],
         }
+        if sltp_cores:
+            result['sltp'] = sltp_cores
         if grad_cores:
             result['gradient_server'] = grad_cores
         return result
@@ -92,6 +104,8 @@ def get_core_allocation(grad_server_cores: int = 0):
         'reporting': reporting_cores,
         'ipc': ipc_cores,
     }
+    if sltp_cores:
+        result['sltp'] = sltp_cores
     if grad_cores:
         result['gradient_server'] = grad_cores
     return result

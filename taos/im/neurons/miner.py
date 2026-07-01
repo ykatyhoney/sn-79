@@ -28,7 +28,8 @@ response to MarketSimulationStateUpdate queries from the validator.
 # memory per round. Re-exec once with MALLOC_ARENA_MAX set so glibc sees it
 # before allocating any arenas. Only triggers on direct script execution.
 if __name__ == "__main__":
-    import os, sys
+    import os
+    import sys
     if os.environ.get("MALLOC_ARENA_MAX") is None:
         os.environ["MALLOC_ARENA_MAX"] = "2"
         os.execvp(sys.executable, [sys.executable] + sys.argv)
@@ -43,10 +44,47 @@ if __name__ != "__mp_main__":
     from taos.im.protocol import MarketSimulationStateUpdate
     from taos.im.protocol.gentrx import GenTRXAssignment
 
-    class Miner(BaseMinerNeuron):
+    # taos.im.protocol.exchange is excluded from the public release (exchange-mode
+    # only). Use sentinel classes so type hints and isinstance() checks stay valid
+    # without forcing the module to be present; the exchange axon-attach below is
+    # gated on the real import succeeding.
+    try:
+        from taos.im.protocol.exchange import ExchangeStateUpdate, ExchangeAgentResponse
+        _HAS_PROTOCOL_EXCHANGE = True
+    except ImportError:
+        _HAS_PROTOCOL_EXCHANGE = False
 
-        def __init__(self):
-            super().__init__()
+        # Sentinels inherit from pydantic.BaseModel so FastAPI route registration
+        # with Union[..., ExchangeStateUpdate] succeeds on the public surface.
+        from pydantic import BaseModel as _SentinelBase
+
+        class ExchangeStateUpdate(_SentinelBase):  # type: ignore[no-redef]
+            pass
+
+        class ExchangeAgentResponse(_SentinelBase):  # type: ignore[no-redef]
+            pass
+
+    class Miner(BaseMinerNeuron):
+        """
+        Intelligent markets miner neuron.
+
+        Attaches synapse handlers for the simulation forward path, the exchange
+        forward path, and (when GenTRX is enabled on the agent) the GenTRX
+        training-assignment delivery path.
+        """
+        def __init__(self, config=None):
+            super().__init__(config=config)
+            # Exchange handler — required when running in exchange mode. Public
+            # release omits taos.im.protocol.exchange, so this attach is gated
+            # on the real ExchangeStateUpdate being importable; sim-only public
+            # deployments simply never receive ExchangeStateUpdate synapses.
+            if _HAS_PROTOCOL_EXCHANGE:
+                self.axon.attach(
+                    forward_fn=self.forward_exchange,
+                    blacklist_fn=self.blacklist_forward_exchange,
+                    priority_fn=self.priority_forward_exchange,
+                )
+
             # GenTRX: wire chain access onto the agent so that
             # _get_aggregator_store_for_assignment can do on-chain bucket
             # discovery.  The base agent class receives no subtensor/metagraph
@@ -71,16 +109,15 @@ if __name__ != "__mp_main__":
             )
 
             # GenTRX: commit S3 bucket credentials on-chain so validators can
-            # discover where to fetch our gradients. Hard fail if env vars are
-            # set but the chain commitment fails — running without commitment
-            # means the validator can't find us = no point continuing.
+            # discover where to fetch our gradients. Soft-fails when env vars
+            # not set (non-GenTRX miner) or when the commit fails transiently.
             self._commit_gentrx_bucket()
 
         def _commit_gentrx_bucket(self) -> None:
             """Commit GenTRX S3 bucket credentials on-chain.
 
             Skips silently if GENTRX_AGENT_S3_BUCKET is not set (miner not
-            participating in GenTRX). Hard-fails if commitment fails.
+            participating in GenTRX). Warns on commit failure (retry next start).
             """
             try:
                 from GenTRX.src.chain import BucketInfo, GenTRXChain
@@ -103,10 +140,6 @@ if __name__ != "__mp_main__":
                     f"GenTRX bucket committed on-chain: account={bucket_info.account_id}"
                 )
             except Exception as exc:
-                # Don't crash the miner — chain commit failure (rate limit,
-                # invalid transaction, transient RPC) is recoverable. The
-                # validator will discover the bucket on a later resync once
-                # the commit eventually lands. Log and continue.
                 bt.logging.warning(
                     f"GenTRX bucket commitment failed (will retry on next start): {exc}"
                 )
@@ -175,12 +208,16 @@ if __name__ != "__mp_main__":
             start = time.time()
             synapse.decompress(lazy=self.config.agent.params.lazy_load)
             bt.logging.info(f"Decompressed ({time.time() - start}s)")
-            synapse.response = self.agent.handle(synapse)
+            try:
+                synapse.response = self.agent.handle(synapse)
+            except Exception as e:
+                bt.logging.error(f"Agent handle error: {e}\n{traceback.format_exc()}")
+                raise
             start = time.time()
             compressed = synapse.clear_inputs().compress()
             bt.logging.debug(f"Compressed ({time.time() - start}s)")
-            return compressed
-        
+            return compressed or synapse
+
         def blacklist_forward(
             self, synapse: MarketSimulationStateUpdate
         ) -> typing.Tuple[bool, str]:
@@ -205,6 +242,26 @@ if __name__ != "__mp_main__":
             Returns:
                 float: A priority score calculated using the standard priority function.
             """
+            return self.priority(synapse)
+
+        async def forward_exchange(self, synapse: ExchangeStateUpdate) -> ExchangeStateUpdate:
+            start = time.time()
+            synapse.decompress(lazy=self.config.agent.params.lazy_load)
+            bt.logging.info(f"Decompressed ({time.time() - start}s)")
+            try:
+                synapse.response = self.agent.handle(synapse)
+            except Exception as e:
+                bt.logging.error(f"Agent handle error: {e}\n{traceback.format_exc()}")
+                raise
+            start = time.time()
+            compressed = synapse.clear_inputs().compress()
+            bt.logging.debug(f"Compressed ({time.time() - start}s)")
+            return compressed or synapse
+
+        def blacklist_forward_exchange(self, synapse: ExchangeStateUpdate) -> typing.Tuple[bool, str]:
+            return self.blacklist(synapse)
+
+        def priority_forward_exchange(self, synapse: ExchangeStateUpdate) -> float:
             return self.priority(synapse)
 
 # This is the main function, which runs the miner.

@@ -49,7 +49,7 @@ def generate_tex_with_texsoup(template, figures_paths,xml,log_dir,
             document = TexSoup(temp_file.read()) 
     try:
         bookId = int(os.path.split(os.path.split(figures_paths[0])[0])[1].split('_')[-1])
-    except:
+    except Exception:
         print('Book id parse error')
         bookId = 0
     # Parse simul parameter out config
@@ -62,7 +62,7 @@ def generate_tex_with_texsoup(template, figures_paths,xml,log_dir,
 
 
     if len(figures_paths) == 0:
-        print(f"No valid image files found.")
+        print("No valid image files found.")
         return
 
     # Example tabular 'item' append
@@ -80,11 +80,11 @@ def generate_tex_with_texsoup(template, figures_paths,xml,log_dir,
             if name in search_patterns:
                 extract_metrics(log_dir,bookId,metrics,name,subfields=metrics[name].keys(),search_pattern=f'*{search_patterns[name]}*.csv')
             else:
-                subfields= metrics[name].keys() if type(metrics[name]) == dict else None
+                subfields= metrics[name].keys() if type(metrics[name]) is dict else None
                 extract_metrics(log_dir,bookId,metrics,name,subfields=subfields,search_pattern=f'*{name.lower()}*.csv')
 
         for key,values in metrics.items():
-            if type(values) == dict:
+            if type(values) is dict:
                 if key == 'Volume':
                     add_metrics_table(document,values,key,[' ','Volumes','Trade period'],n_cols=3)
                 else:
@@ -93,7 +93,7 @@ def generate_tex_with_texsoup(template, figures_paths,xml,log_dir,
                 add_metrics_table(document,values,key)
     
     
-    if type(additional_metrics) == dict:
+    if type(additional_metrics) is dict:
         for key,values in additional_metrics.items():
             add_metrics_table(document,values,key)
     # TODO if passed only path to csv (or csvs)
@@ -137,7 +137,7 @@ def generate_tex_with_texsoup(template, figures_paths,xml,log_dir,
         print(f"Error writing to the file: {e}")
 
 def tab_append_row(tabular,key=None,values=None):
-    if key==None:
+    if key is None:
         for _,value in values.items():    
           tabular.append(f'{value} ')
           tabular.append('& ')
@@ -170,7 +170,7 @@ def add_metrics_table(document, values, key='met',titles=['Metrics','Value'], n_
     table.append(tabular)
 
 
-    if type(values) == dict:
+    if type(values) is dict:
         if key == 'Volume':
             for t_key,value in values.items():
                 if t_key != 'TradePeriod':
@@ -178,7 +178,7 @@ def add_metrics_table(document, values, key='met',titles=['Metrics','Value'], n_
                     #print(f'{t_key=}|{value=}|{values=}')
                     #for t_period,t_value in value.items():
                     for t_period,t_value in enumerate(value):
-                        if type(t_value) == float:
+                        if type(t_value) is float:
                             t_value = "{:.2f}".format(t_value)
                         tabular.append(f'\t & {t_value} &  {t_period} \\\\ \n') 
                     tabular.append(TexCmd('hline'))
@@ -196,7 +196,7 @@ def add_metrics_table(document, values, key='met',titles=['Metrics','Value'], n_
     document.document.append('\n')
 
 def extract_metrics(log_dir, bookId, metrics, name, subfields=None, search_pattern=None):
-    if search_pattern == None:
+    if search_pattern is None:
         search_pattern= f'*{name.lower()}*.csv'
     dirs = glob(os.path.join(log_dir,search_pattern))
     for csv_file in dirs:
@@ -208,7 +208,7 @@ def extract_metrics(log_dir, bookId, metrics, name, subfields=None, search_patte
                     metrics[name][subname]= df[subname]
             else:
                 metrics[name] = df[name].iloc[0]
-        except: 
+        except Exception:
             print('Cannot parse CSV')
         
 def fill_in_figures(document, selected_imgs,fig_idx,image_type):
@@ -334,9 +334,9 @@ if __name__ == "__main__":
     l3_files = sorted(glob(search_pattern))
     try:
         xml = ET.parse(os.path.join(latest_dir, 'config.xml')).getroot()
-    except:
+    except Exception:
         xml = None
-    for l2_file,l3_file in zip(l2_files,l3_files):
+    for l2_file,_l3_file in zip(l2_files,l3_files):
         bookId = int(l2_file.split('.')[-2].split('-')[-1])
         out_dir = os.path.join(latest_dir,f"book_{bookId}") # Save directory in StylizedTraderReporting
         figures_paths = sorted(glob(out_dir + '/*.png'))  #"path_to_your_image_folder"  # Replace with your folder path

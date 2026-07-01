@@ -2,16 +2,27 @@
   "agents": [
     {
       "uid": 256,
-      "name": "benchmark_0",
-      "ip": "23.227.184.236",
-      "port": 41645,
-      "hotkey": "5ECK3B8TenJ5eYc5CFLxhYotwn4eRL7ZtNxeKTHrnCZh9HEH",
-      "gentrx_bucket": {
-        "endpoint_url": "https://54c1e398b79fefb42485bef8060eb909.r2.cloudflarestorage.com",
-        "bucket_name": "54c1e398b79fefb42485bef8060eb909",
-        "access_key_id": "93bc30f8393637322c68282b67111d02",
-        "secret_access_key": "e0847496d7e080ec1bd7d04d4e0abf370606f9119d3042869eba17df8f79ccf1"
-      }
+      "name": "benchmark_maker",
+      "ip": "127.0.0.1",
+      "port": 8101,
+      "hotkey": "5FLC3ZpqQq6ExvzEY4MMqMgtfX4KPtdPdmAWfLEBrmu6Vc5e",
+      "coldkey": "5CtUzN4hoCKtYkmRfdbhGbbstJAbEPjC1d71uwuYq7XSPT5K"
+    },
+    {
+      "uid": 257,
+      "name": "benchmark_taker",
+      "ip": "127.0.0.1",
+      "port": 8102,
+      "hotkey": "5H3p48hSfaT14H8xLghEagVTg8rMW7Kd2i7Ff9rYYUuEyKzL",
+      "coldkey": "5CPcLNFGidwbmstxhKKXqe8hZCcKn3G8KzRhh9fRmtpK9KdE"
+    },
+    {
+      "uid": 258,
+      "name": "benchmark_reveng",
+      "ip": "127.0.0.1",
+      "port": 8103,
+      "hotkey": "5EAcKSbLLiN6qkJexdvidKZDYFoKiy9kNE7aU4zCGkT2fhRT",
+      "coldkey": "5E9Uj5VFVW8NVjFQwg8GnReMuN4d9wQpcQAMfWcLVEi1tAMZ"
     }
   ]
 }

@@ -11,13 +11,12 @@
 import os
 import re
 import math
-import time
 import pandas as pd
 import numpy as np
 from scipy.optimize import fsolve
 from GBM import GBM
 import xml.etree.ElementTree as ET
-from scipy.stats import poisson, nbinom, rayleigh
+from scipy.stats import nbinom, rayleigh
 
 from thesimulator import *
 
@@ -183,7 +182,7 @@ class StylizedTraderAgent:
         """
         self.currentTimestamp = simulation.currentTimestamp()
         # Update regime weights if specified by self.regimeChangeFlag
-        if self.regimeChangeFlag == True:
+        if self.regimeChangeFlag:
             np.random.seed()
             rnd_num = np.random.uniform()
             if rnd_num <= self.regimeProb:
@@ -231,7 +230,7 @@ class StylizedTraderAgent:
 
     # ------------------------- Message Handling Methods ------------------------- #
     def handle_simulation_start(self, simulation, payload):
-        self.log(f"-----SIMULATION STARTED----")
+        self.log("-----SIMULATION STARTED----")
         simulation.dispatchMessage(self.currentTimestamp, 1, self.name(), self.exchange, "SUBSCRIBE_EVENT_TRADE", EmptyPayload())
         for i in range(self.bookCount):
             L1Payload = RetrieveL1Payload()
@@ -239,7 +238,7 @@ class StylizedTraderAgent:
             simulation.dispatchMessage(self.currentTimestamp, 1, self.name(), self.exchange, "RETRIEVE_L1", L1Payload)
     
     def handle_subscribe_event_trade(self, simulation, payload):
-        self.log(f"-----Subscribed to trade events----")  
+        self.log("-----Subscribed to trade events----")  
         for i in range(self.bookCount):
             L1Payload = RetrieveL1Payload()
             L1Payload.bookId = i    
@@ -322,12 +321,10 @@ class StylizedTraderAgent:
         self.orderFlag[bookId] = False
 
     def handle_response_cancel_orders(self, simulation, payload):
-        bookId = payload.requestPayload.bookId
         self.log(f"BOOK {payload.requestPayload.bookId} | CANCELLED ORDERS : {','.join([str(c.id) for c in payload.requestPayload.cancellations])}")
     
     def handle_error_response_cancel_orders(self, simulation, payload):
-        bookId = payload.requestPayload.bookId            
-        if not 'do not exist' in payload.errorPayload.message:
+        if 'do not exist' not in payload.errorPayload.message:
             self.log(f"BOOK {payload.requestPayload.bookId} |  ERROR CANCELLING ORDER : {payload.errorPayload.message}")
     
     def handle_event_trade(self, simulation, payload):
@@ -350,7 +347,7 @@ class StylizedTraderAgent:
 
     
     def handle_event_simulation_stop(self, simulation, payload):
-        self.log(f"-----The simulation ends now----")
+        self.log("-----The simulation ends now----")
 
     # ------------------------- Trading Logic ------------------------- #    
     def priceFcast(self, price, priceF, bookId):

@@ -4,9 +4,9 @@
  */
 
 #include "taosim/decimal/decimal.hpp"
-#include "taosim/exchange/TieredFeePolicy.hpp"
-#include "taosim/exchange/DynamicFeePolicy.hpp"
-#include "taosim/exchange/FeePolicyWrapper.hpp"
+#include "taosim/matching/TieredFeePolicy.hpp"
+#include "taosim/matching/DynamicFeePolicy.hpp"
+#include "taosim/matching/FeePolicyWrapper.hpp"
 #include "taosim/message/PayloadFactory.hpp"
 #include "formatting.hpp"
 
@@ -14,13 +14,12 @@
 #include <gtest/gtest.h>
 
 
-#include "DistributedProxyAgent.hpp"
 #include "MultiBookExchangeAgent.hpp"
 #include "Order.hpp"
 #include "Simulation.hpp"
-#include "server.hpp"
+#include <taosim/net/server.hpp>
 #include "util.hpp"
-#include <taosim/exchange/ClearingManager.hpp>
+#include <taosim/matching/ClearingManager.hpp>
 
 #include <fmt/format.h>
 #include <gmock/gmock.h>
@@ -56,7 +55,7 @@ using namespace testing;
 //-------------------------------------------------------------------------
 
 using namespace taosim::literals;
-using namespace taosim::exchange;
+using namespace taosim::matching;
 
 using testing::StrEq;
 using testing::Values;
@@ -80,7 +79,7 @@ std::string normalizeOutput(const std::string& input) {
 
 void printBalances(const taosim::accounting::Balances& balances, const AgentId agentId){
     std::string baseString = normalizeOutput(fmt::format("{}", balances.base));
-    std::string quoteString = normalizeOutput(fmt::format("{}", balances.quote));
+    std::string quoteString = normalizeOutput(fmt::format("{}", *balances.quote));
     fmt::println("Agent {} => \tBase: {} \n\t\tQuote: {}", agentId, baseString, quoteString);
     for (auto it = balances.m_loans.begin(); it != balances.m_loans.end(); it++){
         if (it == balances.m_loans.begin())
@@ -245,7 +244,9 @@ protected:
 
 TEST_F(TieredFeePolicyTest, trackVolumes)
 {
-    const AgentId agent1 = -1, agent2 = -2, agent3 = -3;
+    const AgentId agent1 = -2, agent2 = -3, agent3 = -4;
+    const auto agentIdBegin = agent1;
+    const auto agentIdEnd = agent3;
     const BookId bookId{};
     auto book = exchange->books()[bookId];
     
@@ -265,11 +266,11 @@ TEST_F(TieredFeePolicyTest, trackVolumes)
     for (const auto& tier: feePolicy->agentTiers())
         fmt::println("Agent #{} is in tier {} now", tier.first, tier.second.at(bookId));
 
-    for (AgentId agId = -1; agId > -4; agId--){
+    for (AgentId agId = agentIdBegin; agId >= agentIdEnd; agId--){
         printBalances(exchange->accounts()[agId][bookId], agId);
     }
 
-    for (AgentId agId = -1; agId > -4; agId--){
+    for (AgentId agId = agentIdBegin; agId >= agentIdEnd; agId--){
         EXPECT_EQ(feePolicy->findTierForAgent(bookId, agId).volumeRequired, tiers[0].volumeRequired);
         fmt::println("FeeRates for agent#{} is ({} | {})",
             agId,
@@ -285,13 +286,13 @@ TEST_F(TieredFeePolicyTest, trackVolumes)
     EXPECT_EQ(feePolicy->agentVolumes().at(agent2).at(bookId).back(), 120_dec);
     EXPECT_EQ(feePolicy->agentVolumes().at(agent3).at(bookId).back(), 490_dec);
 
-    for (AgentId agId = -1; agId > -4; agId--){
+    for (AgentId agId = agentIdBegin; agId >= agentIdEnd; agId--){
         EXPECT_EQ(feePolicy->findTierForAgent(bookId, agId).volumeRequired, tiers[0].volumeRequired);
     }
 
     feePolicy->updateAgentsTiers();
 
-    for (AgentId agId = -1; agId > -4; agId--){
+    for (AgentId agId = agentIdBegin; agId >= agentIdEnd; agId--){
         EXPECT_EQ(feePolicy->findTierForAgent(bookId, agId).volumeRequired, 
             feePolicy->findTierForVolume(feePolicy->agentVolumes().at(agId).at(bookId)[feePolicy->historySlots()-2]).volumeRequired);
         fmt::println("FeeRates for agent#{} is ({} | {})",
@@ -304,7 +305,7 @@ TEST_F(TieredFeePolicyTest, trackVolumes)
     EXPECT_EQ(feePolicy->findTierForAgent(bookId, agent2).volumeRequired, tiers[1].volumeRequired);
     EXPECT_EQ(feePolicy->findTierForAgent(bookId, agent3).volumeRequired, tiers[1].volumeRequired);
 
-    for (AgentId agId = -1; agId > -4; agId--){
+    for (AgentId agId = agentIdBegin; agId >= agentIdEnd; agId--){
         printBalances(exchange->accounts()[agId][bookId], agId);
     }
 
@@ -318,7 +319,7 @@ TEST_F(TieredFeePolicyTest, trackVolumes)
     
     feePolicy->resetHistory();
     
-    for (AgentId agId = -1; agId > -4; agId--){
+    for (AgentId agId = agentIdBegin; agId >= agentIdEnd; agId--){
         EXPECT_EQ(feePolicy->findTierForAgent(bookId, agId).volumeRequired, tiers[0].volumeRequired);
         fmt::println("FeeRates for agent#{} is ({} | {})",
             agId,
@@ -336,7 +337,9 @@ TEST_F(TieredFeePolicyTest, trackVolumes)
 
 TEST_F(NegativeTieredFeePolicyTest, trackVolumes)
 {
-    const AgentId agent1 = -1, agent2 = -2, agent3 = -3;
+    const AgentId agent1 = -2, agent2 = -3, agent3 = -4;
+    const auto agentIdBegin = agent1;
+    const auto agentIdEnd = agent3;
     const BookId bookId{};
     auto book = exchange->books()[bookId];
     
@@ -356,11 +359,11 @@ TEST_F(NegativeTieredFeePolicyTest, trackVolumes)
     for (const auto& tier: feePolicy->agentTiers())
         fmt::println("Agent #{} is in tier {} now", tier.first, tier.second.at(bookId));
 
-    for (AgentId agId = -1; agId > -4; agId--){
+    for (AgentId agId = agentIdBegin; agId >= agentIdEnd; agId--){
         printBalances(exchange->accounts()[agId][bookId], agId);
     }
 
-    for (AgentId agId = -1; agId > -4; agId--){
+    for (AgentId agId = agentIdBegin; agId >= agentIdEnd; agId--){
         EXPECT_EQ(feePolicy->findTierForAgent(bookId, agId).volumeRequired, tiers[0].volumeRequired);
         fmt::println("FeeRates for agent#{} is ({} | {})",
             agId,
@@ -376,13 +379,13 @@ TEST_F(NegativeTieredFeePolicyTest, trackVolumes)
     EXPECT_EQ(feePolicy->agentVolumes().at(agent2).at(bookId).back(), 120_dec);
     EXPECT_EQ(feePolicy->agentVolumes().at(agent3).at(bookId).back(), 490_dec);
 
-    for (AgentId agId = -1; agId > -4; agId--){
+    for (AgentId agId = agentIdBegin; agId >= agentIdEnd; agId--){
         EXPECT_EQ(feePolicy->findTierForAgent(bookId, agId).volumeRequired, tiers[0].volumeRequired);
     }
 
     feePolicy->updateAgentsTiers();
 
-    for (AgentId agId = -1; agId > -4; agId--){
+    for (AgentId agId = agentIdBegin; agId >= agentIdEnd; agId--){
         EXPECT_EQ(feePolicy->findTierForAgent(bookId, agId).volumeRequired, 
             feePolicy->findTierForVolume(feePolicy->agentVolumes().at(agId).at(bookId)[feePolicy->historySlots()-2]).volumeRequired);
         fmt::println("FeeRates for agent#{} is ({} | {})",
@@ -395,7 +398,7 @@ TEST_F(NegativeTieredFeePolicyTest, trackVolumes)
     EXPECT_EQ(feePolicy->findTierForAgent(bookId, agent2).volumeRequired, tiers[1].volumeRequired);
     EXPECT_EQ(feePolicy->findTierForAgent(bookId, agent3).volumeRequired, tiers[1].volumeRequired);
 
-    for (AgentId agId = -1; agId > -4; agId--){
+    for (AgentId agId = agentIdBegin; agId >= agentIdEnd; agId--){
         printBalances(exchange->accounts()[agId][bookId], agId);
     }
 
@@ -409,7 +412,7 @@ TEST_F(NegativeTieredFeePolicyTest, trackVolumes)
     
     feePolicy->resetHistory();
     
-    for (AgentId agId = -1; agId > -4; agId--){
+    for (AgentId agId = agentIdBegin; agId >= agentIdEnd; agId--){
         EXPECT_EQ(feePolicy->findTierForAgent(bookId, agId).volumeRequired, tiers[0].volumeRequired);
         fmt::println("FeeRates for agent#{} is ({} | {})",
             agId,
@@ -426,8 +429,10 @@ TEST_F(NegativeTieredFeePolicyTest, trackVolumes)
 
 TEST_F(DynamicFeePolicyTest, trackVolumes)
 {
-    const AgentId agent1 = -3, agent2 = -4;
-    const AgentId agent_1 = -1, agent_2 = -2;
+    const AgentId agent1 = -4, agent2 = -5;
+    const AgentId agent_1 = -2, agent_2 = -3;
+    const auto agentIdBegin = agent2;
+    const auto agentIdEnd = agent_1;
     const BookId bookId{};
     auto book = exchange->books()[bookId];
     
@@ -438,13 +443,13 @@ TEST_F(DynamicFeePolicyTest, trackVolumes)
     exchange->accounts().registerLocal("stylized_3");
     exchange->accounts().registerLocal("stylized_4");
 
-    for (AgentId agId = -4; agId < 0; agId++){
+    for (AgentId agId = agentIdBegin; agId <= agentIdEnd; agId++){
         if (agId == 0) continue;
         printBalances(exchange->accounts()[agId][bookId], agId);
     }
 
 
-    for (AgentId agId = -4; agId < 0; agId++){
+    for (AgentId agId = agentIdBegin; agId <= agentIdEnd; agId++){
         // EXPECT_EQ(feePolicy->findTierForAgent(bookId, agId).volumeRequired, tiers[0].volumeRequired);
         if (agId == 0) continue;
         fmt::println("FeeRates for agent#{} is ({} | {})",
@@ -465,7 +470,7 @@ TEST_F(DynamicFeePolicyTest, trackVolumes)
 
     exchange->simulation()->step();
 
-    for (AgentId agId = -4; agId < 0; agId++){
+    for (AgentId agId = agentIdBegin; agId <= agentIdEnd; agId++){
         // EXPECT_EQ(feePolicy->findTierForAgent(bookId, agId).volumeRequired, tiers[0].volumeRequired);
         if (agId == 0) continue;
         fmt::println("FeeRates for agent#{} is ({} | {})",
@@ -490,7 +495,7 @@ TEST_F(DynamicFeePolicyTest, trackVolumes)
 
     // feePolicy->updateAgentsTiers();
 
-    for (AgentId agId = -4; agId < 0; agId++){
+    for (AgentId agId = agentIdBegin; agId <= agentIdEnd; agId++){
         // EXPECT_EQ(feePolicy->findTierForAgent(bookId, agId).volumeRequired, tiers[0].volumeRequired);
         if (agId == 0) continue;
         fmt::println("FeeRates for agent#{} is ({} | {})",

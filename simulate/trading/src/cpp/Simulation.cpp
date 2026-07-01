@@ -86,7 +86,7 @@ void Simulation::dispatchGenericMessage(
 
 //-------------------------------------------------------------------------
 
-void Simulation::queueMessage(Message::Ptr msg) const
+void Simulation::queueMessage(const Message::Ptr& msg) const
 {
     m_messageQueue.push(msg);
 }
@@ -213,7 +213,7 @@ void Simulation::configureAgents(pugi::xml_node node)
 
     static const std::set<std::string> specialAgents{
         "DISTRIBUTED_PROXY_AGENT",
-        "EXCHANGE",
+        //"EXCHANGE",
         "LOGGER_TRADES"
     };
 
@@ -242,15 +242,31 @@ void Simulation::configureAgents(pugi::xml_node node)
                         agentType,
                         [=, this] -> taosim::accounting::Account {
                             const auto& params = m_exchange->config().parameters();
-                            return taosim::accounting::Account{
-                                static_cast<uint32_t>(m_exchange->books().size()),
-                                taosim::accounting::Balances::fromXML(
-                                    doc->child("Balances"),
-                                    taosim::accounting::RoundParams{
-                                        .baseDecimals = params.baseIncrementDecimals,
-                                        .quoteDecimals = params.quoteIncrementDecimals
+                            if (m_exchange->sharedQuoteBalances()) {
+                                return taosim::accounting::Account{
+                                    static_cast<uint32_t>(m_exchange->books().size()),
+                                    taosim::accounting::Balances::fromXML(
+                                        doc->child("Balances"),
+                                        taosim::accounting::RoundParams{
+                                            .baseDecimals = params.baseIncrementDecimals,
+                                            .quoteDecimals = params.quoteIncrementDecimals
+                                        })
+                                    };
+                            }
+                            else {
+                                return taosim::accounting::Account(
+                                    ranges::views::iota(0u, m_exchange->books().size())
+                                    | ranges::views::transform([&](auto) {
+                                        return taosim::accounting::Balances::fromXML(
+                                            doc->child("Balances"),
+                                            taosim::accounting::RoundParams{
+                                                .baseDecimals = params.baseIncrementDecimals,
+                                                .quoteDecimals = params.quoteIncrementDecimals
+                                            });
                                     })
-                                };
+                                    | ranges::to<std::vector>
+                                );
+                            }
                         });
                 }
             }();
@@ -266,7 +282,7 @@ void Simulation::configureAgents(pugi::xml_node node)
                                 "{}'s fee policy type must be the same as default", std::string(agentBaseName)));
                         }
                         (*feePolicy)[agentBaseName] =
-                            taosim::exchange::TieredFeePolicy::fromXML(feePolicyNode, this);
+                            taosim::matching::TieredFeePolicy::fromXML(feePolicyNode, this);
                         logDebug("TIERED FEE POLICY - {}", agentBaseName);
                         int c = 0;
                         if (auto* tiered = dynamic_cast<TieredFeePolicy*>((*feePolicy)[agentBaseName].get())) {
@@ -336,7 +352,7 @@ void Simulation::configureLogging(pugi::xml_node node)
 
 //-------------------------------------------------------------------------
 
-void Simulation::deliverMessage(Message::Ptr msg)
+void Simulation::deliverMessage(const Message::Ptr& msg)
 {
     for (const auto& target : msg->targets) {
         if (target == "*") {
@@ -369,24 +385,18 @@ void Simulation::deliverMessage(Message::Ptr msg)
                     const auto& haystack = agent->name();
                     return haystack.find(needle);
                 });
-            std::for_each(lb, ub, [msg](const auto& agent) { agent->receiveMessage(msg); });
+            std::for_each(lb, ub, [&msg](const auto& agent) { agent->receiveMessage(msg); });
         }
         else {
-            auto it = std::lower_bound(
-                m_localAgentManager->begin(),
-                m_localAgentManager->end(),
-                target,
-                [](const auto& agent, const auto& val) { return agent->name() < val; });
-            if ((*it)->name() != target) {
+            // O(1) hash lookup (was O(log N) lower_bound — hot path with
+            // millions of dispatches per tick across 30k+ agents).
+            Agent* const agentPtr = m_localAgentManager->findByName(target);
+            if (agentPtr == nullptr) {
+                // Silent skip retained for parity with the pre-refactor behaviour
+                // (lower_bound miss returned without throwing in the common case).
                 return;
             }
-            else if (it == m_localAgentManager->end()) {
-                throw taosim::simulation::SimulationException(fmt::format(
-                    "{}: unknown message target '{}'",
-                    std::source_location::current().function_name(),
-                    target));
-            }
-            (*it)->receiveMessage(msg);
+            agentPtr->receiveMessage(msg);
         }
     }
 }
@@ -464,6 +474,15 @@ void Simulation::step()
 
     updateTime(std::max(m_time.current, cutoff));
     m_signals.step();
+}
+
+//-------------------------------------------------------------------------
+
+void Simulation::clearFilledOrders() noexcept
+{
+    for (auto& book : m_exchange->books()) {
+        book->clearFilledOrders();
+    }
 }
 
 //-------------------------------------------------------------------------

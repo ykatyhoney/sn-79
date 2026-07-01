@@ -19,7 +19,7 @@ namespace taosim::book
 L3EventLogger::L3EventLogger(
     const fs::path& filepath,
     std::chrono::system_clock::time_point startTimePoint,
-    decltype(exchange::ExchangeSignals::L3)& signal,
+    decltype(matching::ExchangeSignals::L3)& signal,
     Simulation* simulation) noexcept
     : logging::RotatingLoggerBase(logging::RotatingLoggerBaseDesc{
         .name = "L3Logger",
@@ -54,8 +54,11 @@ void L3EventLogger::log(taosim::L3LogEvent event)
         },
         event.item);
 
-    m_logger->trace(fmt::format("{:%Y-%m-%d,%H:%M:%S},{}", time, taosim::json::json2str(json)));
+    const auto line =
+        fmt::format("{:%Y-%m-%d,%H:%M:%S},{}", time, taosim::json::json2str(json));
+    m_logger->trace(line);
     m_logger->flush();
+    m_loggedSignal(line);
 }
 
 //-------------------------------------------------------------------------

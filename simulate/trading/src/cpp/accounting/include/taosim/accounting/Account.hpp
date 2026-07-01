@@ -24,6 +24,7 @@ public:
 
     Account() noexcept = default;
     explicit Account(uint32_t bookCount, std::optional<Balances> balances) noexcept;
+    explicit Account(Holdings balances) noexcept;
 
     [[nodiscard]] auto& at(this auto&& self, BookId bookId) { return self.m_holdings.at(bookId); }
     [[nodiscard]] auto& operator[](this auto&& self, BookId bookId) { return self.m_holdings[bookId]; }

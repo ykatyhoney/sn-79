@@ -34,8 +34,11 @@ class RollingWindowHurst(RollingWindow):
         - Increase num_windows and samples for advanced mode for more statistical robustness.
         - Adjust lag_min/lag_max depending on expected momentum duration.
     """
-    lag_min: int
-    lag_max: int
+    # Defaults match the call site below; needed so @dataclass inheritance
+    # doesn't reject non-default fields appearing after the parent class's
+    # `sampling_interval: int = 1`.
+    lag_min: int = 2
+    lag_max: int = 60
 
 @dataclass
 class Thresholds:
@@ -183,7 +186,7 @@ class MovingHurstAgent(GenTRXAgent):
             book (Book): Book object from the state update.
             timestamp (int): Simulation timestamp of the associated state update.
         """
-        if not validator in self.book_event_history or not self.book_event_history[validator]:
+        if validator not in self.book_event_history or not self.book_event_history[validator]:
             lookback_minutes = max(
                 (self.simulation_config.publish_interval // 1_000_000_000) // 60,
                 self.sampling_interval * 2 // 60,
@@ -255,7 +258,7 @@ class MovingHurstAgent(GenTRXAgent):
                 bestAsk = book.asks[0].price if book.asks else bestBid + 10 ** (-self.simulation_config.priceDecimals)
                 midquote = (bestBid + bestAsk) / 2
 
-                if not state.dendrite.hotkey in self.predictors:
+                if state.dendrite.hotkey not in self.predictors:
                     self.predictors[state.dendrite.hotkey] = {}
                     self.last_signal[state.dendrite.hotkey] = {}
                     self.midquotes[state.dendrite.hotkey] = {}
@@ -368,7 +371,7 @@ class MovingHurstAgent(GenTRXAgent):
         return response, total_amount, close_dir
 
     def onEnd(self, event:  SimulationEndEvent):
-        bt.logging.info(f"[SIMULATION END] Clearing history")
+        bt.logging.info("[SIMULATION END] Clearing history")
         for validator in list(self.predictors.keys()):
             self.reset(validator)
 

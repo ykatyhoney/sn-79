@@ -7,13 +7,6 @@ target_include_directories(exchange PUBLIC include)
 target_link_libraries(exchange
     PUBLIC
         taosim::accounting
-        taosim::book
         taosim::decimal
-        taosim::event
-        taosim::logging
-        taosim::message
-        taosim::process
-        taosim::replay
-        taosim::serialization
-        taosim::simulation
+        taosim::matching
 )

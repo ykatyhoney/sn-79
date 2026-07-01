@@ -15,6 +15,44 @@ from typing import Literal, Any
 from taos.common.protocol import BaseModel
 
 
+def _req(el: Element | None, tag: str) -> Element:
+    """Return the required child <tag> of ``el``, raising on malformed config.
+
+    Replaces chained ``el.find(tag).find(...)`` access where a missing element
+    would otherwise surface as an opaque ``AttributeError`` on ``None``.
+    """
+    child = el.find(tag) if el is not None else None
+    if child is None:
+        raise ValueError(f"Malformed simulation config: missing <{tag}>")
+    return child
+
+
+def _balance_fields(
+    bcfg: Element, init_price: float, quote_decimals: int
+) -> tuple[str, float | None, float | None, float]:
+    """Derive (capital_type, base_balance, quote_balance, wealth) for one agent
+    group's <Balances> element, matching the original per-group logic: when a
+    <Base> child is present the group uses static balances and computes wealth
+    from <Quote>+<Base>*price; otherwise it reads a flat ``wealth`` attribute.
+    """
+    base_el = bcfg.find("Base")
+    quote_el = bcfg.find("Quote")
+    capital_type = "static" if base_el is not None else bcfg.attrib["type"]
+    base_balance = float(base_el.attrib["total"]) if base_el is not None else None
+    quote_balance = float(quote_el.attrib["total"]) if quote_el is not None else None
+    if base_el is not None:
+        # Original logic assumes <Quote> accompanies <Base>; assert rather than
+        # AttributeError so a malformed config fails with a clear message.
+        assert quote_el is not None, "Malformed config: <Base> present without <Quote>"
+        wealth = round(
+            float(quote_el.attrib["total"]) + float(base_el.attrib["total"]) * init_price,
+            quote_decimals,
+        )
+    else:
+        wealth = float(bcfg.attrib["wealth"])
+    return capital_type, base_balance, quote_balance, wealth
+
+
 class FeeTier(BaseModel):
     volume_required : float
     maker_fee : float
@@ -213,6 +251,7 @@ class MarketSimulationConfig(BaseModel):
 
     fee_policy : FeePolicy | None = None
 
+    min_order_size : float = 0.0
     max_open_orders : int | None = None
 
     max_leverage : float
@@ -309,21 +348,44 @@ class MarketSimulationConfig(BaseModel):
         """
         Constructs an instance of the class from the XML simulation configuration.
         """
-        MBE_config = xml.find('Agents').find('MultiBookExchangeAgent')
-        books_config = MBE_config.find('Books')
-        processes_config = books_config.find("Processes")
-        FP_config = processes_config.find("FundamentalPrice")
-        balances_config = MBE_config.find('Balances')
-        fees_config = MBE_config.find("FeePolicy")
+        agents_config = _req(xml, "Agents")
+        MBE_config = _req(agents_config, "MultiBookExchangeAgent")
+        books_config = _req(MBE_config, "Books")
+        processes_config = _req(books_config, "Processes")
+        FP_config = _req(processes_config, "FundamentalPrice")
+        balances_config = _req(MBE_config, "Balances")
+        fees_config = _req(MBE_config, "FeePolicy")
 
-        init_config = xml.find('Agents').find('InitializationAgent')
-        init_balances_config = init_config.find("Balances") if init_config.find("Balances") != None else balances_config
-        STA_config = xml.find('Agents').find('StylizedTraderAgent')
-        STA_balances_config = STA_config.find("Balances") if STA_config.find("Balances") != None else balances_config
-        HFT_config = xml.find('Agents').find('HighFrequencyTraderAgent')
-        HFT_balances_config = HFT_config.find("Balances") if HFT_config.find("Balances") != None else balances_config
-        Futures_config = xml.find('Agents').find('FuturesTraderAgent')
-        Futures_balances_config = Futures_config.find("Balances") if Futures_config.find("Balances") != None else balances_config
+        init_config = _req(agents_config, "InitializationAgent")
+        init_balances_config = init_config.find("Balances")
+        init_balances_config = init_balances_config if init_balances_config is not None else balances_config
+        STA_config = _req(agents_config, "StylizedTraderAgent")
+        STA_balances_config = STA_config.find("Balances")
+        STA_balances_config = STA_balances_config if STA_balances_config is not None else balances_config
+        HFT_config = _req(agents_config, "HighFrequencyTraderAgent")
+        HFT_balances_config = HFT_config.find("Balances")
+        HFT_balances_config = HFT_balances_config if HFT_balances_config is not None else balances_config
+        Futures_config = _req(agents_config, "FuturesTraderAgent")
+        Futures_balances_config = Futures_config.find("Balances")
+        Futures_balances_config = Futures_balances_config if Futures_balances_config is not None else balances_config
+
+        init_price = float(MBE_config.attrib["initialPrice"])
+        quote_decimals = int(MBE_config.attrib["quoteDecimals"])
+        miner_capital_type, miner_base_balance, miner_quote_balance, miner_wealth = _balance_fields(
+            balances_config, init_price, quote_decimals
+        )
+        init_capital_type, init_base_balance, init_quote_balance, init_wealth = _balance_fields(
+            init_balances_config, init_price, quote_decimals
+        )
+        hft_capital_type, hft_base_balance, hft_quote_balance, hft_wealth = _balance_fields(
+            HFT_balances_config, init_price, quote_decimals
+        )
+        sta_capital_type, sta_base_balance, sta_quote_balance, sta_wealth = _balance_fields(
+            STA_balances_config, init_price, quote_decimals
+        )
+        futures_capital_type, futures_base_balance, futures_quote_balance, futures_wealth = _balance_fields(
+            Futures_balances_config, init_price, quote_decimals
+        )
         return MarketSimulationConfig(
             remoteAgentCount=int(MBE_config.attrib['remoteAgentCount']),
             block_count=int(xml.attrib['blockCount']),
@@ -346,18 +408,19 @@ class MarketSimulationConfig(BaseModel):
 
             fee_policy=FeePolicy.from_xml(fees_config),
 
+            min_order_size=float(MBE_config.attrib.get('minOrderSize', 0.0)),
             max_open_orders=int(MBE_config.attrib['maxOpenOrders']),
 
             max_leverage = float(MBE_config.attrib['maxLeverage']),
             max_loan = float(MBE_config.attrib['maxLoan']),
             maintenance_margin = float(MBE_config.attrib['maintenanceMargin']),
 
-            miner_capital_type="static" if balances_config.find("Base") != None else balances_config.attrib['type'],
-            miner_base_balance = float(balances_config.find('Base').attrib['total']) if balances_config.find("Base") != None else None,
-            miner_quote_balance = float(balances_config.find('Quote').attrib['total']) if balances_config.find("Quote") != None else None,
-            miner_wealth = round(float(balances_config.find('Quote').attrib['total']) + float(balances_config.find('Base').attrib['total']) * float(MBE_config.attrib['initialPrice']), int(MBE_config.attrib['quoteDecimals'])) if balances_config.find("Base") != None else float(balances_config.attrib['wealth']),
+            miner_capital_type=miner_capital_type,
+            miner_base_balance=miner_base_balance,
+            miner_quote_balance=miner_quote_balance,
+            miner_wealth=miner_wealth,
 
-            init_price = float(MBE_config.attrib['initialPrice']),
+            init_price = init_price,
 
             fp_update_period = int(FP_config.attrib['updatePeriod']) + 1,
             fp_seed_interval = int(FP_config.attrib['seedInterval']),
@@ -368,18 +431,18 @@ class MarketSimulationConfig(BaseModel):
             fp_sigma_jump = float(FP_config.attrib['sigmaJump']),
 
             init_agent_count = int(init_config.attrib['instanceCount']),
-            init_agent_capital_type = "static" if init_balances_config.find("Base") != None else init_balances_config.attrib['type'],
-            init_agent_base_balance = float(init_balances_config.find('Base').attrib['total']) if init_balances_config.find("Base") != None else None,
-            init_agent_quote_balance = float(init_balances_config.find('Quote').attrib['total']) if init_balances_config.find("Quote") != None else None,
-            init_agent_wealth = round(float(init_balances_config.find('Quote').attrib['total']) + float(init_balances_config.find('Base').attrib['total']) * float(MBE_config.attrib['initialPrice']), int(MBE_config.attrib['quoteDecimals'])) if init_balances_config.find("Base") != None else float(init_balances_config.attrib['wealth']),
+            init_agent_capital_type = init_capital_type,
+            init_agent_base_balance = init_base_balance,
+            init_agent_quote_balance = init_quote_balance,
+            init_agent_wealth = init_wealth,
 
             init_agent_tau = int(init_config.attrib['tau']),
 
             hft_agent_count = int(HFT_config.attrib['instanceCount']),
-            hft_agent_capital_type = "static" if HFT_balances_config.find("Base") != None else HFT_balances_config.attrib['type'],
-            hft_agent_base_balance = float(HFT_balances_config.find('Base').attrib['total']) if HFT_balances_config.find("Base") != None else None,
-            hft_agent_quote_balance = float(HFT_balances_config.find('Quote').attrib['total']) if HFT_balances_config.find("Quote") != None else None,
-            hft_agent_wealth = round(float(HFT_balances_config.find('Quote').attrib['total']) + float(HFT_balances_config.find('Base').attrib['total']) * float(MBE_config.attrib['initialPrice']), int(MBE_config.attrib['quoteDecimals'])) if HFT_balances_config.find("Base") != None else float(HFT_balances_config.attrib['wealth']),
+            hft_agent_capital_type = hft_capital_type,
+            hft_agent_base_balance = hft_base_balance,
+            hft_agent_quote_balance = hft_quote_balance,
+            hft_agent_wealth = hft_wealth,
 
             hft_agent_feed_latency_min = int(HFT_config.attrib['minMFLatency']),
             hft_agent_order_latency_min = int(HFT_config.attrib['minOPLatency']),
@@ -397,10 +460,10 @@ class MarketSimulationConfig(BaseModel):
             hft_agent_price_shift = float(HFT_config.attrib['shiftPercentage']),
 
             sta_agent_count = int(STA_config.attrib['instanceCount']),
-            sta_agent_capital_type = "static" if STA_balances_config.find("Base") != None else STA_balances_config.attrib['type'],
-            sta_agent_base_balance = float(STA_balances_config.find('Base').attrib['total']) if STA_balances_config.find("Base") != None else None,
-            sta_agent_quote_balance = float(STA_balances_config.find('Quote').attrib['total']) if STA_balances_config.find("Quote") != None else None,
-            sta_agent_wealth = round(float(STA_balances_config.find('Quote').attrib['total']) + float(STA_balances_config.find('Base').attrib['total']) * float(MBE_config.attrib['initialPrice']), int(MBE_config.attrib['quoteDecimals'])) if STA_balances_config.find("Base") != None else float(STA_balances_config.attrib['wealth']),
+            sta_agent_capital_type = sta_capital_type,
+            sta_agent_base_balance = sta_base_balance,
+            sta_agent_quote_balance = sta_quote_balance,
+            sta_agent_wealth = sta_wealth,
 
             sta_agent_feed_latency_mean = int(STA_config.attrib['MFLmean']),
             sta_agent_feed_latency_std = int(STA_config.attrib['MFLstd']),
@@ -422,10 +485,10 @@ class MarketSimulationConfig(BaseModel):
             sta_agent_r_aversion = float(STA_config.attrib['r_aversion']),
 
             futures_agent_count = int(Futures_config.attrib['instanceCount']),
-            futures_agent_capital_type = "static" if Futures_balances_config.find("Base") != None else Futures_balances_config.attrib['type'],
-            futures_agent_base_balance = float(Futures_balances_config.find('Base').attrib['total']) if Futures_balances_config.find("Base") != None else None,
-            futures_agent_quote_balance = float(Futures_balances_config.find('Quote').attrib['total']) if Futures_balances_config.find("Quote") != None else None,
-            futures_agent_wealth = round(float(Futures_balances_config.find('Quote').attrib['total']) + float(Futures_balances_config.find('Base').attrib['total']) * float(MBE_config.attrib['initialPrice']), int(MBE_config.attrib['quoteDecimals'])) if Futures_balances_config.find("Base") != None else float(Futures_balances_config.attrib['wealth']),
+            futures_agent_capital_type = futures_capital_type,
+            futures_agent_base_balance = futures_base_balance,
+            futures_agent_quote_balance = futures_quote_balance,
+            futures_agent_wealth = futures_wealth,
 
             futures_agent_volume = float(Futures_config.attrib['volume']),
             futures_agent_sigmaEps = float(Futures_config.attrib['sigmaEps']),
@@ -559,7 +622,7 @@ class LevelInfo(BaseModel):
         """
         Method to transform simulator format model to the format required by the MarketSimulationStateUpdate synapse.
         """
-        if not 'o' in json:
+        if 'o' not in json:
             orders = None
         else:
             orders = [Order.model_construct(i=order['i'], t=order['t'], q=order['q'], s=order['s'], order_type="limit", p=json['p'], l=json['l'] if 'l' in json else 0.0) for order in json['o']]
@@ -994,8 +1057,6 @@ class History:
         return sampled
                 
 from typing import Union, Optional
-from itertools import accumulate
-import numpy as np
 
 class EventHistory(History):
     """
@@ -2206,7 +2267,7 @@ class LoanSettlementOption(IntEnum):
                 try:
                     order_id = int(name)
                     return order_id
-                except:
+                except Exception:
                     return None
 
 class LazyLevel(Sequence):

@@ -27,8 +27,16 @@ class Book : public CSVPrintable, public JsonSerializable
 {
 public:
     using Ptr = std::shared_ptr<Book>;
+    using OptLevelRef = std::optional<std::reference_wrapper<TickContainer>>;
+    using OptConstLevelRef = std::optional<std::reference_wrapper<const TickContainer>>;
 
-    Book(Simulation* simulation, BookId id, size_t maxDepth, size_t detailedDepth);
+    Book(
+        Simulation* simulation,
+        BookId id,
+        size_t maxDepth,
+        size_t detailedDepth,
+        std::shared_ptr<OrderID> orderIdCounter = {},
+        std::shared_ptr<TradeID> tradeIdCounter = {});
 
     [[nodiscard]] BookId id() const noexcept { return m_id; }
     [[nodiscard]] size_t maxDepth() const noexcept { return m_maxDepth; }
@@ -43,6 +51,8 @@ public:
     [[nodiscard]] taosim::decimal_t midPrice() const noexcept;
     [[nodiscard]] taosim::decimal_t bestBid() const noexcept;
     [[nodiscard]] taosim::decimal_t bestAsk() const noexcept;
+    [[nodiscard]] OptLevelRef bestBuyLevel() const noexcept;
+    [[nodiscard]] OptLevelRef bestSellLevel() const noexcept;
 
     template<typename... Args>
     [[nodiscard]] MarketOrder::Ptr placeMarketOrder(OrderClientContext ctx, Args&&... args);
@@ -53,25 +63,39 @@ public:
     template<typename... Args>
     void logTrade(Args&&... args);
 
-    void placeOrder(MarketOrder::Ptr order);
-    void placeOrder(LimitOrder::Ptr order);
-    void placeLimitBuy(LimitOrder::Ptr order);
-    void placeLimitSell(LimitOrder::Ptr order);
+    void placeOrder(const MarketOrder::Ptr& order);
+    void placeOrder(const LimitOrder::Ptr& order);
+    void placeLimitBuy(const LimitOrder::Ptr& order);
+    void placeLimitSell(const LimitOrder::Ptr& order);
     bool cancelOrder(OrderID orderId, std::optional<taosim::decimal_t> volumeToCancel = {});
     [[nodiscard]] std::optional<LimitOrder::Ptr> getOrder(OrderID orderId) const;
-    void registerLimitOrder(LimitOrder::Ptr order);
-    void unregisterLimitOrder(LimitOrder::Ptr order);
-    taosim::decimal_t processAgainstTheBuyQueue(Order::Ptr order, taosim::decimal_t minPrice);
-    taosim::decimal_t processAgainstTheSellQueue(Order::Ptr order, taosim::decimal_t maxPrice);
+    void registerLimitOrder(const LimitOrder::Ptr& order);
+    void unregisterLimitOrder(const LimitOrder::Ptr& order);
+    taosim::decimal_t processAgainstTheBuyQueue(const Order::Ptr& order, taosim::decimal_t minPrice);
+    taosim::decimal_t processAgainstTheSellQueue(const Order::Ptr& order, taosim::decimal_t maxPrice);
     [[nodiscard]] taosim::book::TickContainer* preventSelfTrade(
-        taosim::book::TickContainer* queue, LimitOrder::Ptr iop, Order::Ptr order, AgentId agentId);
+        taosim::book::TickContainer* queue, const LimitOrder::Ptr& iop, const Order::Ptr& order, AgentId agentId);
+    void clearFilledOrders() noexcept;
     void printCSV(uint32_t depth) const;
 
     virtual void printCSV() const override { printCSV(5); }
     virtual void jsonSerialize(
         rapidjson::Document& json, const std::string& key = {}) const override;
 
+    void invalidateTopOfBook() noexcept { m_topOfBook.invalidate(); }
+
 private:
+    struct TopOfBook
+    {
+        std::optional<std::reference_wrapper<TickContainer>> bestBuyLevel;
+        std::optional<std::reference_wrapper<TickContainer>> bestSellLevel;
+        bool isDirty{true};
+
+        void invalidate() noexcept { isDirty = true; }
+    };
+
+    void refreshTopOfBook() const noexcept;
+
     void dumpCSVLOB(auto begin, auto end, uint32_t depth) const;
 
     void emitL2Signal([[maybe_unused]] auto&&... args) const { m_signals.L2(this); }
@@ -82,12 +106,13 @@ private:
     size_t m_maxDepth;
     size_t m_detailedDepth;
     BookSignals m_signals;
-    OrderID m_orderIdCounter{};
-    TradeID m_tradeIdCounter{};
+    std::shared_ptr<OrderID> m_orderIdCounter;
+    std::shared_ptr<TradeID> m_tradeIdCounter;
     std::map<OrderID, LimitOrder::Ptr> m_orderIdMap;
     std::map<OrderID, OrderClientContext> m_order2clientCtx;
     taosim::book::OrderContainer m_buyQueue;
     taosim::book::OrderContainer m_sellQueue;
+    mutable TopOfBook m_topOfBook;
     bool m_initMode = false;
 
     friend class ::Simulation;
@@ -100,7 +125,7 @@ MarketOrder::Ptr Book::placeMarketOrder(OrderClientContext clientCtx, Args&&... 
 {
     static_assert(std::constructible_from<MarketOrder, OrderID, Args...>);
     const auto marketOrder =
-        std::make_shared<MarketOrder>(m_orderIdCounter++, std::forward<Args>(args)...);
+        std::make_shared<MarketOrder>((*m_orderIdCounter)++, std::forward<Args>(args)...);
     m_order2clientCtx.insert({marketOrder->id(), clientCtx});
     m_signals.orderCreated(
         marketOrder, OrderContext{clientCtx.agentId, m_id, clientCtx.clientOrderId});
@@ -118,7 +143,7 @@ LimitOrder::Ptr Book::placeLimitOrder(OrderClientContext clientCtx, Args&&... ar
 {
     static_assert(std::constructible_from<LimitOrder, OrderID, Args...>);
     const auto limitOrder =
-        std::make_shared<LimitOrder>(m_orderIdCounter++, std::forward<Args>(args)...);
+        std::make_shared<LimitOrder>((*m_orderIdCounter)++, std::forward<Args>(args)...);
     m_order2clientCtx.insert({limitOrder->id(), clientCtx});
     m_signals.orderCreated(
         limitOrder, OrderContext{clientCtx.agentId, m_id, clientCtx.clientOrderId});
@@ -134,7 +159,7 @@ template<typename... Args>
 void Book::logTrade(Args&&... args)
 {
     static_assert(std::constructible_from<Trade, TradeID, Args...>);
-    const auto trade = Trade::create(m_tradeIdCounter++, std::forward<Args>(args)...);
+    const auto trade = Trade::create((*m_tradeIdCounter)++, std::forward<Args>(args)...);
     m_signals.trade(trade, m_id);
 }
 
@@ -144,10 +169,10 @@ void Book::dumpCSVLOB(auto begin, auto end, uint32_t depth) const
 {
     while (depth > 0 && begin != end) {
         const taosim::decimal_t totalVolume = [&] {
-            taosim::decimal_t totalVolume{};
+            taosim::decimal_t totalVolume;
             for (auto it = begin->begin(); it != begin->end(); ++it) {
-                LimitOrder::Ptr order = *it;
-                totalVolume += order->volume() * (1_dec + order->leverage());
+                const auto& order = *it;
+                totalVolume += order->totalVolume();
             }
             return totalVolume;
         }();

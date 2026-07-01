@@ -443,7 +443,7 @@ The gradient server's collect path runs sequentially today, which keeps the loca
 | `--keep-checkpoints` | 10 | Hot-bucket retention. Older `checkpoints/v*.pt` deleted after each successful publish; `latest.json` is preserved. Set `0` to disable pruning - recommended only if you mirror checkpoints to cold storage. |
 | `--keep-proposals` | 10 | Hot-bucket retention for `proposals/<own-uid>/{round_id:08d}.grad`. Set `0` to disable. |
 | `--window-ns` | 5min sim time | Training window per assignment |
-| `--no-is-aggregator` | (on) | Sibling mode: score + propose only |
+| `--no-is-aggregator` | (on) | Sibling mode: score + propose only. **Always pass this** unless you are the MVTRX team operating the uid-0 aggregator. |
 | `--wandb-project` | (empty) | Enable wandb dashboard - see [`wandb.md`](wandb.md) |
 
 ### Validator (CLI)

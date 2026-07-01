@@ -18,14 +18,18 @@ from __future__ import annotations
 
 import copy
 import hashlib
-import json
 import logging
 import os
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from GenTRX.src.gradient_store import GradientStore
+    from GenTRX.src.model import ModelConfig, OrderModel
+    from GenTRX.src.tokenizer import OrderTokenizer, TokenizerConfig
 
 from GenTRX.src.bt_log import gtx_log
 from GenTRX.src.util.paths import default_output_dir
@@ -130,6 +134,9 @@ class MinerTrainingService:
         else:
             self.cfg.gradient_dir = Path(self.cfg.gradient_dir)
         self.cfg.gradient_dir.mkdir(parents=True, exist_ok=True)
+        # gradient_dir is resolved to a concrete Path above; expose it non-optional
+        # so downstream path joins don't trip the Optional field type.
+        self.gradient_dir: Path = self.cfg.gradient_dir
 
         self.state = _TrainingState()
         self._lock = threading.Lock()  # protects pending_assignments + training_in_progress
@@ -155,10 +162,10 @@ class MinerTrainingService:
         )
 
         # Model / tokenizer (loaded lazily)
-        self.model = None
-        self.tokenizer = None
-        self.model_cfg = None
-        self.tokenizer_cfg = None
+        self.model: "OrderModel | None" = None
+        self.tokenizer: "OrderTokenizer | None" = None
+        self.model_cfg: "ModelConfig | None" = None
+        self.tokenizer_cfg: "TokenizerConfig | None" = None
         # Set at init from torch's view of CUDA so the startup banner reflects
         # the device that _load_model_from_checkpoint will pick. Re-checked at
         # load time so dynamic CUDA visibility changes still work.
@@ -169,10 +176,15 @@ class MinerTrainingService:
             self.device = "cpu"
 
         # S3 stores
-        self._store = None  # aggregator-bucket fallback (env-var)
-        self._data_store = None  # default data store (== _store unless overridden)
-        self._write_store = None  # per-miner write bucket
-        self._discovered_aggregator_store = None  # cached chain-based discovery
+        self._store: "GradientStore | None" = None  # aggregator-bucket fallback (env-var)
+        self._data_store: "GradientStore | None" = None  # default data store (== _store unless overridden)
+        self._write_store: "GradientStore | None" = None  # per-miner write bucket
+        self._discovered_aggregator_store: "GradientStore | None" = None  # cached chain-based discovery
+        # Guards the discovery cache so concurrent training threads don't both
+        # walk the metagraph + probe every uid's bucket. In practice the
+        # training loop is serialized, but the public API surface allows
+        # external callers (status endpoints, ad-hoc scripts) to land here too.
+        self._discovered_aggregator_store_lock = threading.Lock()
         self._discovered_aggregator_uid: int = self.cfg.aggregator_uid
         self._s3_cache_dir: Path | None = None
         self._s3_cached_files: dict[str, Path] = {}
@@ -289,7 +301,7 @@ class MinerTrainingService:
         """
         if self._write_store is None:
             return
-        pending_dir = self.cfg.gradient_dir / "pending"
+        pending_dir = self.gradient_dir / "pending"
         if not pending_dir.exists():
             return
 
@@ -336,7 +348,7 @@ class MinerTrainingService:
         log.propagate = False
         if not log.handlers:
             fh = RotatingFileHandler(
-                self.cfg.gradient_dir / "train.log",
+                self.gradient_dir / "train.log",
                 maxBytes=50 * 1024 * 1024,
                 backupCount=5,
             )
@@ -582,7 +594,7 @@ class MinerTrainingService:
                     self._prune_s3_cache()
                 except Exception as exc:
                     self._tlog.warning(f"S3 upload failed: {exc} — saving for retry")
-                    pending_dir = self.cfg.gradient_dir / "pending"
+                    pending_dir = self.gradient_dir / "pending"
                     pending_dir.mkdir(parents=True, exist_ok=True)
                     pending_path = pending_dir / f"block_{round_id:08d}_miner_{self.cfg.uid}.grad"
                     pending_path.write_bytes(data)
@@ -613,10 +625,20 @@ class MinerTrainingService:
         """Return a GradientStore pointing at a validator bucket with a
         published checkpoint. See taos.im.agents.GenTRXAgent for the equivalent
         inline logic; this is a duplicate by design.
-        """
-        if self._discovered_aggregator_store is not None:
-            return self._discovered_aggregator_store
 
+        Discovery is cached under `_discovered_aggregator_store_lock` so two
+        concurrent callers don't both walk every uid; the second waits and
+        gets the cached result. The lock is also held during the bucket-probe
+        I/O so the cache is set atomically with a successful probe.
+        """
+        with self._discovered_aggregator_store_lock:
+            if self._discovered_aggregator_store is not None:
+                return self._discovered_aggregator_store
+            return self._discover_aggregator_store_locked(assignment)
+
+    def _discover_aggregator_store_locked(self, assignment: dict | None):
+        """Inner discovery body. Caller MUST hold
+        `_discovered_aggregator_store_lock`."""
         from GenTRX.src.gradient_store import GradientStore
 
         def _build_store(bi) -> GradientStore:
@@ -854,7 +876,7 @@ class MinerTrainingService:
         self._s3_cache_dir = None
 
     def _pending_retry_count(self) -> int:
-        pending_dir = self.cfg.gradient_dir / "pending"
+        pending_dir = self.gradient_dir / "pending"
         if not pending_dir.exists():
             return 0
         return len(list(pending_dir.glob("*.grad")))

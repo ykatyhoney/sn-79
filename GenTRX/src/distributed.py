@@ -177,6 +177,13 @@ def evaluate_gradient(
     `label_smooth_sigma` must match what the miner trained under, or the
     before/after comparison is across two different losses.
 
+    Defends against the case where ``decompress(gradient) + apply_gradient``
+    silently leaves NaN/Inf in the model parameters: the post-apply pass
+    walks ``model.parameters()`` and if any tensor has a non-finite entry
+    we treat loss_after as :data:`_MAX_EVAL_LOSS`, rollback, and return
+    a heavily-negative score (so the gradient is rejected downstream)
+    without ever running val_loader against a corrupt model.
+
     Returns:
         score = loss_before - loss_after (positive = improvement)
     """
@@ -188,6 +195,23 @@ def evaluate_gradient(
     # Apply gradient
     delta = decompress(gradient)
     apply_gradient(model, delta)
+
+    # Post-apply finite check on the model. If any parameter tensor went
+    # non-finite (NaN/Inf from the apply), the val loss would be garbage
+    # noise. Short-circuit to _MAX_EVAL_LOSS and roll back immediately.
+    bad_params = [n for n, p in model.named_parameters() if not torch.isfinite(p).all()]
+    if bad_params:
+        logger.warning(
+            "evaluate_gradient (miner %d, window %d): non-finite model "
+            "params after apply (%d tensors affected, e.g. %s) — rolling "
+            "back, scoring as _MAX_EVAL_LOSS",
+            gradient.metadata.miner_uid,
+            gradient.metadata.window_id,
+            len(bad_params),
+            bad_params[:3],
+        )
+        model.load_state_dict(original_state)
+        return loss_before - _MAX_EVAL_LOSS
 
     loss_after = _eval_loss(model, val_loader, device, max_batches, label_smooth_sigma)
 

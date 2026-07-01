@@ -5,7 +5,8 @@ Payload compression utilities: lz4/zlib/zstd + Base64 encoding for synapse
 data, with parallel batching support via ThreadPoolExecutor.
 """
 import zstandard as zstd
-import zlib, lz4.frame
+import zlib
+import lz4.frame
 import pybase64
 import base64
 import msgspec
@@ -115,14 +116,17 @@ def compress_batch(axon_synapses: dict, batch, compressed_books: str, level: int
     for uid in batch:
         axon_synapses[uid].books = None
         payload = {
+            "pools":    getattr(axon_synapses[uid], 'pools', None),
             "accounts": axon_synapses[uid].accounts,
-            "notices": axon_synapses[uid].notices,
-            "config": axon_synapses[uid].config,
+            "notices":  axon_synapses[uid].notices,
+            "config":   axon_synapses[uid].config,
             "response": axon_synapses[uid].response,
         }
+        if hasattr(axon_synapses[uid], 'pools'):
+            axon_synapses[uid].pools = None
         axon_synapses[uid].accounts = None
-        axon_synapses[uid].notices = None
-        axon_synapses[uid].config = None
+        axon_synapses[uid].notices  = None
+        axon_synapses[uid].config   = None
         axon_synapses[uid].response = None
         axon_synapses[uid].compressed = {
             "books": compressed_books,

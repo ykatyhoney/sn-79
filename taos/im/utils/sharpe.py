@@ -182,7 +182,7 @@ def sharpe(uid, inventory_values, realized_pnl_values, lookback, norm_min, norm_
         
         return sharpe_values
         
-    except Exception as ex:
+    except Exception:
         print(f"Failed to calculate Sharpe for UID {uid}: {traceback.format_exc()}")
         return None
 

@@ -11,6 +11,8 @@
 
 //-------------------------------------------------------------------------
 
+namespace taosim::process { class MagneticField; }
+
 namespace taosim::agent
 {
 
@@ -110,6 +112,9 @@ private:
 
     // State.
     NoiseTraderAgentState m_state;
+    // Cached per-bookId MagneticField pointer — eliminates per-tick string
+    // lookup + RTTI cast in handleWakeup/handleRetrieveL1Response paths.
+    std::vector<taosim::process::MagneticField*> m_magneticField;
 };
 
 //-------------------------------------------------------------------------

@@ -19,7 +19,10 @@ export BT_NO_PARSE_CLI_ARGS=false
 #       -w <write-key> -W <write-secret> -k <api-key>
 #
 # Flags:
-#   -m|-G sibling              Run mode (default: sibling; -G accepted as alias)
+#   -m|-G sibling          Run mode (default: sibling; -G accepted as alias). Use
+#                          'sibling' unless you are the subnet operator running
+#                          the canonical uid-0 aggregator that publishes checkpoints
+#                          on-chain for the whole subnet.
 #   -e <endpoint>          Subtensor network endpoint
 #   -u <netuid>            Subnet UID (default: 79)
 #   -p <port>              Listen port (default: 8100)
@@ -116,11 +119,19 @@ API_KEY="${GENTRX_API_KEY:-}"
 PRESERVE=0
 LOG_LEVEL=info
 USE_TMUX=1
-SKIP_UPDATE=0
+# Auto-update is OPT-IN: by default the launcher does NOT `git pull` /
+# `pip install -e .`, so a running node never silently jumps to an unpinned
+# upstream HEAD. Pass -U to update on launch; -n is kept as a no-op alias.
+SKIP_UPDATE=1
+# pm2 process name. Per-env launchers (run_mvtrx.sh) pass a suffixed name
+# (e.g. gradient-server-sim-local) so multiple stacks on one host don't
+# clobber each other's instance — pm2 start with an existing name REPLACES it.
+GRADIENT_SERVER_NAME="${GRADIENT_SERVER_NAME:-gradient-server}"
 
-while getopts m:G:e:u:p:b:V:c:d:o:E:B:w:W:k:s:l:x:n flag; do
+while getopts m:G:e:u:p:b:V:c:d:o:E:B:w:W:k:s:l:x:nUN: flag; do
     case "${flag}" in
         m|G) GENTRX_ROLE=${OPTARG};;
+        N) GRADIENT_SERVER_NAME=${OPTARG};;
         e) ENDPOINT=${OPTARG};;
         u) NETUID=${OPTARG};;
         p) GRAD_PORT=${OPTARG};;
@@ -137,6 +148,7 @@ while getopts m:G:e:u:p:b:V:c:d:o:E:B:w:W:k:s:l:x:n flag; do
         s) PRESERVE=${OPTARG};;
         l) LOG_LEVEL=${OPTARG};;
         x) USE_TMUX=${OPTARG};;
+        U) SKIP_UPDATE=0;;
         n) SKIP_UPDATE=1;;
     esac
 done
@@ -308,9 +320,15 @@ echo ""
 # ── Install / update ──────────────────────────────────────────────────────────
 cd "$REPO_ROOT"
 if [ "$SKIP_UPDATE" = "0" ]; then
-    echo "Updating gradient server"
+    echo "Updating gradient server (opt-in via -U)"
     git pull || { echo "WARNING: git pull failed (no tracking branch?). Continue without updating? [y/N]"; read -r _yn; [ "$_yn" = "y" ] || exit 1; }
-    pip install -e .
+    # Honour the committed lockfile when present so the update resolves the
+    # pinned, reproducible dependency set rather than floating to newer releases.
+    if [ -f "$REPO_ROOT/constraints.txt" ]; then
+        pip install -e . -c "$REPO_ROOT/constraints.txt"
+    else
+        pip install -e .
+    fi
 fi
 
 # scalecodec ↔ cyscale conflict: bittensor's transitive deps drag py-scale-codec
@@ -410,9 +428,8 @@ LAUNCHER_EOF
 chmod +x "$LAUNCHER"
 
 if [ "$PRESERVE" = "0" ]; then
-    pm2 delete gradient-server 2>/dev/null || true
+    pm2 delete "$GRADIENT_SERVER_NAME" 2>/dev/null || true
 fi
-
 # pm2 log rotation: cap each .log at 100 MB, keep 10 rotated copies, gzip
 # old ones. Idempotent — `pm2 install` is a no-op when already present, and
 # `pm2 set` overwrites silently. Applies daemon-wide (also covers validator,
@@ -424,11 +441,11 @@ pm2 set pm2-logrotate:max_size 100M >/dev/null 2>&1 || true
 pm2 set pm2-logrotate:retain 10 >/dev/null 2>&1 || true
 pm2 set pm2-logrotate:compress true >/dev/null 2>&1 || true
 
-pm2 start --name=gradient-server "$LAUNCHER"
+pm2 start --name="$GRADIENT_SERVER_NAME" "$LAUNCHER"
 pm2 save
 echo ""
-echo " ✓  Gradient server started (pm2: gradient-server)"
-echo "    Logs:    pm2 logs gradient-server"
+echo " ✓  Gradient server started (pm2: $GRADIENT_SERVER_NAME)"
+echo "    Logs:    pm2 logs $GRADIENT_SERVER_NAME"
 echo "    Metrics: http://${GRAD_BIND}:${GRAD_PORT}/gentrx/metrics"
 echo "    Version: curl http://${GRAD_BIND}:${GRAD_PORT}/gentrx/version"
 echo ""
@@ -439,6 +456,6 @@ if [ "$USE_TMUX" = "1" ]; then
     tmux set-option -t gentrx mouse on
     tmux split-window -h -t gentrx:gentrx 'nvitop 2>/dev/null || watch -n2 nvidia-smi'
     tmux select-pane -t 0
-    tmux split-window -v -t gentrx:gentrx 'pm2 logs gradient-server'
+    tmux split-window -v -t gentrx:gentrx "pm2 logs $GRADIENT_SERVER_NAME"
     tmux attach-session -t gentrx
 fi

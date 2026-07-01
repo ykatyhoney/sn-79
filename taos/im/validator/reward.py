@@ -27,11 +27,214 @@ import torch
 import random
 import bittensor as bt
 import numpy as np
-from typing import Dict, Tuple
-from collections import defaultdict
+from typing import TYPE_CHECKING, Dict, Tuple
 from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
-from taos.im.utils import normalize
 from taos.im.utils.kappa import kappa_3, batch_kappa_3, _get_pnl_fingerprint
+
+if TYPE_CHECKING:
+    from taos.im.neurons.validator import Validator
+
+
+def _aggregate_roundtrip_volumes(uid, roundtrip_volumes, num_books, lookback_threshold, sampled_timestamp, sampling_interval):
+    """STEP 3 helper: per-book lookback / latest roundtrip volumes for one miner.
+
+    Pure extraction from calculate_kappa_score; logic unchanged.
+    """
+    miner_roundtrip_volumes = {}
+    latest_roundtrip_volumes = {}
+    latest_roundtrip_timestamps = {}
+
+    if uid in roundtrip_volumes:
+        uid_rt_volumes = roundtrip_volumes[uid]
+
+        for book_id in range(num_books):
+            if book_id in uid_rt_volumes:
+                rt_volumes = uid_rt_volumes[book_id]
+
+                if rt_volumes:
+                    lookback_volume = 0.0
+                    latest_time = 0
+                    latest_volume = 0.0
+
+                    # Sum all volumes within lookback period
+                    # Find the most recent trading timestamp
+                    for ts, vol in rt_volumes.items():
+                        if ts >= lookback_threshold:
+                            lookback_volume += vol
+                        if vol > 0 and ts <= sampled_timestamp and ts > latest_time:
+                            latest_time = ts
+
+                    # Check if there was recent activity (within sampling interval)
+                    if latest_time > 0 and latest_time >= sampled_timestamp - sampling_interval:
+                        latest_volume = rt_volumes[latest_time]
+
+                    miner_roundtrip_volumes[book_id] = lookback_volume
+                    latest_roundtrip_volumes[book_id] = latest_volume
+                    latest_roundtrip_timestamps[book_id] = latest_time
+                else:
+                    # No volume history for this book
+                    miner_roundtrip_volumes[book_id] = 0.0
+                    latest_roundtrip_volumes[book_id] = 0.0
+                    latest_roundtrip_timestamps[book_id] = 0
+            else:
+                # Book not in roundtrip volumes
+                miner_roundtrip_volumes[book_id] = 0.0
+                latest_roundtrip_volumes[book_id] = 0.0
+                latest_roundtrip_timestamps[book_id] = 0
+    else:
+        # UID not in roundtrip_volumes, initialize all books to zero
+        for book_id in range(num_books):
+            miner_roundtrip_volumes[book_id] = 0.0
+            latest_roundtrip_volumes[book_id] = 0.0
+            latest_roundtrip_timestamps[book_id] = 0
+
+    return miner_roundtrip_volumes, latest_roundtrip_volumes, latest_roundtrip_timestamps
+
+
+def _outlier_penalty(data):
+    """STEP 8 helper: 1.5×IQR left-tail outlier penalty. Pure extraction."""
+    q1, q3 = np.percentile(data, [25, 75])
+    iqr = q3 - q1
+
+    # Apply minimum IQR to prevent division issues and scale penalty appropriately
+    min_iqr = 0.01
+    effective_iqr = max(iqr, min_iqr)
+    lower_threshold = q1 - 1.5 * effective_iqr
+    outliers = data[data < lower_threshold]
+
+    if len(outliers) > 0 and np.median(outliers) < 0.5:
+        base_penalty = (0.5 - np.median(outliers)) / 1.5
+        consistency_bonus = 1.0 - np.exp(-5 * iqr)  # Sigmoid-like scaling
+        outlier_penalty = base_penalty * consistency_bonus
+    else:
+        outlier_penalty = 0
+    return outlier_penalty
+
+
+def _compute_pnl_factors(uid, pnl_factors, normalized_kappas, config, lookback, simulation_config, realized_pnl_history, lookback_threshold):
+    """STEP 5 helper: per-book P&L multipliers. Pure extraction; logic unchanged."""
+    pnl_factors_uid = pnl_factors.get(uid, {b: 1.0 for b in normalized_kappas})
+    pnl_impact = config.get('kappa', {}).get('pnl', {}).get('impact', 0.0)
+
+    if pnl_impact > 0:
+        # Normalization: 100% DAILY return is the baseline for max boost
+        # This makes P&L factors comparable across different assessment windows
+        DAILY_NS = 86400_000_000_000  # 24 hours in nanoseconds
+        assessment_window_ns = lookback  # already simulation ns
+        window_fraction = assessment_window_ns / DAILY_NS
+        pnl_reference = simulation_config['miner_wealth'] * window_fraction
+
+        # Compute realized P&L per book over lookback window
+        # Only counts completed trades (realized gains/losses)
+        book_realized_pnl = {}
+        if uid in realized_pnl_history:
+            for timestamp, books_dict in realized_pnl_history[uid].items():
+                if timestamp >= lookback_threshold:
+                    for book_id, pnl in books_dict.items():
+                        if book_id not in book_realized_pnl:
+                            book_realized_pnl[book_id] = 0.0
+                        book_realized_pnl[book_id] += pnl
+
+        # Calculate P&L factor per book
+        for book_id in normalized_kappas.keys():
+            realized_pnl_book = book_realized_pnl.get(book_id, 0.0)
+
+            # Normalize by daily-scaled reference
+            # pnl_ratio = 1.0 means they earned enough to imply 100% daily return
+            pnl_ratio = realized_pnl_book / pnl_reference
+
+            # Raw P&L factor calculation:
+            #   0% daily return → 1.0x (neutral)
+            #   +100% daily return → (1+impact)x
+            #   -100% daily return → (1+impact)x
+            raw_pnl_factor = max(1.0 + pnl_ratio, 0.0)
+
+            # Apply impact scaling: controls how much P&L affects final score
+            pnl_factor = 1.0 + ((raw_pnl_factor - 1.0) * pnl_impact)
+
+            # Cap at 2x boost
+            pnl_factor = min(pnl_factor, 2.0)
+
+            pnl_factors_uid[book_id] = pnl_factor
+    else:
+        # P&L weighting disabled - set all to neutral (1.0 = no effect)
+        for book_id in normalized_kappas.keys():
+            pnl_factors_uid[book_id] = 1.0
+
+    return pnl_factors_uid
+
+
+def _apply_activity_factors(uid, activity_factors, normalized_kappas, miner_roundtrip_volumes,
+                            latest_roundtrip_volumes, latest_roundtrip_timestamps, config,
+                            volume_cap_inv, activity_impact, simulation_timestamp,
+                            decay_grace_period, decay_window_ns_inv, base_decay_factor,
+                            time_acceleration_power):
+    """STEP 4 helper: per-book activity boost / inactivity decay. Pure extraction.
+
+    Mutates and returns the uid's activity-factor dict (same object semantics as
+    the original `activity_factors.get(uid, ...)` in-place update).
+    """
+    activity_factors_uid = activity_factors.get(uid, {b: 0.0 for b in normalized_kappas})
+    decay_rate = config['activity'].get('decay_rate', 1.0)
+
+    for book_id, roundtrip_volume in miner_roundtrip_volumes.items():
+        if latest_roundtrip_volumes[book_id] > 0:
+            # ACTIVE BOOK: Calculate activity boost based on volume
+            # Formula: 1 + (volume/volume_cap × activity_impact)
+            activity_factors_uid[book_id] = min(
+                1 + ((roundtrip_volume * volume_cap_inv) * activity_impact),
+                2.0
+            )
+        else:
+            # INACTIVE BOOK: Apply exponential decay
+            if decay_rate == 0.0:
+                # Decay disabled, skip this book
+                continue
+
+            latest_time = latest_roundtrip_timestamps[book_id]
+
+            if latest_time > 0:
+                # Calculate time since last activity
+                inactive_time = max(0, simulation_timestamp - latest_time)
+            else:
+                # Never traded on this book, use full simulation time
+                inactive_time = simulation_timestamp
+
+            current_factor = activity_factors_uid[book_id]
+            activity_multiplier = max(current_factor, 1.0)
+
+            # Time acceleration: Decay accelerates based on how long inactive
+            if inactive_time <= decay_grace_period:
+                # Within grace period: no decay acceleration
+                time_acceleration = 1.0
+            else:
+                # Beyond grace period: accelerated decay
+                # The longer inactive, the faster the decay
+                time_beyond_grace = inactive_time - decay_grace_period
+                time_ratio = time_beyond_grace * decay_window_ns_inv
+                # Quadratic acceleration (time_acceleration_power = 2.0)
+                time_acceleration = 1 + (time_ratio ** time_acceleration_power) * decay_rate
+
+            # Total acceleration combines current factor with time acceleration
+            # Higher current factors decay faster (to prevent "coasting" on past activity)
+            total_acceleration = activity_multiplier * time_acceleration
+            total_acceleration = min(total_acceleration, 100.0)  # Safety cap
+
+            # Apply exponential decay: factor *= base_decay_factor^acceleration
+            try:
+                decay_factor = base_decay_factor ** total_acceleration
+                if not np.isfinite(decay_factor):
+                    bt.logging.error(f"UID {uid} book {book_id}: Non-finite decay_factor")
+                    decay_factor = 0.0
+            except (OverflowError, ValueError) as e:
+                bt.logging.error(f"UID {uid} book {book_id}: Decay overflow - {e}")
+                decay_factor = 0.0
+
+            # Update activity factor with decay
+            activity_factors_uid[book_id] *= decay_factor
+
+    return activity_factors_uid
+
 
 def calculate_kappa_score(
     uid: int,
@@ -107,11 +310,10 @@ def calculate_kappa_score(
         config['activity']['capital_turnover_cap'] * simulation_config['miner_wealth'],
         simulation_config['volumeDecimals']
     )
-    volume_cap_inv = 1.0 / volume_cap
+    volume_cap_inv = 1.0 / volume_cap if volume_cap > 0 else 0.0
 
-    lookback = config['kappa']['lookback']  # Number of intervals to look back
-    publish_interval = simulation_config['publish_interval']  # Nanoseconds per interval
-    lookback_threshold = simulation_timestamp - (lookback * publish_interval)
+    lookback = config['kappa']['lookback']  # simulation nanoseconds
+    lookback_threshold = simulation_timestamp - lookback
     
     # Decay parameters: Activity factors decay for inactive books to incentivize consistent trading
     decay_grace_period = config['activity'].get('decay_grace_period', 600_000_000_000)
@@ -122,8 +324,8 @@ def calculate_kappa_score(
     # The decay window is the lookback period minus the grace period
     # During grace period: no decay (allows brief pauses without penalty)
     # After grace period: exponential decay kicks in
-    scoring_interval_seconds = config['interval'] / 1e9
-    total_intervals = lookback // scoring_interval_seconds
+    # lookback and interval are both simulation ns -> number of scoring intervals
+    total_intervals = lookback / config['interval']
     grace_intervals = decay_grace_period / config['interval']
     decay_window_intervals = total_intervals - grace_intervals
     
@@ -137,7 +339,7 @@ def calculate_kappa_score(
         base_decay_factor = 2 ** (-1 / decay_window_intervals)
         base_decay_factor = max(0.5, min(0.9999, base_decay_factor))  # Clamp to safe range
     
-    decay_window_ns = (lookback * config['interval']) - decay_grace_period
+    decay_window_ns = lookback - decay_grace_period
     decay_window_ns_inv = 1.0 / decay_window_ns if decay_window_ns > 0 else 0.0
 
     # ===== STEP 3: COMPUTE ROUNDTRIP VOLUMES PER BOOK =====
@@ -150,170 +352,33 @@ def calculate_kappa_score(
     num_books = len(normalized_kappas)
     
     # Compute compact roundtrip volumes for this UID
-    miner_roundtrip_volumes = {}
-    latest_roundtrip_volumes = {}
-    latest_roundtrip_timestamps = {}
-    
-    if uid in roundtrip_volumes:
-        uid_rt_volumes = roundtrip_volumes[uid]
-        
-        for book_id in range(num_books):
-            if book_id in uid_rt_volumes:
-                rt_volumes = uid_rt_volumes[book_id]
-                
-                if rt_volumes:
-                    lookback_volume = 0.0
-                    latest_time = 0
-                    latest_volume = 0.0
-                    
-                    # Sum all volumes within lookback period
-                    # Find the most recent trading timestamp
-                    for ts, vol in rt_volumes.items():
-                        if ts >= lookback_threshold:
-                            lookback_volume += vol
-                        if vol > 0 and ts <= sampled_timestamp and ts > latest_time:
-                            latest_time = ts
-                    
-                    # Check if there was recent activity (within sampling interval)
-                    if latest_time > 0 and latest_time >= sampled_timestamp - sampling_interval:
-                        latest_volume = rt_volumes[latest_time]
-                    
-                    miner_roundtrip_volumes[book_id] = lookback_volume
-                    latest_roundtrip_volumes[book_id] = latest_volume
-                    latest_roundtrip_timestamps[book_id] = latest_time
-                else:
-                    # No volume history for this book
-                    miner_roundtrip_volumes[book_id] = 0.0
-                    latest_roundtrip_volumes[book_id] = 0.0
-                    latest_roundtrip_timestamps[book_id] = 0
-            else:
-                # Book not in roundtrip volumes
-                miner_roundtrip_volumes[book_id] = 0.0
-                latest_roundtrip_volumes[book_id] = 0.0
-                latest_roundtrip_timestamps[book_id] = 0
-    else:
-        # UID not in roundtrip_volumes, initialize all books to zero
-        for book_id in range(num_books):
-            miner_roundtrip_volumes[book_id] = 0.0
-            latest_roundtrip_volumes[book_id] = 0.0
-            latest_roundtrip_timestamps[book_id] = 0
+    miner_roundtrip_volumes, latest_roundtrip_volumes, latest_roundtrip_timestamps = (
+        _aggregate_roundtrip_volumes(
+            uid, roundtrip_volumes, num_books, lookback_threshold, sampled_timestamp, sampling_interval
+        )
+    )
 
     # ===== STEP 4: CALCULATE VOLUME-BASED ACTIVITY FACTORS =====
     # Activity factors range from 0 to 2.0:
     # - 1.0 = neutral (no boost or penalty)
     # - <1.0 = penalty for inactivity (via exponential decay)
     # - >1.0 = boost for high volume (up to 2.0x at volume_cap)
-    activity_factors_uid = activity_factors.get(uid, {b: 0.0 for b in normalized_kappas})
-    decay_rate = config['activity'].get('decay_rate', 1.0)
+    activity_factors_uid = _apply_activity_factors(
+        uid, activity_factors, normalized_kappas, miner_roundtrip_volumes,
+        latest_roundtrip_volumes, latest_roundtrip_timestamps, config,
+        volume_cap_inv, activity_impact, simulation_timestamp,
+        decay_grace_period, decay_window_ns_inv, base_decay_factor,
+        time_acceleration_power,
+    )
 
-    for book_id, roundtrip_volume in miner_roundtrip_volumes.items():
-        if latest_roundtrip_volumes[book_id] > 0:
-            # ACTIVE BOOK: Calculate activity boost based on volume
-            # Formula: 1 + (volume/volume_cap × activity_impact)
-            activity_factors_uid[book_id] = min(
-                1 + ((roundtrip_volume * volume_cap_inv) * activity_impact), 
-                2.0
-            )
-        else:
-            # INACTIVE BOOK: Apply exponential decay
-            if decay_rate == 0.0:
-                # Decay disabled, skip this book
-                continue
-                
-            latest_time = latest_roundtrip_timestamps[book_id]
-            
-            if latest_time > 0:
-                # Calculate time since last activity
-                inactive_time = max(0, simulation_timestamp - latest_time)
-            else:
-                # Never traded on this book, use full simulation time
-                inactive_time = simulation_timestamp
-            
-            current_factor = activity_factors_uid[book_id]
-            activity_multiplier = max(current_factor, 1.0)
-
-            # Time acceleration: Decay accelerates based on how long inactive
-            if inactive_time <= decay_grace_period:
-                # Within grace period: no decay acceleration
-                time_acceleration = 1.0
-            else:
-                # Beyond grace period: accelerated decay
-                # The longer inactive, the faster the decay
-                time_beyond_grace = inactive_time - decay_grace_period
-                time_ratio = time_beyond_grace * decay_window_ns_inv
-                # Quadratic acceleration (time_acceleration_power = 2.0)
-                time_acceleration = 1 + (time_ratio ** time_acceleration_power) * decay_rate
-            
-            # Total acceleration combines current factor with time acceleration
-            # Higher current factors decay faster (to prevent "coasting" on past activity)
-            total_acceleration = activity_multiplier * time_acceleration
-            total_acceleration = min(total_acceleration, 100.0)  # Safety cap
-            
-            # Apply exponential decay: factor *= base_decay_factor^acceleration
-            try:
-                decay_factor = base_decay_factor ** total_acceleration
-                if not np.isfinite(decay_factor):
-                    bt.logging.error(f"UID {uid} book {book_id}: Non-finite decay_factor")
-                    decay_factor = 0.0
-            except (OverflowError, ValueError) as e:
-                bt.logging.error(f"UID {uid} book {book_id}: Decay overflow - {e}")
-                decay_factor = 0.0
-            
-            # Update activity factor with decay
-            activity_factors_uid[book_id] *= decay_factor
-    
     # ===== STEP 5: CALCULATE P&L-BASED MULTIPLIERS =====
     # P&L factors boost/penalize Kappa scores based on realized profitability per book
     # This rewards miners who achieve good risk-adjusted returns AND make money
     # Range: 0.0 to (1 + config.kappa.pnl.impact)
-    pnl_factors_uid = pnl_factors.get(uid, {b: 1.0 for b in normalized_kappas})
-    pnl_impact = config.get('kappa', {}).get('pnl', {}).get('impact', 0.0)
-    
-    if pnl_impact > 0:
-        # Normalization: 100% DAILY return is the baseline for max boost
-        # This makes P&L factors comparable across different assessment windows
-        DAILY_NS = 86400_000_000_000  # 24 hours in nanoseconds
-        assessment_window_ns = lookback * config['interval']
-        window_fraction = assessment_window_ns / DAILY_NS
-        pnl_reference = simulation_config['miner_wealth'] * window_fraction
-        
-        # Compute realized P&L per book over lookback window
-        # Only counts completed trades (realized gains/losses)
-        book_realized_pnl = {}
-        if uid in realized_pnl_history:
-            for timestamp, books_dict in realized_pnl_history[uid].items():
-                if timestamp >= lookback_threshold:
-                    for book_id, pnl in books_dict.items():
-                        if book_id not in book_realized_pnl:
-                            book_realized_pnl[book_id] = 0.0
-                        book_realized_pnl[book_id] += pnl
-        
-        # Calculate P&L factor per book
-        for book_id in normalized_kappas.keys():
-            realized_pnl_book = book_realized_pnl.get(book_id, 0.0)
-            
-            # Normalize by daily-scaled reference
-            # pnl_ratio = 1.0 means they earned enough to imply 100% daily return
-            pnl_ratio = realized_pnl_book / pnl_reference
-            
-            # Raw P&L factor calculation:
-            #   0% daily return → 1.0x (neutral)
-            #   +100% daily return → (1+impact)x
-            #   -100% daily return → (1+impact)x
-            raw_pnl_factor = max(1.0 + pnl_ratio, 0.0)
-            
-            # Apply impact scaling: controls how much P&L affects final score
-            pnl_factor = 1.0 + ((raw_pnl_factor - 1.0) * pnl_impact)
-            
-            # Cap at 2x boost
-            pnl_factor = min(pnl_factor, 2.0)
-            
-            pnl_factors_uid[book_id] = pnl_factor
-    else:
-        # P&L weighting disabled - set all to neutral (1.0 = no effect)
-        for book_id in normalized_kappas.keys():
-            pnl_factors_uid[book_id] = 1.0
-    
+    pnl_factors_uid = _compute_pnl_factors(
+        uid, pnl_factors, normalized_kappas, config, lookback, simulation_config, realized_pnl_history, lookback_threshold
+    )
+
     # ===== STEP 6: COMBINE ACTIVITY AND P&L FACTORS, APPLY TO KAPPA =====
     # Both factors are multiplicative: combined_factor = activity × pnl
     # This means miners need BOTH good activity AND good profitability for max boost
@@ -392,25 +457,8 @@ def calculate_kappa_score(
     # Use the 1.5×IQR rule to detect left-hand outliers in the activity-weighted Kappas
     # Outliers indicate books where the miner performed significantly worse than their median
     # This penalizes inconsistent performance across books
-    q1, q3 = np.percentile(data, [25, 75])
-    iqr = q3 - q1
-    
-    # Apply minimum IQR to prevent division issues and scale penalty appropriately
-    min_iqr = 0.01
-    effective_iqr = max(iqr, min_iqr)
-    lower_threshold = q1 - 1.5 * effective_iqr
-    outliers = data[data < lower_threshold]
-    
-    # Outliers detected here are activity-weighted Kappas which are significantly lower than those achieved on other books
-    # A penalty equal to 67% of the difference between the mean outlier value and the value at the centre of the possible activity weighted Kappa values is calculated
-    # Penalty is scaled by consistency: tight clusters (low IQR) get reduced penalty to reward consistent performance
-    if len(outliers) > 0 and np.median(outliers) < 0.5:
-        base_penalty = (0.5 - np.median(outliers)) / 1.5
-        consistency_bonus = 1.0 - np.exp(-5 * iqr)  # Sigmoid-like scaling
-        outlier_penalty = base_penalty * consistency_bonus
-    else:
-        outlier_penalty = 0
-    
+    outlier_penalty = _outlier_penalty(data)
+
     # ===== STEP 9: FINAL KAPPA SCORE =====
     # The median of the activity-weighted Kappas provides the base score for the miner
     # Median is robust to outliers and represents "typical" performance across books
@@ -444,7 +492,7 @@ def calculate_pnl_score(
     
     This function measures absolute profitability per book:
     - Calculates daily return for EACH book independently
-    - Uses per-book capital allocation (miner_wealth / book_count) as reference
+    - Uses per-book capital (miner_wealth, which is already per-book) as reference
     - Allows up to max_inactive_books to have zero P&L without penalty
     - Excess inactive books contribute 0.0 to the median calculation
     - Takes MEDIAN across scored books (consistent with Kappa methodology)
@@ -461,8 +509,8 @@ def calculate_pnl_score(
         realized_pnl_history: P&L history from completed trades
             Format: {uid: {timestamp: {book_id: pnl}}}
         uid: UID to score
-        lookback: Lookback period in intervals
-        interval: Interval duration in nanoseconds
+        lookback: Lookback assessment window in simulation nanoseconds
+        interval: Interval duration in nanoseconds (unused; retained for signature stability)
         lookback_threshold: Minimum timestamp to include (pre-calculated)
         miner_wealth: Total initial capital across all books
         book_count: Number of books in simulation
@@ -498,11 +546,18 @@ def calculate_pnl_score(
     # ===== STEP 2: CALCULATE DAILY RETURN RATIO PER BOOK =====
     # Per-book capital allocation
     DAILY_NS = 86400_000_000_000  # 24 hours in nanoseconds
-    assessment_window_ns = lookback * interval
+    # `lookback` is already the assessment window in simulation nanoseconds
+    # (scoring.kappa.lookback). Do NOT multiply by `interval` again — that was a
+    # leftover from when lookback was an interval count, and it inflated the
+    # daily reference capital by `interval`, driving every return ratio to ~0.
+    assessment_window_ns = lookback
     window_fraction = assessment_window_ns / DAILY_NS
     
-    # Capital per book (equal allocation across books)
-    capital_per_book = miner_wealth / book_count
+    # `miner_wealth` is the PER-BOOK initial capital (confirmed against
+    # initial_balances: each miner starts with ~miner_wealth on EVERY book),
+    # NOT the total across books — so do not divide by book_count. This matches
+    # the per-book reference used in _compute_pnl_factors (miner_wealth * window).
+    capital_per_book = miner_wealth
     pnl_reference_per_book = capital_per_book * window_fraction
     
     if pnl_reference_per_book == 0:
@@ -692,9 +747,8 @@ def score_uid(validator_data: Dict, uid: int) -> Tuple[float, float]:
     pnl_score = 0.0
 
     if pnl_score_weight > 0:
-        lookback = config['kappa']['lookback']
-        publish_interval = simulation_config['publish_interval']
-        lookback_threshold = simulation_timestamp - (lookback * publish_interval)
+        lookback = config['kappa']['lookback']  # simulation nanoseconds
+        lookback_threshold = simulation_timestamp - lookback
 
         pnl_score = calculate_pnl_score(
             realized_pnl_history=realized_pnl_history,
@@ -723,9 +777,32 @@ def score_uid(validator_data: Dict, uid: int) -> Tuple[float, float]:
         round_score = gentrx_ranked.get(uid, 0.0)
         gentrx_ema = validator_data.get('gentrx_ema', {})
         alpha = gentrx_config.get('ema_alpha', 0.1)
-        prev = gentrx_ema.get(uid, round_score)
-        gentrx_score = alpha * round_score + (1.0 - alpha) * prev
-        gentrx_ema[uid] = gentrx_score
+        # Bootstrap new miners at 0 instead of `round_score`. The previous
+        # default seeded the EMA from the first observed score, which gave
+        # newly-registered miners their full round score immediately and
+        # made multi-round consistency irrelevant for them. With alpha=0.1
+        # a new miner now reaches 90% of their steady-state score in ~22
+        # rounds; this is closer to the EMA's intended "trust accrues over
+        # time" semantics.
+        prev = gentrx_ema.get(uid, 0.0)
+        # Per-round idempotency: track which (uid, round) pairs we have
+        # already applied EMA for so a repeated call to `score_uid` within
+        # the same round can't double-apply the smoothing. The round id
+        # comes from validator_data['gentrx_round'] when available; absent
+        # that key (legacy callers) we fall back to the non-idempotent
+        # behaviour with a debug log.
+        round_id = validator_data.get('gentrx_round')
+        applied: set = validator_data.setdefault('_gentrx_ema_applied', set())
+        ema_key = (uid, round_id) if round_id is not None else None
+        if ema_key is not None and ema_key in applied:
+            # Already applied this round — return the cached EMA without
+            # mutating it again.
+            gentrx_score = gentrx_ema.get(uid, 0.0)
+        else:
+            gentrx_score = alpha * round_score + (1.0 - alpha) * prev
+            gentrx_ema[uid] = gentrx_score
+            if ema_key is not None:
+                applied.add(ema_key)
 
     # ===== STEP 4: TRADING SCORE (kappa + pnl, weighted-sum, clamp) =====
     # kappa_weight + pnl_weight must sum to 1.0 within the trading pool
@@ -944,11 +1021,16 @@ def get_rewards(self: 'Validator') -> Tuple[torch.FloatTensor, torch.FloatTensor
             },
         },
         'simulation_config': {
-            'miner_wealth': self.simulation.miner_wealth,
+            'miner_wealth': (
+                getattr(getattr(self.config, 'exchange', None), 'volume_cap', 50000.0)
+                / max(self.config.scoring.activity.capital_turnover_cap, 1e-9)
+                if self.simulation.miner_wealth == 0.0
+                else self.simulation.miner_wealth
+            ),
             'publish_interval': self.simulation.publish_interval,
             'volumeDecimals': self.simulation.volumeDecimals,
             'grace_period': self.simulation.grace_period,
-            'book_count': self.simulation.book_count, 
+            'book_count': self.simulation.book_count,
         },
         'simulation_timestamp': self.simulation_timestamp,
         'uids': all_uids,
@@ -1020,7 +1102,7 @@ def set_delays(self: 'Validator', synapse_responses: dict[int, MarketSimulationS
         delay = min_delay + delay_frac * (max_delay - min_delay)
         return int(delay)
     log_messages = []
-    for uid, synapse_response in synapse_responses.items():
+    for _uid, synapse_response in synapse_responses.items():
         response = synapse_response.response
         if response:
             base_delay = compute_delay(synapse_response.dendrite.process_time)

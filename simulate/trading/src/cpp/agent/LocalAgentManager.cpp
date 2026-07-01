@@ -33,7 +33,7 @@ void LocalAgentManager::createAgentsInstanced(
             createAgentInstanced<MultiBookExchangeAgent>(child);
         }
         else if (name == "DistributedProxyAgent") {
-            createAgentInstanced<DistributedProxyAgent>(child);
+            createAgentInstanced<taosim::agent::DistributedProxyAgent>(child);
         }
         else if (name == "StylizedTraderAgent") {
             createAgentInstanced<taosim::agent::StylizedTraderAgent>(child);
@@ -78,6 +78,15 @@ void LocalAgentManager::createAgentsInstanced(
             return lhs->name() < rhs->name();
         });
 
+    // Populate by-name index for O(1) lookup in Simulation::deliverMessage.
+    // (Previously a std::lower_bound over the sorted vector — O(log N) string
+    // comparisons per dispatched message; with 30k+ agents and millions of
+    // messages per tick that was a real hot spot.)
+    m_byName.reserve(m_agents.size());
+    for (const auto& agent : m_agents) {
+        m_byName.emplace(agent->name(), agent.get());
+    }
+
     m_roster = std::make_unique<LocalAgentRoster>(std::move(baseNamesToCounts));
 }
 
@@ -104,10 +113,10 @@ void LocalAgentManager::createAgentInstanced(pugi::xml_node node)
 //-------------------------------------------------------------------------
 
 template<>
-void LocalAgentManager::createAgentInstanced<DistributedProxyAgent>(pugi::xml_node node)
+void LocalAgentManager::createAgentInstanced<taosim::agent::DistributedProxyAgent>(pugi::xml_node node)
 {
     m_agents.push_back([this, node] {
-        auto agent = std::make_unique<DistributedProxyAgent>(m_simulation);
+        auto agent = std::make_unique<taosim::agent::DistributedProxyAgent>(m_simulation);
         agent->configure(node);
         m_simulation->m_proxy = agent.get();
         return agent;

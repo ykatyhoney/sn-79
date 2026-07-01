@@ -30,14 +30,14 @@ FeeLogger::FeeLogger(
       })
 {
     m_feed = signal.connect(
-        [this](const exchange::FeePolicyWrapper* feePolicyWrapper, const FeeLogEvent& event) {
+        [this](const matching::FeePolicyWrapper* feePolicyWrapper, const FeeLogEvent& event) {
             log(feePolicyWrapper, event); 
         });
 }
 
 //-------------------------------------------------------------------------
 
-void FeeLogger::log(const exchange::FeePolicyWrapper* feePolicyWrapper, const FeeLogEvent& event)
+void FeeLogger::log(const matching::FeePolicyWrapper* feePolicyWrapper, const FeeLogEvent& event)
 {
     updateSink();
 

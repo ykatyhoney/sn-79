@@ -5,6 +5,7 @@ vcpkg/
 
 #VSCode
 .vscode/
+*.code-workspace
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -176,6 +177,12 @@ simulate/trading/src/python
 
 testing/
 scripts/
+!mvtrx/scripts/
+
+# Model checkpoints — runtime state (training artifacts, large binaries)
+checkpoints/
+# Staging dirs created during rclone checkpoint downloads
+**/*.staging/
 
 # GenTRX runtime artifacts
 data/live/
@@ -183,13 +190,8 @@ data/localnet_test/
 agents/*/miner_buckets.json
 agents/gentrx_proxy/config.json
 
-# Local runtime / generated files
-.claude/
-activity.csv
-checkpoints/
-agents/exchange/
-mvtrx/
-mvtrx-chainlayer-rs/
-taos/im/config/batch_signer_ledger.db
 taos/im/config/proxy_passwords.enc
+taos/im/config/batch_signer_ledger.db
 taos/im/config/benchmark_agents_test.json
+burn.py
+.claude/

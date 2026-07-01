@@ -43,6 +43,32 @@ namespace taosim::agent
         * (1. / risk * (base * price + quote) + constant);
 };
 
+// 1-D Newton-Raphson with central-difference derivative. Drop-in replacement
+// for Eigen::HybridNonLinearSolver::hybrd1 for the scalar residual case used
+// by calculate{Indifference,Minimum,Maximum}Price. Tolerance matches the prior
+// xtol (1.49012e-8). Returns {x, converged}. Differs from the prior solver at
+// the convergence-tolerance level — accepted under "tolerance-level diff" policy.
+template <typename F>
+[[nodiscard]] static std::pair<double, bool> solveScalarNewton(
+    F&& residual, double x0, double xtol = 1.49012e-8, int maxIter = 100)
+{
+    double x = x0;
+    constexpr double h = 1e-7;
+    for (int i = 0; i < maxIter; ++i) {
+        const double f = residual(x);
+        if (std::abs(f) < xtol) return {x, true};
+        const double fp = residual(x + h);
+        const double fm = residual(x - h);
+        const double df = (fp - fm) / (2.0 * h);
+        if (!std::isfinite(df) || std::abs(df) < 1e-15) return {x, false};
+        const double dx = f / df;
+        x -= dx;
+        if (!std::isfinite(x)) return {x0, false};
+        if (std::abs(dx) < xtol * std::max(1.0, std::abs(x))) return {x, true};
+    }
+    return {x, false};
+}
+
 //-------------------------------------------------------------------------
 
 StylizedTraderAgent::StylizedTraderAgent(Simulation* simulation) noexcept
@@ -305,7 +331,7 @@ void StylizedTraderAgent::configure(const pugi::xml_node& node)
         }());
         m_logReturns.push_back([&] {
             decltype(m_logReturns)::value_type logReturns{m_historySize};
-            const auto& priceHist = m_priceHist.at(bookId);
+            const auto& priceHist = m_priceHist[bookId];
             logReturns.push_back(0.0);
             for (uint32_t i = 1; i < priceHist.size(); ++i) {
                 if (priceHist[i-1] == 0 || isnan(priceHist[i])) {
@@ -316,6 +342,17 @@ void StylizedTraderAgent::configure(const pugi::xml_node& node)
             }
             return logReturns;
         }());
+        // Initialize running sum / sum-of-squares from the seed buffer above.
+        {
+            double s = 0.0, ss = 0.0;
+            for (double v : m_logReturns.back()) { s += v; ss += v * v; }
+            m_logReturnSum.push_back(s);
+            m_logReturnSqSum.push_back(ss);
+        }
+        // Cache process pointers (string lookup + dynamic_cast moved out of hot path).
+        m_magneticField.push_back(dynamic_cast<taosim::process::MagneticField*>(
+            simulation()->exchange()->process("magneticfield", bookId)));
+        m_fundamental.push_back(simulation()->exchange()->process("fundamental", bookId));
     }
 
     attr = node.attribute("opLatencyScaleRay"); 
@@ -416,8 +453,7 @@ void StylizedTraderAgent::handleSimulationStart()
                 fmt::format("{}_{}", m_baseName, chosenAgent),
                 "WAKEUP",
                 MessagePayload::create<RetrieveL1Payload>(bookId));  
-            const auto field = dynamic_cast<taosim::process::MagneticField*>(
-                simulation()->exchange()->process("magneticfield",bookId));
+            const auto field = m_magneticField[bookId];
             float initValue = std::exp((float) m_maxDelay/3.0f);
             field->insertDurationComp(
                 m_baseName, taosim::process::DurationComp{.delay=initValue, .psi=initValue});
@@ -441,7 +477,7 @@ void StylizedTraderAgent::handleTradeSubscriptionResponse()
 
 void StylizedTraderAgent::handleRetrieveL1Response(Message::Ptr msg)
 {
-    const auto payload = std::dynamic_pointer_cast<RetrieveL1ResponsePayload>(msg->payload);
+    const auto payload = std::static_pointer_cast<RetrieveL1ResponsePayload>(msg->payload);
 
     const BookId bookId = payload->bookId;
 
@@ -454,25 +490,38 @@ void StylizedTraderAgent::handleRetrieveL1Response(Message::Ptr msg)
         "RETRIEVE_L1",
         MessagePayload::create<RetrieveL1Payload>(bookId));
 
-    auto& topLevel = m_topLevel.at(bookId);
+    auto& topLevel = m_topLevel[bookId];
     topLevel.bid = taosim::util::decimal2double(payload->bestBidPrice);
     topLevel.ask = taosim::util::decimal2double(payload->bestAskPrice);
     
 
-    if  (topLevel.bid == 0.0) topLevel.bid = m_priceHist.at(bookId).back();
+    if  (topLevel.bid == 0.0) topLevel.bid = m_priceHist[bookId].back();
     if  (topLevel.ask == 0.0) topLevel.ask = topLevel.bid + m_priceIncrement;
     const double midQuote = 0.5 * (topLevel.bid + topLevel.ask);
 
-    m_logReturns.at(bookId).push_back(
-        std::log(midQuote / m_priceHist.at(bookId).back()));
-    m_priceHist.at(bookId).push_back(midQuote);
+    // Maintain incremental sum / sum-of-squares of m_logReturns[bookId] in
+    // lockstep with the circular-buffer push. When the buffer is full the
+    // push_back evicts front(), so subtract that value first.
+    {
+        const double newLogRet = std::log(midQuote / m_priceHist[bookId].back());
+        auto& buf = m_logReturns[bookId];
+        if (buf.full()) {
+            const double evicted = buf.front();
+            m_logReturnSum[bookId]   -= evicted;
+            m_logReturnSqSum[bookId] -= evicted * evicted;
+        }
+        buf.push_back(newLogRet);
+        m_logReturnSum[bookId]   += newLogRet;
+        m_logReturnSqSum[bookId] += newLogRet * newLogRet;
+    }
+    m_priceHist[bookId].push_back(midQuote);
 }
 
 //-------------------------------------------------------------------------
 
 void StylizedTraderAgent::handleLimitOrderPlacementResponse(Message::Ptr msg)
 {
-    const auto payload = std::dynamic_pointer_cast<PlaceOrderLimitResponsePayload>(msg->payload);
+    const auto payload = std::static_pointer_cast<PlaceOrderLimitResponsePayload>(msg->payload);
 
     simulation()->dispatchMessage(
         simulation()->currentTimestamp(),
@@ -483,7 +532,7 @@ void StylizedTraderAgent::handleLimitOrderPlacementResponse(Message::Ptr msg)
         MessagePayload::create<CancelOrdersPayload>(
             std::vector{taosim::event::Cancellation(payload->id)}, payload->requestPayload->bookId));
 
-    m_orderFlag.at(payload->requestPayload->bookId) = false;
+    m_orderFlag[payload->requestPayload->bookId] = false;
 }
 
 //-------------------------------------------------------------------------
@@ -491,11 +540,11 @@ void StylizedTraderAgent::handleLimitOrderPlacementResponse(Message::Ptr msg)
 void StylizedTraderAgent::handleLimitOrderPlacementErrorResponse(Message::Ptr msg)
 {
     const auto payload =
-        std::dynamic_pointer_cast<PlaceOrderLimitErrorResponsePayload>(msg->payload);
+        std::static_pointer_cast<PlaceOrderLimitErrorResponsePayload>(msg->payload);
 
     const BookId bookId = payload->requestPayload->bookId;
 
-    m_orderFlag.at(bookId) = false;
+    m_orderFlag[bookId] = false;
 }
 
 //-------------------------------------------------------------------------
@@ -512,7 +561,7 @@ void StylizedTraderAgent::handleCancelOrdersErrorResponse(Message::Ptr msg)
 
 void StylizedTraderAgent::handleTrade(Message::Ptr msg)
 {
-    const auto payload = std::dynamic_pointer_cast<EventTradePayload>(msg->payload);
+    const auto payload = std::static_pointer_cast<EventTradePayload>(msg->payload);
 }
 
 //-------------------------------------------------------------------------
@@ -521,18 +570,20 @@ StylizedTraderAgent::ForecastResult StylizedTraderAgent::forecast(BookId bookId)
 {
     const double pf = getProcessValue(bookId, "fundamental");
 
-    m_price = m_priceHist.at(bookId).back();
+    m_price = m_priceHist[bookId].back();
     if (isnan(m_price) || m_price <= 0.0) {
         // Error recovery
         m_price = m_price0;
     }
-    const auto& logReturns = m_logReturns.at(bookId);
-    double compF =  1.0 / m_tauF.at(bookId) * std::log(pf/ m_price);
+    const auto& logReturns = m_logReturns[bookId];
+    double compF =  1.0 / m_tauF[bookId] * std::log(pf/ m_price);
     // Error recovery, just in case
     if (isnan(compF)) {
         compF = 0.0;
     }
-    double compC = 1.0 / m_historySize * ranges::accumulate(logReturns, 0.0);
+    // Incremental: was 1/m_historySize * sum_over(logReturns). Sum is maintained
+    // in m_logReturnSum[bookId] by handleRetrieveL1Response().
+    double compC = m_logReturnSum[bookId] / m_historySize;
     if (isnan(compC)) {
         if (logReturns.front() != logReturns.back()){
             compC = (logReturns.front() + logReturns.back())*0.5;
@@ -543,14 +594,14 @@ StylizedTraderAgent::ForecastResult StylizedTraderAgent::forecast(BookId bookId)
     const double compN = std::normal_distribution{0.0, m_sigmaEps}(*m_rng);
     double logReturnForecast = std::clamp(m_weightNormalizer
         * (m_weight.F * compF + m_weight.C * compC + m_weight.N * compN), -1.0, 1.0);
+    // Population variance via E[X²] - E[X]². Mathematically equivalent to the
+    // previous boost::accumulators sample-variance × (n-1)/n result; differs at
+    // ~ FP epsilon (catastrophic-cancellation tolerated for this workload).
     double varLastLogs = [&] {
-        namespace bacc = boost::accumulators;
-        bacc::accumulator_set<double, bacc::stats<bacc::tag::lazy_variance>> acc;
         const auto n = logReturns.size();
-        for (auto logRet : logReturns) {
-            acc(logRet);
-        }
-        return bacc::variance(acc) * (n - 1) / n;
+        if (n == 0) return 0.0;
+        const double mean = m_logReturnSum[bookId] / n;
+        return m_logReturnSqSum[bookId] / n - mean * mean;
     }();
     // Error recovery
     if (isnan(varLastLogs)) {
@@ -573,7 +624,7 @@ void StylizedTraderAgent::placeOrderChiarella(BookId bookId)
     const auto freeBase =
         taosim::util::decimal2double(simulation()->account(name()).at(bookId).base.getFree());
     const auto freeQuote =
-        taosim::util::decimal2double(simulation()->account(name()).at(bookId).quote.getFree());
+        taosim::util::decimal2double(simulation()->account(name()).at(bookId).quote->getFree());
 
     if (m_riskAversion * forecastResult.varianceOfLastLogReturns == 0.0) {
         // ERROR recovery rebalance in order to keep things flowing
@@ -647,48 +698,13 @@ void StylizedTraderAgent::placeOrderChiarella(BookId bookId)
 StylizedTraderAgent::OptimizationResult StylizedTraderAgent::calculateIndifferencePrice(
     const StylizedTraderAgent::ForecastResult& forecastResult, double freeBase, double freeQuote)
 {
-    struct Functor
-    {
-        ForecastResult forecastResult;
-        double riskAversion;
-        double freeBase;
-        double freeQuote;
-        double hara;
-
-        Functor(ForecastResult forecastResult, double riskAversion, double freeBase, double freeQuote, double hara) noexcept
-            : forecastResult{forecastResult}, riskAversion{riskAversion}, freeBase{freeBase}, freeQuote{freeQuote},
-            hara{hara}
-        {}
-
-        int inputs() const noexcept { return 1; }
-        int values() const noexcept { return 1; }
-
-        int operator()(const Eigen::VectorXd& x, Eigen::VectorXd& fvec) const
-        {
-            fvec[0] = 
-                investmentPosition(
-                    x[0], 
-                    forecastResult.price, 
-                    forecastResult.varianceOfLastLogReturns, 
-                    freeBase,
-                    freeQuote,
-                    riskAversion,
-                    hara)
-                - freeBase;
-            return 0;
-        }
+    auto residual = [&](double x) {
+        return investmentPosition(x, forecastResult.price,
+            forecastResult.varianceOfLastLogReturns,
+            freeBase, freeQuote, m_riskAversion, m_hara) - freeBase;
     };
-
-    Functor functor{forecastResult, m_riskAversion, freeBase, freeQuote, m_hara};
-    Eigen::HybridNonLinearSolver<Functor> solver{functor};
-    solver.parameters.xtol = 1.49012e-8;
-    Eigen::VectorXd x{1};
-    x[0] = 1.0;
-    Eigen::HybridNonLinearSolverSpace::Status status = solver.hybrd1(x);
-    return {
-        .value = x[0],
-        .converged = status == Eigen::HybridNonLinearSolverSpace::RelativeErrorTooSmall
-    };
+    auto [value, converged] = solveScalarNewton(residual, 1.0);
+    return {.value = value, .converged = converged};
 }
 
 //-------------------------------------------------------------------------
@@ -696,57 +712,13 @@ StylizedTraderAgent::OptimizationResult StylizedTraderAgent::calculateIndifferen
 StylizedTraderAgent::OptimizationResult StylizedTraderAgent::calculateMinimumPrice(
     const StylizedTraderAgent::ForecastResult& forecastResult, double freeBase, double freeQuote)
 {
-    struct Functor
-    {
-        ForecastResult forecastResult;
-        double riskAversion;
-        double freeBase;
-        double freeQuote;
-        double hara;
-
-        Functor(
-            ForecastResult forecastResult,
-            double riskAversion,
-            double freeBase,
-            double freeQuote,
-            double hara) noexcept
-            : forecastResult{forecastResult},
-              riskAversion{riskAversion},
-              freeBase{freeBase},
-              freeQuote{freeQuote},
-              hara{hara}
-        {}
-
-        int inputs() const noexcept { return 1; }
-        int values() const noexcept { return 1; }
-
-        int operator()(const Eigen::VectorXd& x, Eigen::VectorXd& fvec) const
-        {
-            fvec[0] = x[0] * 
-                (investmentPosition(
-                    x[0], 
-                    forecastResult.price, 
-                    forecastResult.varianceOfLastLogReturns,
-                    freeBase,
-                    freeQuote,
-                    riskAversion,
-                    hara) 
-                    - freeBase)
-                - freeQuote;
-            return 0;
-        }
+    auto residual = [&](double x) {
+        return x * (investmentPosition(x, forecastResult.price,
+            forecastResult.varianceOfLastLogReturns,
+            freeBase, freeQuote, m_riskAversion, m_hara) - freeBase) - freeQuote;
     };
-
-    Functor functor{forecastResult, m_riskAversion, freeBase, freeQuote, m_hara};
-    Eigen::HybridNonLinearSolver<Functor> solver{functor};
-    solver.parameters.xtol = 1.49012e-8;
-    Eigen::VectorXd x{1};
-    x[0] = 1.0;
-    Eigen::HybridNonLinearSolverSpace::Status status = solver.hybrd1(x);
-    return {
-        .value = x[0],
-        .converged = status == Eigen::HybridNonLinearSolverSpace::RelativeErrorTooSmall
-    };
+    auto [value, converged] = solveScalarNewton(residual, 1.0);
+    return {.value = value, .converged = converged};
 }
 
 //-------------------------------------------------------------------------
@@ -787,7 +759,7 @@ void StylizedTraderAgent::placeLimitBuy(
         return;
     }
 
-    m_orderFlag.at(bookId) = true;
+    m_orderFlag[bookId] = true;
 
     const float postOnlyProb = std::max(1.0/(1.0 + std::exp(-m_slopeVolGuard* (forecastResult.varianceOfLastLogReturns - m_volGuardX0))), m_alpha);
     const bool postOnly = std::bernoulli_distribution{postOnlyProb}(*m_rng);
@@ -840,7 +812,7 @@ void StylizedTraderAgent::placeLimitSell(
         return;
     }
 
-    m_orderFlag.at(bookId) = true;
+    m_orderFlag[bookId] = true;
     const float postOnlyProb = std::max(1.0/(1.0 + std::exp(-m_slopeVolGuard* (forecastResult.varianceOfLastLogReturns - m_volGuardX0))), m_alpha);
     const bool postOnly = std::bernoulli_distribution{postOnlyProb}(*m_rng);
     if (!postOnly && (sampledPrice < m_price*(1.0 - m_wealthFrac) && std::bernoulli_distribution{std::pow((m_price-sampledPrice)/m_price,0.20)}(*m_rng))) {
@@ -882,7 +854,7 @@ uint64_t StylizedTraderAgent::selectTurn() {
 
 void StylizedTraderAgent::handleWakeup(Message::Ptr &msg)
 {
-    const auto payload = std::dynamic_pointer_cast<RetrieveL1Payload>(msg->payload);
+    const auto payload = std::static_pointer_cast<RetrieveL1Payload>(msg->payload);
 
     const BookId bookId = payload->bookId;
     auto chosenAgent = selectTurn();
@@ -901,6 +873,8 @@ void StylizedTraderAgent::handleWakeup(Message::Ptr &msg)
 
 double StylizedTraderAgent::getProcessValue(BookId bookId, const std::string& name)
 {
+    // Fast path: forecast()'s hot loop only ever asks for "fundamental".
+    if (name == "fundamental") return m_fundamental[bookId]->value();
     return simulation()->exchange()->process(name, bookId)->value();
 }
 
@@ -931,8 +905,7 @@ Timestamp StylizedTraderAgent::marketFeedLatency()
 
 Timestamp StylizedTraderAgent::decisionMakingDelay(BookId bookId)
 {
-    const auto field = dynamic_cast<taosim::process::MagneticField*>(
-        simulation()->exchange()->process("magneticfield", bookId));
+    const auto field = m_magneticField[bookId];
     const auto lastDurationComp = field->getDurationComp(m_baseName);
     float lastDelay = lastDurationComp.delay;
     float psi_prev = lastDurationComp.psi; 

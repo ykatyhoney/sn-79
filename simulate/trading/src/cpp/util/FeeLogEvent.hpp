@@ -5,7 +5,7 @@
 #pragma once
 
 #include "common.hpp"
-#include <taosim/exchange/Fees.hpp>
+#include <taosim/matching/Fees.hpp>
 
 //-------------------------------------------------------------------------
 
@@ -17,7 +17,7 @@ struct FeeLogEvent
     BookId bookId;
     AgentId restingAgentId;
     AgentId aggressingAgentId;
-    exchange::Fees fees;
+    matching::Fees fees;
     decimal_t price;
     decimal_t volume;
     decimal_t restingRatio;

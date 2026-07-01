@@ -27,10 +27,8 @@ import random
 import bittensor as bt
 import numpy as np
 from typing import Dict, Tuple
-from collections import defaultdict
 from taos.im.neurons.validator import Validator
 from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
-from taos.im.utils import normalize
 from taos.im.utils.sharpe import sharpe, batch_sharpe
 
 def score_uid(validator_data: Dict, uid: int) -> float:
@@ -57,7 +55,7 @@ def score_uid(validator_data: Dict, uid: int) -> float:
     reward_weights = validator_data['reward_weights']
 
     simulation_timestamp = validator_data['simulation_timestamp']
-    publish_interval = simulation_config['publish_interval']
+    simulation_config['publish_interval']
 
     if not sharpe_values[uid]:
         return 0.0
@@ -446,7 +444,7 @@ def set_delays(self: Validator, synapse_responses: dict[int, MarketSimulationSta
         delay = min_delay + delay_frac * (max_delay - min_delay)
         return int(delay)
 
-    for uid, synapse_response in synapse_responses.items():
+    for _uid, synapse_response in synapse_responses.items():
         response = synapse_response.response
         if response:
             base_delay = compute_delay(synapse_response.dendrite.process_time)

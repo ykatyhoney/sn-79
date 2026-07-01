@@ -20,8 +20,9 @@
 #include <taosim/checkpoint/serialization/agent/StylizedTraderAgent.hpp>
 #include <taosim/checkpoint/serialization/book/Book.hpp>
 #include <taosim/checkpoint/serialization/book/BookProcessManager.hpp>
-#include <taosim/checkpoint/serialization/exchange/ClearingManager.hpp>
-#include <taosim/checkpoint/serialization/exchange/ExchangeSignals.hpp>
+#include <taosim/checkpoint/serialization/matching/ClearingManager.hpp>
+#include <taosim/checkpoint/serialization/matching/ExchangeSignals.hpp>
+#include <taosim/checkpoint/serialization/matching/SLTPContainer.hpp>
 #include <taosim/event/serialization/L3RecordContainer.hpp>
 #include <taosim/filesystem/utils.hpp>
 #include <taosim/message/serialization/MessageQueue.hpp>
@@ -124,11 +125,31 @@ fs::path runDirFromToken(const CheckpointToken& token)
 
 fs::path runDirLatest(const fs::path& baseDir)
 {
+    // A valid simulation run directory must have a ckpt/ subdirectory containing
+    // at least one .ckptd directory with common.ckpt (the simulation checkpoint
+    // format). This excludes exchange-service directories which use state.ckpt.
+    const auto isSimRunDir = [](const fs::path& p) {
+        if (!fs::is_directory(p)) return false;
+        const auto ckptStoreDir = p / CheckpointManager::s_storeDirName;
+        if (!fs::is_directory(ckptStoreDir)) return false;
+        const auto commonFile =
+            fmt::format("common{}", CheckpointManager::s_fileExtension);
+        for (const auto& entry : fs::directory_iterator{ckptStoreDir}) {
+            if (entry.is_directory() && fs::exists(entry.path() / commonFile))
+                return true;
+        }
+        return false;
+    };
     const auto runDirsSortedByWriteTime =
-        filesystem::collectMatchingPaths(baseDir, [](auto&& p) { return fs::is_directory(p); })
+        filesystem::collectMatchingPaths(baseDir, isSimRunDir)
         | ranges::actions::sort([](auto&& lhs, auto&& rhs) {
             return fs::last_write_time(lhs) < fs::last_write_time(rhs);
         });
+    if (runDirsSortedByWriteTime.empty()) {
+        throw CheckpointError{fmt::format(
+            "No run directories containing '{}' found in '{}'",
+            CheckpointManager::s_storeDirName, baseDir.c_str())};
+    }
     return runDirsSortedByWriteTime.back();
 }
 
@@ -275,7 +296,21 @@ static void setupExchange(const msgpack::object& o, Simulation& simu, size_t blo
             setupBooks(val);
         }
         else if (key == "signals") {
-            setupSignals(val);
+            // Restore eventCounter in-place on existing ExchangeSignals objects.
+            // The default unique_ptr<ExchangeSignals> convert would create new
+            // objects and destroy the originals, severing the L3EventLogger
+            // signal connections established during fromConfig.
+            if (val.type == msgpack::type::MAP) {
+                auto& signalsMap = simu.exchange()->signals();
+                for (uint32_t i = 0; i < val.via.map.size; ++i) {
+                    BookId bookId;
+                    val.via.map.ptr[i].key.convert(bookId);
+                    const auto it = signalsMap.find(bookId);
+                    if (it != signalsMap.end() && it->second) {
+                        val.via.map.ptr[i].val.convert(*it->second);
+                    }
+                }
+            }
         }
         else if (key == "bookProcessManager") {
             val.convert(simu.exchange()->bookProcessManager());
@@ -300,6 +335,12 @@ static void setupExchange(const msgpack::object& o, Simulation& simu, size_t blo
         }
         else if (key == "localTradeByOrderSubs") {
             val.convert(simu.exchange()->localTradeByOrderSubs());
+        }
+        else if (key == "sltpContainer") {
+            // Restore the per-book trigger state in place; the container's
+            // runtime wiring was already established during fromConfig and is
+            // intentionally left untouched here.
+            val.convert(simu.exchange()->sltpContainer());
         }
     }
 

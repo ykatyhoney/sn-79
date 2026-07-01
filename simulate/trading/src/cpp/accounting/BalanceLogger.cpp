@@ -80,9 +80,9 @@ void BalanceLogger::log(L3LogEvent event) const
                     balances.base.getReserved(),
                     balances.base.getFree(),
                     balances.base.getTotal(),
-                    balances.quote.getReserved(),
-                    balances.quote.getFree(),
-                    balances.quote.getTotal());
+                    balances.quote->getReserved(),
+                    balances.quote->getFree(),
+                    balances.quote->getTotal());
             }),
             ","));
 

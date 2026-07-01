@@ -22,6 +22,7 @@ target_include_directories(simulation
 
 target_link_libraries(simulation
     PUBLIC
+        taosim::agent
         taosim::checkpoint
         taosim::decimal
         taosim::dsa

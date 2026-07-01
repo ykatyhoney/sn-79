@@ -2,7 +2,7 @@
  * SPDX-FileCopyrightText: 2025 Rayleigh Research <to@rayleigh.re>
  * SPDX-License-Identifier: MIT
  */
-#include "server.hpp"
+#include <taosim/net/server.hpp>
 
 #include <fmt/core.h>
 
@@ -11,7 +11,12 @@
 
 //-------------------------------------------------------------------------
 
-net::awaitable<void> session(beast::tcp_stream stream, const rapidjson::Value& responsesJson)
+namespace taosim::net
+{
+
+//-------------------------------------------------------------------------
+
+asio::awaitable<void> session(beast::tcp_stream stream, const rapidjson::Value& responsesJson)
 {
     beast::flat_buffer buffer;
     thread_local static uint32_t counter = 0;
@@ -46,7 +51,7 @@ net::awaitable<void> session(beast::tcp_stream stream, const rapidjson::Value& r
 
 //-------------------------------------------------------------------------
 
-net::awaitable<void> listen(
+asio::awaitable<void> listen(
     tcp::endpoint endpoint,
     const rapidjson::Value& responsesJson,
     std::latch& serverReady,
@@ -57,11 +62,11 @@ net::awaitable<void> listen(
     serverReady.count_down();
 
     while (!stopToken.stop_requested()) {
-        net::co_spawn(
+        asio::co_spawn(
             acceptor.get_executor(),
             session(
                 beast::tcp_stream{co_await acceptor.async_accept(use_awaitable)}, responsesJson),
-            net::detached);
+            asio::detached);
     }
 }
 
@@ -69,16 +74,20 @@ net::awaitable<void> listen(
 
 void runServer(ServerProps props, std::latch& serverReady, std::stop_token stopToken)
 {
-    net::io_context ctx;
-    net::co_spawn(
+    asio::io_context ctx;
+    asio::co_spawn(
         ctx,
         listen(
             tcp::endpoint{ip::make_address(props.host), props.port},
             props.responsesJson,
             serverReady,
             stopToken),
-        net::detached);
+        asio::detached);
     ctx.run();
 }
+
+//-------------------------------------------------------------------------
+
+}  // namespace taosim::net
 
 //-------------------------------------------------------------------------

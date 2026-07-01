@@ -12,7 +12,6 @@
 import os
 import glob
 import xml.etree.ElementTree as ET
-import numpy as np
 import pandas as pd
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
 from thesimulator import *
@@ -66,19 +65,19 @@ class TraderLogger:
         self.trading_period_seconds = float(params['trading_period_seconds'])
         self.Tinit= self.duration
         self.trades_file = open(os.path.join(self.logDir,'output_trade.csv'), 'a')
-        self.trades_file.write(f"Timestamp,BookId,TradeId,Volume,Direction,Price\n")
+        self.trades_file.write("Timestamp,BookId,TradeId,Volume,Direction,Price\n")
         #self.trades_file.flush()
         self.trades_volume_period = open(os.path.join(self.logDir,'output_trade_volume_period.csv'), 'a')
-        self.trades_volume_period.write(f"TradePeriod,BookId,Count,Sum,Mean,MeanTime,CountTime\n")
+        self.trades_volume_period.write("TradePeriod,BookId,Count,Sum,Mean,MeanTime,CountTime\n")
         #self.trades_volume_period.flush()
         self.prices= open(os.path.join(self.logDir,'output_price.csv'), 'a')
-        self.prices.write(f"Timestamp,BookId,Price\n")
+        self.prices.write("Timestamp,BookId,Price\n")
         #self.prices.flush()
         self.parkinsonVolatility = open(os.path.join(self.logDir,'output_parkinson.csv'), 'a')
-        self.parkinsonVolatility.write(f"TradePeriod,BookId,ParkVol\n")
+        self.parkinsonVolatility.write("TradePeriod,BookId,ParkVol\n")
         #self.parkinsonVolatility.flush()
         self.VPIN = open(os.path.join(self.logDir,'output_vpin.csv'), 'a')
-        self.VPIN.write(f"TradePeriod,BookId,VPIN\n")
+        self.VPIN.write("TradePeriod,BookId,VPIN\n")
         #self.VPIN.flush()
         #self.slope_feed = pd.DataFrame({"BookId": [], "Timestamp": [] ,"m_bid": [],"c_bid": [],"m_ask": [], "c_ask": [], "b_bidP": [], "b_bidV": [], "l_idx":[]})
         self.slope_feed = pd.DataFrame({"BookId": [], "Timestamp": [] ,"m_bid": [],"c_bid": [],"m_ask": [], "c_ask": [], "l_idx":[]})
@@ -87,7 +86,7 @@ class TraderLogger:
         self.N_levels = 21
         self.stopSignal = 0
         self.aggregateInventory = open(os.path.join(self.logDir,'output_inventory.csv'), 'a')
-        self.aggregateInventory.write(f"Timestamp,BookId,Inventory\n")
+        self.aggregateInventory.write("Timestamp,BookId,Inventory\n")
         self.l2Offsets = {i : 0 for i in range(self.bookCount)}
         self.l3Offsets = {i : 0 for i in range(self.bookCount)}
         self.l2Cumulative = {}
@@ -99,14 +98,14 @@ class TraderLogger:
         # Subscribing to trade events occcurring within the simulator.
         match messagetype:
             case "EVENT_SIMULATION_START":
-                self.log(f"-----SIMULATION STARTED----")
+                self.log("-----SIMULATION STARTED----")
                 simulation.dispatchMessage(self.currentTimestamp, 1, self.name(), self.exchange, "SUBSCRIBE_EVENT_TRADE", EmptyPayload())
                 for i in range(self.bookCount):
                     L1Payload = RetrieveL1Payload()
                     L1Payload.bookId = i
                     simulation.dispatchMessage(self.currentTimestamp, 1, self.name(), self.exchange, "RETRIEVE_L1", L1Payload)
             case "RESPONSE_SUBSCRIBE_EVENT_TRADE":
-                self.log(f"-----Subscribed to trade events----")
+                self.log("-----Subscribed to trade events----")
                 for i in range(self.bookCount):
                     L1Payload = RetrieveL1Payload()
                     L1Payload.bookId = i
@@ -139,7 +138,7 @@ class TraderLogger:
 
         if messagetype == "EVENT_SIMULATION_STOP" or (self.checkpoints != [] and self.currentTimestamp >= self.checkpoints[0]):
             if messagetype == "EVENT_SIMULATION_STOP":
-                self.log(f"-----The simulation ends now----")
+                self.log("-----The simulation ends now----")
                 print(f"{dir(payload)=}")
                 volumes = pd.DataFrame({"Timestamp": [], "Volume": [], "Price":[], "Type" : [], "BookId" : []})  
                 df_trades = pd.read_csv(os.path.join(self.logDir,'output_trade.csv'))               
@@ -158,9 +157,9 @@ class TraderLogger:
                     cointegration_test["CriticalVal"].append(coint_test_result.cvt[0,1]) 
                     #if (coint_test_result.lr1 > coint_test_result.cvt[:,1]).all():
                     if (coint_test_result.lr1[0] > coint_test_result.cvt[0,1]):
-                        print(f"Fundamental price and trade price are cointegrated.")
+                        print("Fundamental price and trade price are cointegrated.")
                     else:
-                        print(f"Fundamental price and trade price are NOT cointegrated")
+                        print("Fundamental price and trade price are NOT cointegrated")
                     df_trades_period = df_trades[(df_trades['Timestamp']>= (self.currentTimestamp-self.trading_period_seconds))&(df_trades['Timestamp']<= (self.currentTimestamp))&(df_trades['BookId'] == i)]
                     ParkVol = calculate_parkinson_volatility(self,df_trades_period)
                     self.parkinsonVolatility.write(f"{self.currentTimestamp},{i},{ParkVol}\n")
@@ -185,7 +184,7 @@ class TraderLogger:
             l2_files = sorted(glob.glob(search_l2_pattern))
             search_l3_pattern = os.path.join(self.logDir, '*L3*')
             l3_files = sorted(glob.glob(search_l3_pattern))
-            self.log(f'Processing Files:')
+            self.log('Processing Files:')
             self.log(','.join(l2_files))
             self.log(','.join(l3_files))
 
@@ -345,7 +344,7 @@ class TraderLogger:
                 #self.lag1_param.to_csv(os.path.join(self.logDir,'lag1.csv'), header=not existed, index=False, mode='a')    
 
                 if self.serverFlag:
-                    for l2_file,l3_file in zip(l2_files,l3_files):
+                    for l2_file, _l3_file in zip(l2_files, l3_files):
                         out_dir = os.path.join(self.logDir,f"book_{l2_file.split('.')[-2].split('-')[-1]}")
                         template = 'rayleigh-template.tex' # Add folder path later
                         figures_paths = sorted(glob.glob(out_dir + '/*.png'))

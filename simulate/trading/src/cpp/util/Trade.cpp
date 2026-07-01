@@ -111,7 +111,7 @@ TradeContext TradeContext::fromJson(const rapidjson::Value& json)
         json["aggressingAgentId"].GetInt(),
         json["restingAgentId"].GetInt(),
         json["bookId"].GetUint(),
-        taosim::exchange::Fees{
+        taosim::matching::Fees{
             .maker = taosim::json::getDecimal(json["fees"]["maker"]),
             .taker = taosim::json::getDecimal(json["fees"]["taker"])});
 }
@@ -174,7 +174,7 @@ TradeLogContext::Ptr TradeLogContext::fromJson(const rapidjson::Value& json)
         json["aggressingAgentId"].GetInt(),
         json["restingAgentId"].GetInt(),
         json["bookId"].GetUint(),
-        taosim::exchange::Fees{
+        taosim::matching::Fees{
             .maker = taosim::json::getDecimal(json["fees"]["maker"]),
             .taker = taosim::json::getDecimal(json["fees"]["taker"])});
 }

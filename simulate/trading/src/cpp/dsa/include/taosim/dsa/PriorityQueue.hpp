@@ -15,10 +15,11 @@ template<
     typename T,
     typename Container = std::vector<T>,
     typename Compare = std::less<typename Container::value_type>>
-class PriorityQueue : public std::priority_queue<T, Container, Compare>
+class PriorityQueue final : public std::priority_queue<T, Container, Compare>
 {
 public:
     using BaseType = std::priority_queue<T, Container, Compare>;
+    using ContainerType = Container;
     using CompareType = Compare;
 
     using BaseType::BaseType;
@@ -28,6 +29,6 @@ public:
     void clear() noexcept { BaseType::c.clear(); }
 };
 
-}  // taosim::dsa
+}  // namespace taosim::dsa
 
 //-------------------------------------------------------------------------

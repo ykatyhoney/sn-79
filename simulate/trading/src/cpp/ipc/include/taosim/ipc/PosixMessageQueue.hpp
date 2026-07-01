@@ -16,6 +16,7 @@ extern "C" {
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 
 //-------------------------------------------------------------------------
 
@@ -51,8 +52,11 @@ public:
 
     bool send(std::span<const char> msg, uint32_t priority = {}) noexcept;
     ssize_t receive(std::span<char> msg, uint32_t* priority = {}) noexcept;
+    ssize_t blockingReceive(std::span<char> msg, uint32_t* priority = {}) noexcept;
 
     void flush() noexcept;
+
+    static bool remove(std::string_view name);
 
 private:
     mqd_t m_handle;

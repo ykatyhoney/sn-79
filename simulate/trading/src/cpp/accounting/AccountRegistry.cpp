@@ -22,7 +22,7 @@ Account& AccountRegistry::at(const std::variant<AgentId, LocalAgentId>& agentId)
             if constexpr (std::same_as<T, AgentId>) {
                 return m_accounts[agentId];
             } else {
-                return m_accounts[m_idBimap.left.at(agentId)];
+                return m_accounts[m_idLookup.at(agentId)];
             }
         },
         agentId);
@@ -42,6 +42,7 @@ void AccountRegistry::registerLocal(
 {
     const auto id = --m_localIdCounter;
     m_idBimap.insert({agentId, id});
+    m_idLookup.emplace(agentId, id);
     m_accounts[id] = account.value_or(m_accountTemplate());
     m_agentIdToBaseName[id] = [&] {
         std::string res = agentId;
@@ -59,6 +60,7 @@ void AccountRegistry::registerLocal(
 {
     const auto id = --m_localIdCounter;
     m_idBimap.insert({agentId, id});
+    m_idLookup.emplace(agentId, id);
     m_accounts[id] = account.or_else(
         [&] -> std::optional<taosim::accounting::Account> {
             auto it = m_agentTypeAccountTemplates.find(agentType);
@@ -83,20 +85,37 @@ AgentId AccountRegistry::registerRemote(std::optional<Account> account) noexcept
 
 //-------------------------------------------------------------------------
 
+bool AccountRegistry::registerRemote(AgentId agentId, Account::Holdings holdings) noexcept
+{
+    if (m_accounts.contains(agentId)) return false;
+    m_accounts[agentId] = [&] {
+        Account acct;
+        acct.holdings() = std::move(holdings);
+        acct.activeOrders().resize(acct.holdings().size());
+        return acct;
+    }();
+    m_remoteIdCounter = std::max(m_remoteIdCounter, agentId + 1);
+    return true;
+}
+
+//-------------------------------------------------------------------------
+
 void AccountRegistry::registerJson(const rapidjson::Value& json)
 {
     for (const auto& member : json.GetObject()) {
         const rapidjson::Value& accountJson = member.value;
         const AgentId agentId = accountJson["agentId"].GetInt();
         if (!accountJson["agentName"].IsNull()) {
-            m_idBimap.left.insert({accountJson["agentName"].GetString(), agentId});
+            const char* nameC = accountJson["agentName"].GetString();
+            m_idBimap.left.insert({nameC, agentId});
+            m_idLookup.emplace(nameC, agentId);
         }
         for (const rapidjson::Value& balanceJson : accountJson["balances"].GetArray()) {
             const BookId bookId = balanceJson["bookId"].GetUint();
             m_accounts.at(agentId).at(bookId) = Balances::fromJson(balanceJson);
             fmt::println("AGENT #{} BOOK {} : RESTORED BALANCES : QUOTE {} | BASE {}",
                 agentId, bookId,
-                m_accounts.at(agentId).at(bookId).quote, m_accounts.at(agentId).at(bookId).base);
+                *m_accounts.at(agentId).at(bookId).quote, m_accounts.at(agentId).at(bookId).base);
         }
         if (agentId < 0) {
             m_localIdCounter = std::min(m_localIdCounter, agentId);
@@ -116,10 +135,22 @@ bool AccountRegistry::contains(const std::variant<AgentId, LocalAgentId>& agentI
             if constexpr (std::same_as<T, AgentId>) {
                 return m_accounts.contains(agentId);
             } else {
-                return m_accounts.contains(m_idBimap.left.at(agentId));
+                return m_accounts.contains(m_idLookup.at(agentId));
             }
         },
         agentId);
+}
+
+//-------------------------------------------------------------------------
+
+AgentId AccountRegistry::lookupLocalAgentId(std::string_view name) const
+{
+    const auto it = m_idLookup.find(name);
+    if (it == m_idLookup.end()) {
+        throw std::out_of_range{fmt::format(
+            "AccountRegistry::lookupLocalAgentId: unknown agent '{}'", name)};
+    }
+    return it->second;
 }
 
 //-------------------------------------------------------------------------
@@ -132,7 +163,7 @@ AgentId AccountRegistry::getAgentId(const std::variant<AgentId, LocalAgentId>& a
             if constexpr (std::same_as<T, AgentId>) {
                 return agentId;
             } else if constexpr (std::same_as<T, LocalAgentId>) {
-                return m_idBimap.left.at(agentId);
+                return m_idLookup.at(agentId);
             } else {
                 static_assert(false, "Non-exhaustive visitor for agentId");
             }

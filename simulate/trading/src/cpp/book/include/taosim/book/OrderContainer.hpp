@@ -6,6 +6,8 @@
 
 #include <taosim/book/TickContainer.hpp>
 
+#include <range/v3/algorithm/any_of.hpp>
+
 //-------------------------------------------------------------------------
 
 namespace taosim::book
@@ -21,6 +23,11 @@ public:
     using BaseType::BaseType;
 
     [[nodiscard]] auto&& volume(this auto&& self) noexcept { return self.m_volume; }
+
+    [[nodiscard]] bool hasActiveOrders() const noexcept
+    {
+        return ranges::any_of(*this, [](auto&& level) { return level.hasActiveOrders(); });
+    }
 
     void updateVolume(taosim::decimal_t deltaVolume) noexcept { m_volume += deltaVolume; }
 
