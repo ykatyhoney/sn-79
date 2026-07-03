@@ -370,7 +370,16 @@ def test_changed_sim_id_resets(aggregator):
 
 def test_restored_sim_id_mismatch_resets(aggregator):
     """Cross-process restart with a different sim than the staging file:
-    the first config bind must wipe restored-but-stale state."""
+    the first config bind must wipe restored-but-stale state.
+
+    This exercises the startup-cleanup path specifically (`_sim_id is None`
+    at the moment of the mismatched tick). The constructor's
+    `no_startup_cleanup` defaulted to True in ea26b8d3 as an op-safety
+    net, which suppresses this path — flip it off for this test so the
+    wipe fires as designed. Runtime rollovers (`test_changed_sim_id_resets`)
+    still work with the safe default because they don't take this branch.
+    """
+    aggregator._no_startup_cleanup = False
     aggregator._sim_id = None
     aggregator._restored_sim_id = "sim_old"
     aggregator._pending_rows[0] = [_row(100)]

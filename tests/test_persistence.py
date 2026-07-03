@@ -46,3 +46,50 @@ def test_simulation_uses_list_decoding(tmp_path):
     _write(f, {"recent_trades": {0: [1, 2, 3]}})
     state = _try_load_state_file(str(f), "simulation")
     assert isinstance(state["recent_trades"][0], list)
+
+
+def test_build_validator_state_snapshots_miner_stats():
+    """miner_stats is persisted in the saved state (survives restart) and its
+    per-uid dict + call_time list round-trip cleanly through msgpack."""
+    from types import SimpleNamespace
+
+    from taos.im.validator.persistence import build_validator_state
+
+    class _Score:
+        def __init__(self, v):
+            self._v = v
+
+        def item(self):
+            return self._v
+
+    self_ = SimpleNamespace(
+        step=5,
+        simulation_timestamp=123,
+        hotkeys=["a"],
+        scores=[_Score(0.1)],
+        gentrx_scores=[_Score(0.2)],
+        activity_factors={},
+        pnl_factors={},
+        kappa_values={},
+        unnormalized_scores={},
+        deregistered_uids=[],
+        miner_stats={
+            0: {"requests": 105, "timeouts": 34, "failures": 0, "rejections": 0, "call_time": [1.0, 2.0]},
+            1: {"requests": 50, "timeouts": 1, "failures": 2, "rejections": 0, "call_time": []},
+        },
+    )
+    empty_vs = {
+        "volume_sums": {},
+        "maker_volume_sums": {},
+        "taker_volume_sums": {},
+        "self_volume_sums": {},
+        "roundtrip_volume_sums": {},
+    }
+    out = build_validator_state(self_, {}, {}, empty_vs, {}, {}, {})
+    assert out["miner_stats"][0]["requests"] == 105
+    assert out["miner_stats"][0]["call_time"] == [1.0, 2.0]
+    assert out["miner_stats"][1]["failures"] == 2
+
+    rt = msgpack.unpackb(msgpack.packb(out, use_bin_type=True), raw=False, strict_map_key=False)
+    assert rt["miner_stats"][0]["timeouts"] == 34
+    assert rt["miner_stats"][1]["requests"] == 50

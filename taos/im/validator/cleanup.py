@@ -235,6 +235,7 @@ def cleanup_executors(self: Validator):
     thread_executors = {
         'save_state_executor': getattr(self, 'save_state_executor', None),
         'maintenance_executor': getattr(self, 'maintenance_executor', None),
+        '_mvtrx_push_executor': getattr(self, '_mvtrx_push_executor', None),
     }
 
     for name, executor in thread_executors.items():

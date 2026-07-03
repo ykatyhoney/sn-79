@@ -887,7 +887,11 @@ def score_uids(validator_data: Dict) -> Tuple[Dict[int, float], Dict[int, float]
             batch = uids[i:i+batch_size]
             if batch:
                 batches.append(batch)
-        actual_cores = config['kappa']['reward_cores'][:len(batches)]
+        # Pass ALL reward_cores (not truncated by batch count) so the (cores,)
+        # tuple identity into get_reusable_executor stays stable across cycles
+        # and loky reuses the warm pool instead of rebuilding it every time.
+        # Idle workers when len(batches) < len(cores) are harmless (~KB of RAM).
+        actual_cores = config['kappa']['reward_cores']
         bt.logging.debug(
             f"Parallel kappa calculation: {total_uids} UIDs split into {len(batches)} batches "
             f"(batch sizes: {[len(b) for b in batches]}) across {len(actual_cores)} cores"

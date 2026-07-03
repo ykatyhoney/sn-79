@@ -254,9 +254,13 @@ void NoiseTraderAgent::handleSimulationStart()
                 "WAKEUP",
                 MessagePayload::create<RetrieveL1Payload>(bookId));
 
+            // Merge: testnet's cached m_magneticField[bookId] preserves the perf
+            // lookup; SIMU003's initPsi = omega/(1-alpha-beta) primes the ACD
+            // recursion at its stationary mean so the self-exciting behaviour
+            // isn't frozen at a static exp(maxDelay/3) start.
             const auto field = m_magneticField[bookId];
-            float initValue = std::exp((float) m_maxDelay/3.0f);
-            field->insertDurationComp(m_baseName, process::DurationComp{.delay=initValue, .psi=initValue});
+            const float initPsi = m_omegaDu / (1.0f - m_alphaDu - m_betaDu);
+            field->insertDurationComp(m_baseName, process::DurationComp{.delay=initPsi, .psi=initPsi});
         }
     }
 }
@@ -264,7 +268,14 @@ void NoiseTraderAgent::handleSimulationStart()
 //-------------------------------------------------------------------------
 
 void NoiseTraderAgent::handleSimulationStop()
-{}
+{
+    if (m_catUId != 0) return;
+    for (BookId bookId = 0; bookId < m_bookCount; ++bookId) {
+        const auto field = dynamic_cast<process::MagneticField*>(
+            simulation()->exchange()->process("magneticfield", bookId));
+        if (field) field->emitDiagnostics(m_baseName, bookId);
+    }
+}
 
 //-------------------------------------------------------------------------
 
@@ -310,7 +321,7 @@ void NoiseTraderAgent::handleRetrieveL1Response(Message::Ptr msg)
     float psi_prev = lastDurationComp.psi; 
     float psi_next = m_omegaDu + m_alphaDu * lastDelay + m_betaDu *psi_prev + m_gammaDu*std::log(1-avgMagnetism);
     if (isnan(psi_next)) {
-        psi_next = m_omegaDu/(1-m_alphaDu - m_omegaDu);
+        psi_next = m_omegaDu/(1-m_alphaDu - m_betaDu);
     }
     float delay = std::exp(psi_next) * m_acdDelayDist(*m_rng);
     Timestamp delay_timestamped = std::clamp(static_cast<Timestamp>(delay), m_minDelay, m_maxDelay);

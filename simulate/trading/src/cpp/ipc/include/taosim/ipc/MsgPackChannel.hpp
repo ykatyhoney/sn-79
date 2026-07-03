@@ -14,8 +14,11 @@
 
 #include <fmt/format.h>
 
+#include <chrono>
 #include <concepts>
 #include <cstring>
+#include <exception>
+#include <functional>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -69,6 +72,40 @@ struct IpcChannelDesc
     // agree on whether to use them.
     std::string reqSemName;
     std::string resSemName;
+};
+
+//-------------------------------------------------------------------------
+
+// Per-cycle timing + size breakdown handed to a server's `onServed` hook.
+// Durations cover only the server-side work; the blocking wait for the next
+// request is excluded. `publish` spans the response-shm truncate+copy, the
+// optional semaphore post, and the size-frame send.
+struct ServeTiming
+{
+    std::chrono::nanoseconds unpack{};   // request bytes available -> decoded
+    std::chrono::nanoseconds handle{};   // handler invocation
+    std::chrono::nanoseconds pack{};     // msgpack-encode of the response
+    std::chrono::nanoseconds publish{};  // shm copy + sem post + size send
+    size_t reqBytes{};
+    size_t resBytes{};
+    bool dropped{};                      // request undecodable or handler threw
+};
+
+// Optional hooks for `MsgPackServer::serveOne`. A default-constructed value
+// preserves the legacy behavior: a decode/handler failure propagates out, and
+// there is no post-cycle observer.
+template<typename Request, typename Response>
+struct ServeHooks
+{
+    // Produce a fallback response when the request cannot be decoded or the
+    // handler throws. Answering anyway keeps the request/response handshake in
+    // lock-step instead of orphaning a peer that is blocked awaiting a reply.
+    // When unset, `serveOne` rethrows (the caller's loop owns the failure).
+    std::function<Response(std::exception_ptr)> onError;
+    // Invoked once the response has been published. `request` points at the
+    // decoded request, or is nullptr when decoding failed. Must not throw.
+    std::function<
+        void(const Request* request, const Response& response, const ServeTiming&)> onServed;
 };
 
 //-------------------------------------------------------------------------
@@ -145,16 +182,19 @@ public:
     MsgPackServer(MsgPackServer&&) = delete;
     MsgPackServer& operator=(MsgPackServer&&) = delete;
 
-    // Process exactly one request → response cycle. Throws whatever the
-    // handler throws; lets the caller's loop / signal logic stay in
-    // charge of program lifetime. The handler constraint is checked
-    // in-body via `static_assert` for a clearer diagnostic than a
-    // failed-substitution error from a class-level `requires`.
+    // Process exactly one request → response cycle. With default hooks the
+    // handler's exception propagates, leaving the caller's loop / signal
+    // logic in charge of program lifetime. Supply `hooks.onError` to convert
+    // a decode/handler failure into a fallback response (so the channel stays
+    // in lock-step), and `hooks.onServed` to observe the per-cycle timing.
+    // The handler constraint is checked in-body via `static_assert` for a
+    // clearer diagnostic than a failed-substitution error from a class-level
+    // `requires`.
     template<typename H>
-    void serveOne(H&& handler);
+    void serveOne(H&& handler, const ServeHooks<Request, Response>& hooks = {});
 
     template<typename H>
-    void serve(H&& handler);
+    void serve(H&& handler, const ServeHooks<Request, Response>& hooks = {});
 
     [[nodiscard]] const IpcChannelDesc& desc() const noexcept { return m_desc; }
 
@@ -185,33 +225,83 @@ template<
     serialization::MsgPackDeserializable Request,
     serialization::MsgPackSerializable Response>
 template<typename H>
-void MsgPackServer<Request, Response>::serveOne(H&& handler)
+void MsgPackServer<Request, Response>::serveOne(
+    H&& handler, const ServeHooks<Request, Response>& hooks)
 {
     static_assert(std::invocable<H, const Request&>);
     static_assert(std::convertible_to<std::invoke_result_t<H, const Request&>, Response>);
 
+    using Clock = std::chrono::steady_clock;
+
+    // Blocks until the next request's bytes are mapped; the wait itself is
+    // peer-side idle time and is deliberately excluded from the timing below.
     auto received = detail::waitForRequest(m_desc, m_reqMq);
-    msgpack::object_handle oh = msgpack::unpack(
-        static_cast<const char*>(received.region.get_address()), received.size);
+    const auto t0 = Clock::now();
+
+    ServeTiming timing;
+    timing.reqBytes = received.size;
+
     Request req;
-    oh.get().convert(req);
+    const Request* reqPtr = nullptr;
+    auto tUnpack = t0;
+    auto tHandle = t0;
 
-    Response res = handler(static_cast<const Request&>(req));
+    Response res = [&]() -> Response {
+        try {
+            msgpack::object_handle oh = msgpack::unpack(
+                static_cast<const char*>(received.region.get_address()), received.size);
+            oh.get().convert(req);
+            reqPtr = &req;
+            tUnpack = Clock::now();
+            Response r = handler(static_cast<const Request&>(req));
+            tHandle = Clock::now();
+            return r;
+        }
+        catch (...) {
+            if (!hooks.onError) {
+                throw;
+            }
+            timing.dropped = true;
+            const auto tErr = Clock::now();
+            // Attribute the failed work to the stage that owned it and keep the
+            // remaining stage durations non-negative.
+            if (reqPtr == nullptr) {
+                tUnpack = tErr;  // decode failed before a request existed
+            }
+            tHandle = tErr;
+            return hooks.onError(std::current_exception());
+        }
+    }();
 
+    const auto tResReady = Clock::now();
     serialization::HumanReadableStream stream;
     msgpack::pack(stream, res);
+    const auto tPack = Clock::now();
+    timing.resBytes = stream.size();
+
     detail::publishResponse(m_desc, m_resMq,
         std::span<const char>{stream.data(), stream.size()});
+    const auto tPublish = Clock::now();
+
+    timing.unpack = tUnpack - t0;
+    timing.handle = tHandle - tUnpack;
+    timing.pack = tPack - tResReady;
+    timing.publish = tPublish - tPack;
+
+    if (hooks.onServed) {
+        hooks.onServed(reqPtr, res, timing);
+    }
 }
 
 template<
     serialization::MsgPackDeserializable Request,
     serialization::MsgPackSerializable Response>
 template<typename H>
-void MsgPackServer<Request, Response>::serve(H&& handler)
+void MsgPackServer<Request, Response>::serve(
+    H&& handler, const ServeHooks<Request, Response>& hooks)
 {
     for (;;) {
-        serveOne(handler);
+        serveOne(handler, hooks);
     }
 }
 

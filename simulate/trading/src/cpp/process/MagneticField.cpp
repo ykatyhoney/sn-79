@@ -6,7 +6,9 @@
 
 #include <Simulation.hpp>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
 
 //-------------------------------------------------------------------------
 
@@ -50,8 +52,7 @@ MagneticField::Position MagneticField::resolvePosition(uint32_t id) const noexce
 
 DurationComp MagneticField::getDurationComp(const std::string& agentBaseName)
 {
-    return m_state.agentBaseNameToDuration[agentBaseName] =
-        DurationComp{.delay = 0.1f, .psi = 0.1f};
+    return m_state.agentBaseNameToDuration[agentBaseName];
 }
 
 //-------------------------------------------------------------------------
@@ -80,8 +81,36 @@ void MagneticField::setValAt(uint32_t pos, int32_t val)
 
 void MagneticField::insertDurationComp(const std::string& agentBaseName, DurationComp event)
 {
-    m_state.agentBaseNameToDuration.insert({agentBaseName, std::move(event)});
+    auto& s = m_state.agentBaseNameToStats[agentBaseName];
+    ++s.n;
+    s.delaySum += event.delay;
+    s.delaySumSq += static_cast<double>(event.delay) * event.delay;
+    s.delayMin = std::min(s.delayMin, static_cast<double>(event.delay));
+    s.delayMax = std::max(s.delayMax, static_cast<double>(event.delay));
+    s.psiSum += event.psi;
+    s.psiSumSq += static_cast<double>(event.psi) * event.psi;
+    m_state.agentBaseNameToDuration[agentBaseName] = std::move(event);
 }
+
+void MagneticField::emitDiagnostics(const std::string& agentBaseName, uint32_t bookId) const
+{
+    const auto it = m_state.agentBaseNameToStats.find(agentBaseName);
+    if (it == m_state.agentBaseNameToStats.end() || it->second.n == 0) return;
+    const auto& s = it->second;
+    const double n = static_cast<double>(s.n);
+    const double delayMean = s.delaySum / n;
+    const double delayStd = std::sqrt(std::max(0.0, s.delaySumSq / n - delayMean * delayMean));
+    const double psiMean = s.psiSum / n;
+    const double psiStd = std::sqrt(std::max(0.0, s.psiSumSq / n - psiMean * psiMean));
+    fmt::print(
+        "AGENTDIAG {{\"agent\":\"{}\",\"book\":{},\"n\":{},"
+        "\"delay_mean\":{},\"delay_std\":{},\"delay_min\":{},\"delay_max\":{},"
+        "\"psi_mean\":{},\"psi_std\":{}}}\n",
+        agentBaseName, bookId, s.n,
+        delayMean, delayStd, s.delayMin, s.delayMax, psiMean, psiStd);
+    std::fflush(stdout);
+}
+
 
 //-------------------------------------------------------------------------
 
@@ -97,7 +126,6 @@ void MagneticField::logState(Timestamp timestamp, uint32_t lastPosition)
 void MagneticField::update(Timestamp timestamp)
 {            
     ++m_state.lastCount;
-    m_state.rng.seed(std::random_device{}());
     std::vector<double> weights(m_numAgents, 1.0);
     std::discrete_distribution<uint32_t> dist(weights.begin(), weights.end());
     uint32_t num_updates = m_numAgents - 1; 

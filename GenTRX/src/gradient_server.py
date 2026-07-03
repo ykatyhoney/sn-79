@@ -1827,12 +1827,85 @@ class GradientAggregator:
         except Exception as exc:
             logger.warning("pending rows restore failed: %s", exc)
 
+    # Hard wall-clock budget for the startup S3 LIST sweep. If exceeded,
+    # we proceed without the parquet registry — the cost is one round of
+    # ~5-min re-accumulation, not a correctness loss. Boto3's per-call
+    # socket timeouts don't reliably fire under some minio pagination
+    # states (observed on sim-local-dev with a stale 12 GB local minio
+    # data-dir), so we enforce the budget from outside the call.
+    _PARQUET_RESTORE_BUDGET_S = 30.0
+    # Env override for operators who need a longer (or shorter) ceiling:
+    # `GENTRX_PARQUET_RESTORE_BUDGET_S=60` etc. `0` disables the restore
+    # entirely (skip + log).
+    _PARQUET_RESTORE_BUDGET_ENV = "GENTRX_PARQUET_RESTORE_BUDGET_S"
+
     def _restore_written_parquets(self) -> None:
         """Scan S3 and rebuild _written_parquets from existing data/ parquets.
 
         Called once at startup so a restart doesn't force a fresh 5-min
         accumulation before the first assignment can be created.
+
+        Wrapped in a hard wall-clock budget (`_PARQUET_RESTORE_BUDGET_S`)
+        and run on a background thread so a stuck minio LIST (boto3
+        socket-level deadlock we've seen on slow disks) can't wedge
+        startup. On budget exhaustion we proceed with an empty registry
+        and pay the 5-min re-accumulation cost — acceptable; the
+        validator's `_check_data_readiness` rebuilds it lazily anyway.
         """
+        import concurrent.futures
+        import os as _os
+
+        try:
+            budget_s = float(_os.environ.get(
+                self._PARQUET_RESTORE_BUDGET_ENV,
+                self._PARQUET_RESTORE_BUDGET_S,
+            ))
+        except (TypeError, ValueError):
+            budget_s = self._PARQUET_RESTORE_BUDGET_S
+
+        if budget_s <= 0:
+            logger.warning(
+                "Parquet restore disabled via %s=0; restart will pay the "
+                "~5-min re-accumulation penalty before first assignment.",
+                self._PARQUET_RESTORE_BUDGET_ENV,
+            )
+            return
+
+        # Use an executor we control manually: `with` would call
+        # `shutdown(wait=True)` on exit and BLOCK until the stuck thread
+        # returns — defeating the whole point of the timeout. Daemon
+        # threads + `shutdown(wait=False)` abandons the stuck worker so
+        # startup can continue; it dies when the gradient-server process
+        # exits.
+        ex = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="GTX-restore"
+        )
+        try:
+            future = ex.submit(self._restore_written_parquets_locked)
+            try:
+                future.result(timeout=budget_s)
+            except concurrent.futures.TimeoutError:
+                logger.warning(
+                    "Parquet restore exceeded %.0fs budget — proceeding "
+                    "without the registry (will re-accumulate). Bump "
+                    "%s to extend.",
+                    budget_s,
+                    self._PARQUET_RESTORE_BUDGET_ENV,
+                )
+                # NOTE: the background thread keeps running until its
+                # next syscall returns; we don't have a clean way to
+                # abort a boto3 socket read from outside. Eventually
+                # boto3's adaptive-retry exhausts and the thread dies.
+        finally:
+            # wait=False so a stuck worker can't wedge startup. The
+            # thread is daemonised by default in ThreadPoolExecutor;
+            # it'll be reaped at process exit.
+            ex.shutdown(wait=False)
+
+    def _restore_written_parquets_locked(self) -> None:
+        """Body of _restore_written_parquets. Called from inside the
+        ThreadPoolExecutor timeout shield; do NOT call directly from the
+        startup path — it has no escape hatch."""
         try:
             book_ids = self.validator_store.list_books(self._validator_uid)
         except Exception as exc:
@@ -3226,18 +3299,30 @@ class GradientAggregator:
         # size budget as a single miner gradient and the model is updated
         # only on the top-k parameters instead of all of them.
         local_agg_dense = aggregate([c for _, _, _, c, _ in accepted])
-        # Skip the decompress→compress round trip. `aggregate()` already stored
-        # the dense values in `sparse[name][1]` with arange-indices, so we can
-        # build the GradientDelta directly from those values without the
-        # `zeros(N).index_assign` allocation that decompress would do per
-        # tensor (~50 MB of redundant memcopy on a 12M-param model per round).
-        local_agg_delta = GradientDelta(
-            delta={
-                name: vals.reshape(shape)
-                for name, (_indices, vals, shape) in local_agg_dense.sparse.items()
-            },
-            metadata=local_agg_dense.metadata,
+        # Skip the decompress→compress round trip WHEN `aggregate()` produced
+        # a fully-dense CompressedGradient (multi-gradient path: sparse[name]
+        # is (arange(N), flat, shape) with flat.numel() == shape.numel()).
+        # But `aggregate([g])` short-circuits and returns the single input
+        # top-k gradient unchanged — where `vals.numel()` is k << shape.numel()
+        # and `vals.reshape(shape)` throws. Detect the case via a numel
+        # comparison on the first tensor and fall back to the safe
+        # `decompress` path for it (~50 MB memcopy per model, tolerated when
+        # only 1 miner submitted; the fast path fires on the healthy N>=2
+        # case which is when aggregation matters).
+        _dense_ok = all(
+            vals.numel() == shape.numel()
+            for _, vals, shape in local_agg_dense.sparse.values()
         )
+        if _dense_ok:
+            local_agg_delta = GradientDelta(
+                delta={
+                    name: vals.reshape(shape)
+                    for name, (_indices, vals, shape) in local_agg_dense.sparse.items()
+                },
+                metadata=local_agg_dense.metadata,
+            )
+        else:
+            local_agg_delta = decompress(local_agg_dense)
         local_agg = compress(local_agg_delta, top_k_frac=0.05)
 
         self._apply_agg_norm_caps(local_agg)

@@ -15,7 +15,9 @@
 #include <boost/asio.hpp>
 #include <pugixml.hpp>
 
+#include <cstdlib>
 #include <memory>
+#include <string>
 #include <vector>
 
 //-------------------------------------------------------------------------
@@ -63,11 +65,21 @@ public:
     static std::unique_ptr<SimulationManager> fromCheckpoint(const checkpoint::CheckpointToken& ckptToken);
     static std::unique_ptr<SimulationManager> fromReplay(const replay::ReplayDesc& desc);
 
-    // TODO: ENV?
-    static constexpr std::string_view s_validatorReqMessageQueueName{"taosim-req"};
-    static constexpr std::string_view s_validatorResMessageQueueName{"taosim-res"};
-    static constexpr std::string_view s_statePublishShmName{"state"};
-    static constexpr std::string_view s_remoteResponsesShmName{"responses"};
+    // IPC object names, optionally suffixed by the TAOSIM_IPC_SUFFIX env var so
+    // multiple taosim runs can share one host with private, non-colliding POSIX
+    // IPC (the namespace/unshare route needs privileges this host's AppArmor
+    // policy denies). Empty/unset suffix => names unchanged (backward compatible).
+    // The Python side (simbo/ipc.py) reads the SAME env var and applies the
+    // SAME suffix, so the two processes agree on the object names.
+    static std::string makeIpcName(std::string_view base)
+    {
+        const char* suffix = std::getenv("TAOSIM_IPC_SUFFIX");
+        return suffix ? std::string{base} + suffix : std::string{base};
+    }
+    inline static const std::string s_validatorReqMessageQueueName = makeIpcName("taosim-req");
+    inline static const std::string s_validatorResMessageQueueName = makeIpcName("taosim-res");
+    inline static const std::string s_statePublishShmName = makeIpcName("state");
+    inline static const std::string s_remoteResponsesShmName = makeIpcName("responses");
 
 private:
     void setupLogDir(pugi::xml_node simuNode, const fs::path& logPath);

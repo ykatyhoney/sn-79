@@ -179,12 +179,17 @@ class SimulationEngine(MarketEngine):
         receive_start = time.time()
         raw_bytes = await self._recv_bytes()
         # Retry unpack: SHM data may be partially written even after the size
-        # poll passes (simulator signals MQ before completing the write).
+        # poll passes (simulator signals MQ before completing the write), or the
+        # buffer may be misframed (stale-MQ / sim-restart size mismatch). A
+        # misframe makes msgpack decode a dict/list where a map key is expected
+        # and raise TypeError ("unhashable type"), which is NOT a ValueError — so
+        # it must be caught here too, otherwise it escapes to _listen, which
+        # returns an EMPTY response and silently drops that step's miner orders.
         for _attempt in range(8):
             try:
                 raw_dict = msgpack.unpackb(raw_bytes, raw=False, use_list=True, strict_map_key=False)
                 break
-            except (ValueError, msgpack.UnpackValueError):
+            except (ValueError, TypeError, msgpack.UnpackValueError):
                 if _attempt == 7:
                     raise
                 await asyncio.sleep(0.005 * (2 ** _attempt))
@@ -529,6 +534,13 @@ class SimulationEngine(MarketEngine):
             for ts, books in timestamps_data.items():
                 for book_id, pnl in books.items():
                     v.realized_pnl_history[uid][ts][book_id] = pnl
+
+        # realized_pnl_history was fully rebuilt above; the MVTRX push running
+        # totals (agent_pnl_by_book / agent_pnl_total) must be re-bootstrapped
+        # from it to stay consistent with what trade.py will observe going
+        # forward.
+        from taos.im.validator.trade import bootstrap_pnl_totals
+        bootstrap_pnl_totals(v)
 
         logger.info(f"Shifted realized P&L history: {len(shifted_pnl_history)} UIDs with data")
 
@@ -1187,6 +1199,12 @@ class SimulationEngine(MarketEngine):
             for book_id in self.book_ids:
                 v.roundtrip_volume_sums[uid][book_id] = 0.0
             v.realized_pnl_history[uid] = {}
+            # Reset the corresponding MVTRX push running totals for this uid
+            # to match — otherwise agent_pnl_book would keep the deregistered
+            # miner's stale sum for the next miner that takes the slot.
+            if hasattr(v, 'agent_pnl_by_book'):
+                v.agent_pnl_by_book.pop(uid, None)
+                v.agent_pnl_total.pop(uid, None)
             v.open_positions[uid] = defaultdict(lambda: {
                 'longs': deque(), 'shorts': deque()
             })
@@ -1308,39 +1326,55 @@ class SimulationEngine(MarketEngine):
         shm_req = _posix_ipc.SharedMemory("/state")
         packed_data = None
         try:
-            # Poll until the SHM segment is at least byte_size bytes.
-            # The simulator signals via MQ before finishing the write, so a
-            # brief gap is normal; large report-step payloads can take longer.
-            # Timeout scales with payload size: at least 15s, +10s per MB.
+            # Wait for the SHM /state write to be ready, then read it. The
+            # simulator can signal via MQ slightly before the write lands, so a
+            # brief poll is normal. Two ready conditions, whichever comes first:
+            #   1. size reaches the announced byte_size (normal case), or
+            #   2. size STABILIZES > 0 below the announced size — a stale/oversized
+            #      MQ frame announced MORE than was actually written (the SHM was
+            #      truncated smaller for the current, smaller state).
+            # Condition 2 is essential: without it, polling `fstat >= announced`
+            # can never succeed on a stale frame, and the old
+            # `max(15, byte_size/100_000)` timeout (~80s for an 8 MB payload)
+            # stalled the whole sim<->validator handshake ~80s before falling back
+            # to the actual size. A partial write (size right, bytes not yet fully
+            # copied) is caught downstream by the msgpack unpack-retry loop.
             import os as _os
-            _timeout = max(15.0, byte_size / 100_000)
-            _deadline = time.monotonic() + _timeout
+            _deadline = time.monotonic() + 15.0
+            _last = -1
+            _stable_since = None
+            _ready = None
             while time.monotonic() < _deadline:
-                if _os.fstat(shm_req.fd).st_size >= byte_size:
+                _sz = _os.fstat(shm_req.fd).st_size
+                if _sz >= byte_size:
+                    _ready = byte_size
                     break
-                time.sleep(0.002)
-            else:
-                # Size mismatch — stale MQ message from a previous simulator run.
-                # If the SHM size is stable (write complete) use the actual size.
-                _actual = _os.fstat(shm_req.fd).st_size
-                _stable_deadline = time.monotonic() + 1.0
-                while time.monotonic() < _stable_deadline:
-                    time.sleep(0.05)
-                    _new = _os.fstat(shm_req.fd).st_size
-                    if _new != _actual:
-                        _actual = _new
-                        _stable_deadline = time.monotonic() + 1.0
-                if _actual > 0:
-                    logger.warning(
-                        f"SHM /state size mismatch: announced {byte_size} B, "
-                        f"actual {_actual} B — reading actual (stale MQ message?)"
-                    )
-                    byte_size = _actual
+                if _sz == _last and _sz > 0:
+                    if _stable_since is None:
+                        _stable_since = time.monotonic()
+                    elif time.monotonic() - _stable_since >= 0.25:
+                        logger.warning(
+                            f"SHM /state size mismatch: announced {byte_size} B, "
+                            f"actual {_sz} B — reading actual (stale MQ frame?)"
+                        )
+                        _ready = _sz
+                        break
                 else:
+                    _last = _sz
+                    _stable_since = None
+                time.sleep(0.002)
+            if _ready is None:
+                _actual = _os.fstat(shm_req.fd).st_size
+                if _actual <= 0:
                     raise RuntimeError(
-                        f"SHM /state not ready after {_timeout:.0f}s: expected {byte_size} B, "
-                        f"got {_actual} B"
+                        f"SHM /state not ready after 15s: announced {byte_size} B, got {_actual} B"
                     )
+                logger.warning(
+                    f"SHM /state not ready after 15s; reading actual {_actual} B "
+                    f"(announced {byte_size} B)"
+                )
+                _ready = _actual
+            byte_size = _ready
             with _mmap.mmap(shm_req.fd, byte_size, _mmap.MAP_SHARED, _mmap.PROT_READ) as mm:
                 packed_data = mm.read(byte_size)
         finally:
@@ -1358,8 +1392,11 @@ class SimulationEngine(MarketEngine):
         def _read():
             shm = _posix_ipc.SharedMemory("/state")
             try:
-                _timeout = max(2.0, byte_size / 100_000)
-                deadline = time.monotonic() + _timeout
+                # Flat cap: the old byte_size/100_000 was ~80s for an 8 MB
+                # payload. The loop breaks immediately when the SHM already holds
+                # >= byte_size (the common retry case), and reads the actual size
+                # otherwise, so a short ceiling is safe.
+                deadline = time.monotonic() + 10.0
                 while time.monotonic() < deadline:
                     if _os.fstat(shm.fd).st_size >= byte_size:
                         break

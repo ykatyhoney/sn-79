@@ -586,6 +586,51 @@ class GenTRXAgent(FinanceAgent):
     # Main loop
     # ------------------------------------------------------------------
 
+    def handle(
+        self,
+        state: MarketSimulationStateUpdate | ExchangeStateUpdate,
+    ) -> "FinanceAgentResponse | ExchangeAgentResponse":
+        """Run the normal agent cycle, then drive assignment-driven training.
+
+        The training trigger lives HERE, not in respond(). FinanceAgent.handle
+        dispatches to respond_simulation()/respond_exchange(), and only the
+        DEFAULT respond_simulation delegates back to respond() — so a subclass
+        that overrides respond_simulation/respond_exchange (or a composed agent
+        whose runtime supplies its own respond) never reaches respond() and
+        would silently stop training while the queue grows unbounded. Anchoring
+        the drain at handle() makes it independent of any customized respond.
+        """
+        response = super().handle(state)
+        if getattr(self, "_gtx", None) is not None:
+            self._drive_training()
+        return response
+
+    def _drive_training(self) -> None:
+        """Drain queued assignments into training (fast, non-blocking).
+
+        Forwards to a remote training service when gtx_training_url is set,
+        else spawns the in-process download+train background thread via
+        _maybe_train(). Guarded so nothing fires while a window is in flight.
+        """
+        if not (self._gtx.training_enabled and self._gtx.pending_assignments):
+            return
+        if self._gtx.training_url:
+            # Split mode: drain queue and forward each assignment to the
+            # standalone miner_training_server. Production dendrite delivery
+            # writes directly to self._gtx.pending_assignments
+            # (taos/im/neurons/miner.py forward_gentrx_assignment), bypassing
+            # the FastAPI route, so this drain is the only forwarding path that
+            # fires for live network traffic.
+            self._drain_and_forward_assignments()
+        elif not self._gtx.training_in_progress:
+            try:
+                self._maybe_train()
+            except Exception as exc:
+                self._gtx.tlog.error(f"_maybe_train failed: {exc}")
+                import traceback
+
+                self._gtx.tlog.error(traceback.format_exc())
+
     def respond(
         self,
         state: MarketSimulationStateUpdate | ExchangeStateUpdate,
@@ -653,24 +698,9 @@ class GenTRXAgent(FinanceAgent):
 
             except Exception as exc:
                 gtx_log.error(f"Book {book_id}: {exc}")
-        # Assignment-driven training: train when validator pushes an assignment
-        if self._gtx.training_enabled and self._gtx.pending_assignments:
-            if self._gtx.training_url:
-                # Split mode: drain queue and forward each assignment to the
-                # standalone miner_training_server. Production dendrite
-                # delivery writes directly to self._gtx.pending_assignments
-                # (taos/im/neurons/miner.py forward_gentrx_assignment),
-                # bypassing the FastAPI route, so this drain is the only
-                # forwarding path that fires for live network traffic.
-                self._drain_and_forward_assignments()
-            elif not self._gtx.training_in_progress:
-                try:
-                    self._maybe_train()
-                except Exception as exc:
-                    self._gtx.tlog.error(f"_maybe_train failed: {exc}")
-                    import traceback
-
-                    self._gtx.tlog.error(traceback.format_exc())
+        # Assignment-driven training is driven by handle() (see _drive_training),
+        # not here — so it survives subclasses that override respond_simulation/
+        # respond_exchange and never delegate back to this respond().
 
         return response
 

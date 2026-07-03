@@ -76,6 +76,22 @@ def build_validator_state(
         "taker_volume_sums": volume_sums_snapshots['taker_volume_sums'],
         "self_volume_sums": volume_sums_snapshots['self_volume_sums'],
         "roundtrip_volume_sums": volume_sums_snapshots['roundtrip_volume_sums'],
+        # Persist the rolling request/timeout accumulators so a restart doesn't
+        # reset them and force a fresh ~100-request (~12 min) blackout before the
+        # miner_gauges requests/timeouts/call_time series reappear in Grafana.
+        # Per-uid dict + call_time list are copied to tolerate concurrent
+        # update_stats() mutation on the main loop (no await between here).
+        "miner_stats": {
+            uid: {
+                "requests": s.get("requests", 0),
+                "timeouts": s.get("timeouts", 0),
+                "failures": s.get("failures", 0),
+                "rejections": s.get("rejections", 0),
+                "call_time": list(s.get("call_time", [])),
+            }
+            for uid, s in dict(getattr(self, "miner_stats", {})).items()
+            if isinstance(s, dict)
+        },
     }
 
 
@@ -949,6 +965,13 @@ def _restore_trade_volumes(self, validator_state, book_ids, book_ids_set):
 
     bt.logging.info("Processing realized PnL history...")
     self.realized_pnl_history = defaultdict(lambda: defaultdict(dict))
+    # Running totals over realized_pnl_history for the MVTRX push payload's
+    # agent_pnl / agent_pnl_book fields. Maintained incrementally by
+    # trade.py at every write/prune so the push builder doesn't have to
+    # re-walk the entire O(N*T*B) history on every state cycle. Rebuilt
+    # from realized_pnl_history via bootstrap_pnl_totals after load.
+    self.agent_pnl_by_book = defaultdict(lambda: defaultdict(float))
+    self.agent_pnl_total = defaultdict(float)
     if "realized_pnl_history" in validator_state:
         for uid, hist in validator_state["realized_pnl_history"].items():
             if uid < self.effective_max_uids:
@@ -1100,6 +1123,35 @@ def _load_validator_state(self):
             self.hotkeys = validator_state["hotkeys"]
             self.deregistered_uids = list(validator_state.get("deregistered_uids", []))
 
+            # Restore rolling request/timeout accumulators (persisted so a restart
+            # doesn't wipe the ~100-request window and blackout the miner_gauges
+            # requests/timeouts/call_time series in Grafana for ~12 min). Runs
+            # after initialize_structures() seeded miner_stats for all UIDs, so
+            # this overlays saved counts onto the fresh zeroed structure.
+            _loaded_miner_stats = validator_state.get("miner_stats", {})
+            if _loaded_miner_stats:
+                if not isinstance(getattr(self, "miner_stats", None), dict):
+                    self.miner_stats = {}
+                _restored = 0
+                for _uid_key, _st in _loaded_miner_stats.items():
+                    if not isinstance(_st, dict):
+                        continue
+                    try:
+                        _uid = int(_uid_key)
+                    except (TypeError, ValueError):
+                        continue
+                    if _uid < 0 or _uid >= self.effective_max_uids:
+                        continue
+                    self.miner_stats[_uid] = {
+                        "requests": int(_st.get("requests", 0)),
+                        "timeouts": int(_st.get("timeouts", 0)),
+                        "failures": int(_st.get("failures", 0)),
+                        "rejections": int(_st.get("rejections", 0)),
+                        "call_time": list(_st.get("call_time", [])),
+                    }
+                    _restored += 1
+                bt.logging.info(f"Restored miner_stats for {_restored} UIDs")
+
             loaded_scores = validator_state["scores"]
             self.scores = torch.zeros(self.effective_max_uids, dtype=torch.float32, device=self.device)
             num_scores_to_copy = min(len(loaded_scores), self.effective_max_uids)
@@ -1243,6 +1295,17 @@ def _load_validator_state(self):
 
             _restore_trade_volumes(self, validator_state, book_ids, book_ids_set)
 
+            # Rebuild the MVTRX push running totals from the freshly-loaded
+            # realized_pnl_history. From here on, trade.py maintains them
+            # incrementally — but at boot we need the full walk once.
+            from taos.im.validator.trade import bootstrap_pnl_totals
+            _bp_start = time.time()
+            bootstrap_pnl_totals(self)
+            bt.logging.info(
+                f"Bootstrapped agent_pnl running totals for {len(self.agent_pnl_total)} UIDs "
+                f"({time.time()-_bp_start:.3f}s)"
+            )
+
             bt.logging.success(f"Loaded validator state for {self.effective_max_uids} UIDs")
         else:
             bt.logging.warning("All validator state files corrupted, initializing fresh state")
@@ -1283,6 +1346,13 @@ def _load_validator_state(self):
         self.roundtrip_volumes = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
         self.roundtrip_volume_sums = defaultdict(lambda: defaultdict(float))
         self.realized_pnl_history = defaultdict(lambda: defaultdict(dict))
+        # Running totals over realized_pnl_history for the MVTRX push payload's
+        # agent_pnl / agent_pnl_book fields. Maintained incrementally by
+        # trade.py at every write/prune so the push builder doesn't have to
+        # re-walk the entire O(N*T*B) history on every state cycle. Rebuilt
+        # from realized_pnl_history via bootstrap_pnl_totals after load.
+        self.agent_pnl_by_book = defaultdict(lambda: defaultdict(float))
+        self.agent_pnl_total = defaultdict(float)
         self.open_positions = defaultdict(lambda: defaultdict(lambda: {
             'longs': deque(),
             'shorts': deque()
