@@ -290,7 +290,7 @@ def _init_worker_affinity(cores):
     """
     Worker initializer that sets CPU affinity.
     Must be at module level for pickling.
-    
+
     Args:
         cores: List of CPU cores to bind to
     """
@@ -299,6 +299,24 @@ def _init_worker_affinity(cores):
             os.sched_setaffinity(0, set(cores))
         except (AttributeError, OSError):
             pass
+
+
+# Module-level cache of the worker initializer partial, keyed by tuple(cores).
+# Loky's get_reusable_executor treats a change in initializer *identity* (not
+# equality) as a reason to shut down and rebuild the pool. Building
+# partial(_init_worker_affinity, cores) fresh on every call causes a full
+# fork-server recreate every reward cycle — 10-15s of overhead per cycle.
+# Caching by (cores,) tuple gives a stable object identity for repeat calls
+# with the same core allocation, so the pool stays warm.
+_worker_init_cache: dict = {}
+
+def _get_worker_initializer(cores):
+    if cores is None:
+        return None
+    key = tuple(cores)
+    if key not in _worker_init_cache:
+        _worker_init_cache[key] = partial(_init_worker_affinity, cores)
+    return _worker_init_cache[key]
 
 def batch_kappa_3(realized_pnl_values, tau, batches, lookback, norm_min, norm_max,
                   min_lookback, min_realized_observations, grace_period, deregistered_uids, 
@@ -326,16 +344,63 @@ def batch_kappa_3(realized_pnl_values, tau, batches, lookback, norm_min, norm_ma
     Returns:
         Tuple of (results_dict, cache_updates_dict)
     """
-    if cores is not None:
-        initializer = partial(_init_worker_affinity, cores)
-    else:
-        initializer = None
-    pool = get_reusable_executor(
-        max_workers=len(batches),
-        initializer=initializer,
-        timeout=300
-    )
-    
+    # FAST PATH: check fingerprint cache on the main thread BEFORE pickling.
+    # Every UID whose PnL hasn't changed since last cycle can be resolved
+    # directly from `cache` in ~1μs — no pickle, no IPC, no worker roundtrip.
+    # In steady state most UIDs don't trade in every 5s scoring window, so
+    # this typically resolves 200+/259 UIDs on mainnet without touching loky.
+    # Before this fast path, EVERY UID's realized_pnl_history was pickled
+    # into a batch dict and shipped to a loky worker, which then paid the
+    # cache-check cost per worker — orders of magnitude more overhead than
+    # a same-thread dict lookup.
+    cache_hits: dict = {}
+    if cache is not None:
+        remaining_batches = []
+        for batch in batches:
+            remaining_uids = []
+            for uid in batch:
+                realized_pnl_value = realized_pnl_values.get(uid, {})
+                fingerprint = _get_pnl_fingerprint(realized_pnl_value)
+                if uid in cache:
+                    cached_fingerprint, cached_kappa = cache[uid]
+                    if cached_fingerprint == fingerprint:
+                        cache_hits[uid] = cached_kappa
+                        continue
+                remaining_uids.append(uid)
+            if remaining_uids:
+                remaining_batches.append(remaining_uids)
+        batches = remaining_batches
+
+    # All UIDs cache-hit — no pool needed at all.
+    if not batches:
+        return cache_hits, {}
+
+    initializer = _get_worker_initializer(cores)
+    # max_workers is what triggers loky's pool-recreate check. Pin it to a
+    # value that doesn't vary with len(batches) so the pool stays warm across
+    # cycles. If cores is given (which reward.py always does), use its count;
+    # else fall back to batches. Also catches the BrokenPipeError case: if a
+    # prior worker died and left the manager pipe closed, force a fresh
+    # reuse=False rebuild instead of the failing shutdown path.
+    max_workers = len(cores) if cores else len(batches)
+    try:
+        pool = get_reusable_executor(
+            max_workers=max_workers,
+            initializer=initializer,
+            timeout=300,
+        )
+    except BrokenPipeError:
+        # Loky's manager thread pipe is dead (worker crash / OOM in prior
+        # cycle left it in a bad state). Force a clean rebuild.
+        from loky.reusable_executor import _ReusablePoolExecutor
+        _ReusablePoolExecutor._executor = None
+        pool = get_reusable_executor(
+            max_workers=max_workers,
+            initializer=initializer,
+            timeout=300,
+            reuse=False,
+        )
+
     tasks = [
         pool.submit(
             kappa_3_batch,
@@ -347,13 +412,13 @@ def batch_kappa_3(realized_pnl_values, tau, batches, lookback, norm_min, norm_ma
         for batch in batches
     ]
     
-    result = {}
+    result = dict(cache_hits)  # merge fast-path hits with pool results
     cache_updates = {}
-    
+
     for task in tasks:
         batch_result, batch_cache_updates = task.result()
         for k, v in batch_result.items():
             result[int(k)] = v
         cache_updates.update(batch_cache_updates)
-    
+
     return result, cache_updates

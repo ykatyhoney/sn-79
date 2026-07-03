@@ -287,11 +287,18 @@ class GenTRXService:
             target=self._tx_worker, name="GenTRX-tx", daemon=True,
         )
         self._tx_thread.start()
+        # Note: the background _pack_worker / _pack_queue that existed in
+        # 0.5.x was removed for 0.4.6 alignment. See push_state() docstring.
         atexit.register(self._drain_on_exit)
         # SIGTERM (systemd, bare kill) bypasses atexit; SIGINT (pm2 default) does not.
+        # Capture (don't discard) any previously-installed SIGTERM handler — e.g.
+        # the validator's graceful-cleanup handler — so _handle_sigterm can chain
+        # to it after draining, instead of hard-exiting via SIG_DFL and skipping
+        # the validator's IPC + executor teardown (which risks orphaned IPC).
+        self._prev_sigterm = None
         if threading.current_thread() is threading.main_thread():
             try:
-                signal.signal(signal.SIGTERM, self._handle_sigterm)
+                self._prev_sigterm = signal.signal(signal.SIGTERM, self._handle_sigterm)
             except (ValueError, OSError) as exc:
                 gtx_log.debug("SIGTERM handler not installed: %s", exc)
 
@@ -395,7 +402,18 @@ class GenTRXService:
     # ------------------------------------------------------------------
 
     def push_state(self, state: Any) -> None:
-        """Extract a tick packet and hand it to the background TX worker."""
+        """Extract a tick packet and hand it to the background TX worker.
+
+        Reverted to the 0.4.6 pattern: extract_state + msgpack.packb run
+        SYNCHRONOUSLY on the caller's thread (the validator's hot path).
+        The intermediate _pack_worker background thread was introduced in
+        0.5.x to move the CPU work off-path, but on mainnet it competed
+        with reward_executor for the GIL every tick and became the
+        dominant driver of reward-cycle backpressure (the "Waiting for
+        rewarding to catch up" queue). Doing the pack inline pays a
+        50-200ms tick-latency cost that stays local to the hot path while
+        freeing the GIL for reward_executor between ticks.
+        """
         if self._packager is None:
             return
         try:
@@ -450,7 +468,7 @@ class GenTRXService:
             if now - last_summary >= self.DEFAULT_TX_SUMMARY_INTERVAL_S:
                 spool_evict = self._tx_spool.evictions_total if self._tx_spool else 0
                 gtx_log.info(
-                    "TX summary: queue=%d drops=%d spool_evict=%d "
+                    "TX summary: tx_q=%d tx_drops=%d spool_evict=%d "
                     "retries=+%d sends=+%d (last %.0fs)",
                     self._tx_queue.qsize(), self._tx_drops, spool_evict,
                     self._tx_retries_total - last_retries,
@@ -509,10 +527,16 @@ class GenTRXService:
         return False
 
     def _drain_on_exit(self) -> None:
-        """Flush in-flight packets on clean shutdown. SIGKILL is not covered."""
+        """Flush in-flight packets on clean shutdown. SIGKILL is not covered.
+
+        Drain order is pack queue first (so any in-flight states still
+        get packed and forwarded to the TX queue), then TX queue, then
+        stop both worker threads.
+        """
         if not self._tx_thread.is_alive():
             return
         deadline = time.time() + self.DEFAULT_TX_DRAIN_TIMEOUT_S
+        # Let the TX worker finish anything push_state produced.
         while time.time() < deadline and not self._tx_queue.empty():
             time.sleep(0.1)
         self._tx_stop.set()
@@ -523,6 +547,14 @@ class GenTRXService:
     def _handle_sigterm(self, signum, frame) -> None:
         gtx_log.info("SIGTERM received; draining TX worker")
         self._drain_on_exit()
+        prev = getattr(self, "_prev_sigterm", None)
+        if callable(prev):
+            # Hand off to the previously-installed handler (e.g. the validator's
+            # graceful cleanup + sys.exit); it owns process teardown from here.
+            prev(signum, frame)
+            return
+        # No chainable predecessor (SIG_DFL/SIG_IGN/None) — fall back to the
+        # default disposition: reset to default and re-raise to terminate.
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         os.kill(os.getpid(), signal.SIGTERM)
 

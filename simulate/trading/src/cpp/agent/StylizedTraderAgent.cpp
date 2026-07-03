@@ -453,10 +453,13 @@ void StylizedTraderAgent::handleSimulationStart()
                 fmt::format("{}_{}", m_baseName, chosenAgent),
                 "WAKEUP",
                 MessagePayload::create<RetrieveL1Payload>(bookId));  
+            // Merge: testnet's cached m_magneticField[bookId] preserves the perf
+            // lookup; SIMU003's initPsi = omega/(1-alpha-beta) primes the ACD
+            // recursion at its stationary mean.
             const auto field = m_magneticField[bookId];
-            float initValue = std::exp((float) m_maxDelay/3.0f);
+            const float initPsi = m_omegaDu / (1.0f - m_alphaDu - m_betaDu);
             field->insertDurationComp(
-                m_baseName, taosim::process::DurationComp{.delay=initValue, .psi=initValue});
+                m_baseName, taosim::process::DurationComp{.delay=initPsi, .psi=initPsi});
         }
     }
 }
@@ -464,7 +467,14 @@ void StylizedTraderAgent::handleSimulationStart()
 //-------------------------------------------------------------------------
 
 void StylizedTraderAgent::handleSimulationStop()
-{}
+{
+    if (m_catUId != 0) return;
+    for (BookId bookId = 0; bookId < m_bookCount; ++bookId) {
+        const auto field = dynamic_cast<taosim::process::MagneticField*>(
+            simulation()->exchange()->process("magneticfield", bookId));
+        if (field) field->emitDiagnostics(m_baseName, bookId);
+    }
+}
 
 //-------------------------------------------------------------------------
 
@@ -911,10 +921,14 @@ Timestamp StylizedTraderAgent::decisionMakingDelay(BookId bookId)
     float psi_prev = lastDurationComp.psi; 
     float psi_next = m_omegaDu + m_alphaDu * lastDelay + m_betaDu *psi_prev;
     if (isnan(psi_next)) {
-        psi_next = m_omegaDu/(1-m_alphaDu - m_omegaDu);
+        psi_next = m_omegaDu/(1-m_alphaDu - m_betaDu);
     }
     float delay = std::exp(psi_next) * m_acdDelayDist(*m_rng);
-    return  std::clamp(static_cast<Timestamp>(delay), m_minDelay, m_maxDelay);
+    Timestamp delay_timestamped = std::clamp(static_cast<Timestamp>(delay), m_minDelay, m_maxDelay);
+    field->insertDurationComp(
+        m_baseName,
+        taosim::process::DurationComp{.delay=std::log((float) delay_timestamped), .psi=psi_next});
+    return delay_timestamped;
 }
 
 //-------------------------------------------------------------------------

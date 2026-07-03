@@ -12,9 +12,7 @@ Tests:
      `_get_miner_s3_client` with the same (endpoint, bucket, key) triple
      returns the SAME client object.
 """
-from pathlib import Path
 
-import pytest
 import torch
 
 from GenTRX.src.gradient import (
@@ -116,6 +114,63 @@ def test_miner_s3_client_is_cached(tmp_path, monkeypatch):
     assert construction_count["n"] == 2, (
         "exactly two real client constructions (one per distinct triple)"
     )
+
+
+def test_single_gradient_aggregate_survives_direct_reshape_path():
+    """Regression: `aggregate([single_top_k_gradient])` short-circuits and
+    returns the input UNCHANGED — where `vals.numel() != shape.numel()`.
+    The PR-4 direct-reshape path (`vals.reshape(shape)`) crashed on this
+    case with `shape '[3, 288]' is invalid for input of size 43` (seen on
+    testnet aggregation loop 2026-07-02).
+
+    The fix: numel-check gates the fast path; single-gradient falls back
+    to `decompress()`, which allocates zeros(numel) + scatter and handles
+    any (indices, values) pair.
+    """
+    # Simulate a miner's top-k gradient: shape [3, 288] = 864 elements,
+    # but only 43 top-k values kept — same numbers the live crash logged.
+    dense = torch.randn(3, 288)
+    delta_g = GradientDelta(
+        delta={"emb_type": dense},
+        metadata=GradientMetadata(window_id=0, miner_uid=42),
+    )
+    compressed_g = compress(delta_g, top_k_frac=43 / 864.0)
+    _, vals, shape = compressed_g.sparse["emb_type"]
+    assert vals.numel() == 43
+    assert shape.numel() == 864
+
+    # aggregate([g]) short-circuits to g unchanged — the direct-reshape
+    # path in _aggregate_round would crash on this. The safe path uses
+    # decompress().
+    agg = aggregate([compressed_g])
+    assert agg is compressed_g
+
+    # Fast-path guard: numel comparison must catch this.
+    dense_ok = all(
+        v.numel() == s.numel() for _, v, s in agg.sparse.values()
+    )
+    assert not dense_ok, "single top-k gradient must NOT be treated as dense"
+
+    # decompress fallback works — round-tripped delta reshapes cleanly.
+    delta_back = decompress(agg)
+    assert delta_back.delta["emb_type"].shape == (3, 288)
+    # And re-compress produces a valid CompressedGradient with the same
+    # top-k count.
+    recompressed = compress(delta_back, top_k_frac=43 / 864.0)
+    _, r_vals, _ = recompressed.sparse["emb_type"]
+    assert r_vals.numel() == 43
+
+
+def test_multi_gradient_aggregate_still_takes_dense_fast_path():
+    """Sanity: the multi-gradient case still goes through the fast path
+    (`vals.numel() == shape.numel()`), so we didn't regress the perf win."""
+    a = _make_cg({"w": torch.randn(3, 288)}, miner_uid=1)
+    b = _make_cg({"w": torch.randn(3, 288)}, miner_uid=2)
+    agg = aggregate([a, b])
+    dense_ok = all(
+        v.numel() == s.numel() for _, v, s in agg.sparse.values()
+    )
+    assert dense_ok, "multi-gradient aggregate must remain dense (arange-indexed)"
 
 
 def test_miner_s3_client_evicted_on_credential_rotation(tmp_path, monkeypatch):

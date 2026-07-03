@@ -14,6 +14,8 @@
 #include <boost/circular_buffer.hpp>
 #include <pugixml.hpp>
 
+#include <limits>
+
 //-------------------------------------------------------------------------
 
 class Simulation;
@@ -41,6 +43,15 @@ struct DurationComp
     float delay, psi;
 };
 
+struct DurationStats
+{
+    uint64_t n{};
+    double delaySum{}, delaySumSq{};
+    double delayMin{std::numeric_limits<double>::infinity()};
+    double delayMax{-std::numeric_limits<double>::infinity()};
+    double psiSum{}, psiSumSq{};
+};
+
 struct MagneticFieldState
 {
     RNG rng;
@@ -48,6 +59,7 @@ struct MagneticFieldState
     float magnetism{};
     float magnetismReturn{};
     std::map<std::string, DurationComp> agentBaseNameToDuration;
+    std::map<std::string, DurationStats> agentBaseNameToStats;
     std::vector<int32_t> field;
     uint64_t lastCount{};
     double value{};
@@ -81,6 +93,7 @@ public:
 
     void setValAt(uint32_t pos, int32_t val);
     void insertDurationComp(const std::string& name, DurationComp event);
+    void emitDiagnostics(const std::string& agentBaseName, uint32_t bookId) const;
     void logState(Timestamp timestamp, uint32_t lastPosition = 0);
 
     virtual void update(Timestamp timestamp) override;

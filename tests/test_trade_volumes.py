@@ -46,6 +46,8 @@ def _make_self():
         recent_miner_trades=defaultdict(dict),
         open_positions=defaultdict(lambda: defaultdict(lambda: {"longs": deque(), "shorts": deque()})),
         realized_pnl_history=defaultdict(dict),
+        agent_pnl_by_book=defaultdict(lambda: defaultdict(float)),
+        agent_pnl_total=defaultdict(float),
         roundtrip_volumes=defaultdict(lambda: defaultdict(lambda: defaultdict(float))),
         inventory_history=defaultdict(dict),
         initial_balances=defaultdict(dict),
@@ -98,3 +100,103 @@ def test_pruning_runs_without_error_on_far_future_tick():
     update_trade_volumes(s, _state(6000 * S, {1: [_trade(5, 1, 1, 2.0, 80.0, 0)]},
                                    accounts={1: {1: {"WEALTH": 900.0}}}))
     assert s._last_prune_timestamp == 6000 * S
+
+
+def _recompute_pnl_from_history(s):
+    """Ground-truth: what _prepare_reporting_data's old O(N*T*B) loop produced —
+    a fresh sum over realized_pnl_history. The running totals must match this."""
+    by_book = defaultdict(lambda: defaultdict(float))
+    total = defaultdict(float)
+    for uid, hist in s.realized_pnl_history.items():
+        for ts_d in hist.values():
+            for book_id, pnl in ts_d.items():
+                by_book[uid][book_id] += pnl
+                total[uid] += pnl
+    return by_book, total
+
+
+def _assert_running_totals_match_history(s):
+    truth_by_book, truth_total = _recompute_pnl_from_history(s)
+    # Every uid with history must have running totals equal to a fresh sum.
+    for uid in s.realized_pnl_history:
+        for book_id, v in truth_by_book[uid].items():
+            assert s.agent_pnl_by_book[uid][book_id] == pytest.approx(v, abs=1e-9), (
+                f"agent_pnl_by_book[{uid}][{book_id}]={s.agent_pnl_by_book[uid][book_id]} "
+                f"!= history sum {v}"
+            )
+        assert s.agent_pnl_total[uid] == pytest.approx(truth_total[uid], abs=1e-9), (
+            f"agent_pnl_total[{uid}]={s.agent_pnl_total[uid]} != history sum {truth_total[uid]}"
+        )
+
+
+def test_running_totals_track_history_across_writes():
+    """The MVTRX-push running totals (agent_pnl_by_book / agent_pnl_total) must
+    equal a fresh sum over realized_pnl_history after every mutation — this is the
+    invariant _prepare_reporting_data now relies on instead of re-summing."""
+    s = _make_self()
+    # open long
+    update_trade_volumes(s, _state(1000 * S, {
+        1: [_trade(Ma=5, Ta=1, b=0, q=10.0, p=100.0, side=0)],
+    }, accounts={1: {0: {"WEALTH": 1000.0}}}))
+    _assert_running_totals_match_history(s)
+    # close long higher on same book (realizes pnl into history[1][ts][0])
+    update_trade_volumes(s, _state(1100 * S, {
+        1: [_trade(Ma=5, Ta=1, b=0, q=10.0, p=110.0, side=1)],
+    }, accounts={1: {0: {"WEALTH": 1100.0}}}))
+    _assert_running_totals_match_history(s)
+    # a second uid trades a different book, and uid1 opens+closes book 1 at a loss
+    update_trade_volumes(s, _state(1200 * S, {
+        1: [_trade(Ma=5, Ta=1, b=1, q=4.0, p=200.0, side=0)],
+        2: [_trade(Ma=5, Ta=2, b=0, q=6.0, p=50.0, side=0)],
+    }, accounts={1: {1: {"WEALTH": 1100.0}}, 2: {0: {"WEALTH": 500.0}}}))
+    update_trade_volumes(s, _state(1300 * S, {
+        1: [_trade(Ma=5, Ta=1, b=1, q=4.0, p=180.0, side=1)],
+    }, accounts={1: {1: {"WEALTH": 1020.0}}}))
+    _assert_running_totals_match_history(s)
+
+
+def test_running_totals_stay_consistent_through_prune():
+    """After a prune drops out-of-lookback timestamps, the running totals must
+    still equal a fresh sum over the *remaining* history — i.e. the prune
+    compensation subtracted exactly the pnl it removed, no more, no less."""
+    s = _make_self()
+    # Realize pnl at an early ts, then trade again far in the future so the early
+    # ts falls outside kappa.lookback (10800s) and gets pruned.
+    update_trade_volumes(s, _state(1000 * S, {
+        1: [_trade(Ma=5, Ta=1, b=0, q=10.0, p=100.0, side=0)],
+    }, accounts={1: {0: {"WEALTH": 1000.0}}}))
+    update_trade_volumes(s, _state(1100 * S, {
+        1: [_trade(Ma=5, Ta=1, b=0, q=10.0, p=110.0, side=1)],
+    }, accounts={1: {0: {"WEALTH": 1100.0}}}))
+    _assert_running_totals_match_history(s)
+    # far-future tick: > lookback (10800s) past the 1100s realize -> prune path
+    # subtracts the pruned pnl from the running totals; open a fresh position too.
+    update_trade_volumes(s, _state(20000 * S, {
+        1: [_trade(Ma=5, Ta=1, b=1, q=5.0, p=300.0, side=0)],
+    }, accounts={1: {1: {"WEALTH": 1100.0}}}))
+    _assert_running_totals_match_history(s)
+    # close the fresh position -> new realized pnl inside the (shifted) window
+    update_trade_volumes(s, _state(20100 * S, {
+        1: [_trade(Ma=5, Ta=1, b=1, q=5.0, p=320.0, side=1)],
+    }, accounts={1: {1: {"WEALTH": 1200.0}}}))
+    _assert_running_totals_match_history(s)
+
+
+def test_bootstrap_pnl_totals_matches_history():
+    """bootstrap_pnl_totals (startup / sim-restart rebuild path) must reproduce
+    exactly what a fresh sum over history yields."""
+    from taos.im.validator.trade import bootstrap_pnl_totals
+
+    s = _make_self()
+    s.realized_pnl_history = {
+        1: {1000 * S: {0: 99.6, 1: -40.0}, 2000 * S: {0: 12.5}},
+        2: {1500 * S: {3: 7.25}},
+        7: {},  # empty history -> zero totals, no KeyError
+    }
+    bootstrap_pnl_totals(s)
+    _assert_running_totals_match_history(s)
+    assert s.agent_pnl_total[1] == pytest.approx(99.6 - 40.0 + 12.5, abs=1e-9)
+    assert s.agent_pnl_by_book[1][0] == pytest.approx(99.6 + 12.5, abs=1e-9)
+    assert s.agent_pnl_by_book[1][1] == pytest.approx(-40.0, abs=1e-9)
+    assert s.agent_pnl_total[2] == pytest.approx(7.25, abs=1e-9)
+    assert s.agent_pnl_total[7] == 0.0

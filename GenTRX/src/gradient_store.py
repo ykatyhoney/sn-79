@@ -236,6 +236,14 @@ class GradientStore:
                     signature_version="s3v4",
                     s3={"addressing_style": "path"},
                     retries={"max_attempts": 3, "mode": "adaptive"},
+                    # Bound socket waits so a stuck LIST response (seen on
+                    # localnet minio during paginated `_restore_written_parquets`
+                    # at startup) can't wedge the whole process. botocore
+                    # default is unbounded; without these the gradient server
+                    # would hang on `_get_sync_client().get_paginator(...)`
+                    # forever instead of failing the LIST and proceeding.
+                    connect_timeout=15,
+                    read_timeout=60,
                     request_checksum_calculation="when_required",
                     response_checksum_validation="when_required",
                 ),

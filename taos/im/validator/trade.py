@@ -17,6 +17,42 @@ if TYPE_CHECKING:
     from taos.im.neurons.validator import Validator
 
 
+def _apply_pnl_delta(self: Validator, uid: int, book_id: int, delta: float) -> None:
+    """Incrementally update the (uid → book → pnl) and (uid → pnl) running
+    totals used by the MVTRX push payload's agent_pnl_book / agent_pnl
+    fields. Called from every site in this file that mutates
+    realized_pnl_history so the payload builder can read the totals
+    directly instead of re-walking the whole history (O(N*T*B)) each cycle.
+    Delta is the change to be added — positive for adds, negative for
+    removes. Zero delta is a no-op.
+    """
+    if delta == 0.0:
+        return
+    self.agent_pnl_by_book[uid][book_id] += delta
+    self.agent_pnl_total[uid] += delta
+
+
+def bootstrap_pnl_totals(self: Validator) -> None:
+    """Rebuild agent_pnl_by_book / agent_pnl_total from realized_pnl_history.
+    Called after state load and after any bulk rebuild of the history
+    (e.g. simulation restart / prune-shift). O(N*T*B) — the very cost the
+    running totals are designed to avoid on the hot path — but it runs
+    once at boot / restart, not per state cycle.
+    """
+    self.agent_pnl_by_book = defaultdict(lambda: defaultdict(float))
+    self.agent_pnl_total = defaultdict(float)
+    for uid, hist in self.realized_pnl_history.items():
+        per_book: dict[int, float] = {}
+        total = 0.0
+        for ts_d in hist.values():
+            for book_id, pnl in ts_d.items():
+                per_book[book_id] = per_book.get(book_id, 0.0) + pnl
+                total += pnl
+        for book_id, v in per_book.items():
+            self.agent_pnl_by_book[uid][book_id] = v
+        self.agent_pnl_total[uid] = total
+
+
 def match_trade_fifo(self: Validator, uid: int, book_id: int, is_buy: bool, quantity: float,
                     price: float, fee: float, timestamp: int) -> tuple[float, float]:
     """
@@ -420,6 +456,25 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
             pnl_hist = self.realized_pnl_history[uid_item]
             if not pnl_hist:
                 continue
+            # Sum pnl in timestamps that will be pruned so we can subtract
+            # the equivalent amount from the running totals — otherwise the
+            # push builder's agent_pnl_book would include already-pruned data.
+            # Batch the subtraction per (uid, book_id): the naive form did two
+            # dict writes per (ts, book_id) tuple (~3M/prune at mainnet
+            # cardinality), and prune fires every 60s under _reward_lock.
+            book_deltas = {}
+            uid_total_delta = 0.0
+            for ts, books in pnl_hist.items():
+                if ts >= lookback_threshold:
+                    continue
+                for book_id, pnl in books.items():
+                    book_deltas[book_id] = book_deltas.get(book_id, 0.0) - pnl
+                    uid_total_delta -= pnl
+            if book_deltas:
+                per_book = self.agent_pnl_by_book[uid_item]
+                for book_id, delta in book_deltas.items():
+                    per_book[book_id] = per_book.get(book_id, 0.0) + delta
+                self.agent_pnl_total[uid_item] = self.agent_pnl_total.get(uid_item, 0.0) + uid_total_delta
             self.realized_pnl_history[uid_item] = {
                 ts: books
                 for ts, books in pnl_hist.items()
@@ -456,8 +511,14 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
                 new_value = round(current + rounded_pnl, volume_decimals)
                 if new_value != 0.0:
                     ts_pnl[book_id] = new_value
+                    # Running-total maintenance: delta = new - current so the
+                    # rounded-value drift stays consistent with what's stored.
+                    _apply_pnl_delta(self, uid_item, book_id, new_value - current)
                 elif book_id in ts_pnl:
+                    # Explicit removal: subtract the entry we're deleting from
+                    # the running total so agent_pnl_book stays in sync.
                     del ts_pnl[book_id]
+                    _apply_pnl_delta(self, uid_item, book_id, -current)
     for uid_item, timestamps in roundtrip_volume_updates.items():
         for ts, books in timestamps.items():
             for book_id, rt_vol in books.items():

@@ -1205,25 +1205,39 @@ void MultiBookExchangeAgent::handleDistributedCancelOrders(const Message::Ptr&  
     const auto payload = std::static_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
     const auto subPayload = std::static_pointer_cast<CancelOrdersPayload>(payload->payload);
 
-    if (m_replayLog) {
-        m_replayEventLoggers.at(subPayload->bookId)->log(msg);
-    }
-
     const auto bookId = subPayload->bookId;
-    const auto book = m_books[bookId];
 
     std::vector<taosim::event::Cancellation> cancellations;
     std::vector<taosim::event::Cancellation> failures;
-    for (const auto& cancellation : subPayload->cancellations) {        
-        if (book->cancelOrder(cancellation.id, cancellation.volume)) {
-            cancellations.push_back(cancellation);
-            m_signals[bookId]->cancelLog(CancellationWithLogContext(
-                cancellation,
-                std::make_shared<CancellationLogContext>(
-                    payload->agentId, bookId, simulation()->currentTimestamp())));
-        }
-        else {
+
+    if (bookId >= m_books.size()) {
+        for (const auto& cancellation : subPayload->cancellations) {
             failures.push_back(cancellation);
+        }
+    }
+    else {
+        if (m_replayLog) {
+            m_replayEventLoggers.at(bookId)->log(msg);
+        }
+
+        const auto book = m_books[bookId];
+        const auto& order2ctx = book->orderToClientInfo();
+        for (const auto& cancellation : subPayload->cancellations) {
+            auto ctxIt = order2ctx.find(cancellation.id);
+            if (ctxIt == order2ctx.end() || ctxIt->second.agentId != payload->agentId) {
+                failures.push_back(cancellation);
+                continue;
+            }
+            if (book->cancelOrder(cancellation.id, cancellation.volume)) {
+                cancellations.push_back(cancellation);
+                m_signals[bookId]->cancelLog(CancellationWithLogContext(
+                    cancellation,
+                    std::make_shared<CancellationLogContext>(
+                        payload->agentId, bookId, simulation()->currentTimestamp())));
+            }
+            else {
+                failures.push_back(cancellation);
+            }
         }
     }
 

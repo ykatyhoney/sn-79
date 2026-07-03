@@ -45,7 +45,7 @@ if __name__ != "__mp_main__":
     import bittensor as bt
 
     from taos.common.neurons import BaseNeuron
-    from taos.im.neurons.miner import Miner
+    from taos.im.neurons.miner import Miner, _HAS_PROTOCOL_EXCHANGE
 
     class BenchmarkMiner(Miner):
         """
@@ -164,11 +164,19 @@ if __name__ != "__mp_main__":
                 forward_fn=self.update,
                 blacklist_fn=self.blacklist_update,
                 priority_fn=self.priority_update,
-            ).attach(
-                forward_fn=self.forward_exchange,
-                blacklist_fn=self.blacklist_forward_exchange,
-                priority_fn=self.priority_forward_exchange,
             )
+            # Exchange-mode handler — gate on real taos.im.protocol.exchange
+            # being importable. The public release ships a pydantic sentinel
+            # ExchangeStateUpdate (miner.py:61) that does NOT inherit from
+            # bittensor.Synapse; unconditionally attaching would trip
+            # `assert issubclass(param_class, Synapse)` inside axon.attach.
+            # Miner.__init__ already gates its own exchange attach the same way.
+            if _HAS_PROTOCOL_EXCHANGE:
+                self.axon.attach(
+                    forward_fn=self.forward_exchange,
+                    blacklist_fn=self.blacklist_forward_exchange,
+                    priority_fn=self.priority_forward_exchange,
+                )
             # Attach GenTRX assignment handler (inherited from Miner).
             # Benchmark miners participate in GenTRX training when
             # GENTRX_AGENT_S3_* env vars are set; handler is a no-op otherwise.

@@ -752,6 +752,14 @@ if __name__ != "__mp_main__":
             self._saving_lock = Lock()
             self._reporting_lock = Lock()
             self._reward_lock = asyncio.Lock()
+            # Dedicated executor for MVTRX data-service push construction so it
+            # doesn't contend with reporting on reporting_ipc_executor
+            # (max_workers=4, already used by reporting's prep/serialize).
+            # Small pool because payload build is CPU-bound and GIL-limited —
+            # more workers don't help throughput, just headroom for backpressure.
+            self._mvtrx_push_executor = ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix='mvtrx_push'
+            )
             self._setup_signal_handlers()
             self._cleanup_done = False
             atexit.register(self.cleanup)
@@ -1494,20 +1502,22 @@ if __name__ != "__mp_main__":
             total_realized_pnl = {}
             realized_pnl_by_book = {}
 
-            for uid, hist in self.realized_pnl_history.items():
-                if not hist:
-                    total_realized_pnl[uid] = 0.0
-                    realized_pnl_by_book[uid] = {book_id: 0.0 for book_id in range(book_count)}
-                    continue
-
-                book_totals = [0.0] * book_count
-                for _ts, timestamp_data in hist.items():
-                    for book_id, pnl in timestamp_data.items():
-                        if book_id < len(book_totals):
-                            book_totals[book_id] += pnl
-
-                realized_pnl_by_book[uid] = {book_id: book_totals[book_id] for book_id in range(book_count)}
-                total_realized_pnl[uid] = sum(book_totals)
+            # Read from the incrementally-maintained running totals instead of
+            # re-summing realized_pnl_history[uid][ts][book_id] every call. The
+            # sum is O(N*T*B) (~66M ops on mainnet at N=259, T~2000, B=128) and
+            # this function runs under _reward_lock, blocking every subsequent
+            # _reward for its duration. The running totals are kept in sync by
+            # trade.py:_apply_pnl_delta on write/delete/prune and rebuilt on
+            # startup + sim-restart by persistence.bootstrap_pnl_totals — so
+            # this is byte-identical to the old loop but constant-time per UID.
+            _pnl_by_book = self.agent_pnl_by_book
+            _pnl_total = self.agent_pnl_total
+            for uid in self.realized_pnl_history.keys():
+                book_totals_dict = _pnl_by_book.get(uid, {})
+                realized_pnl_by_book[uid] = {
+                    book_id: book_totals_dict.get(book_id, 0.0) for book_id in range(book_count)
+                }
+                total_realized_pnl[uid] = _pnl_total.get(uid, 0.0)
 
             bt.logging.debug(f"Computed realized P&L totals ({time.time()-pnl_start:.4f}s)")
 
@@ -1532,19 +1542,22 @@ if __name__ != "__mp_main__":
             bt.logging.debug("Serializing volume sums...")
             serialize_start = time.time()
 
-            def serialize_nested_dict(d):
-                return {
-                    f"{uid}:{book_id}": vol
-                    for uid, books in d.items()
-                    for book_id, vol in books.items()
-                }
+            # Send nested {uid: {book_id: vol}} directly. msgpack packs int keys
+            # and the reporting side unpacks with strict_map_key=False, so the
+            # previous flatten to "uid:book_id" strings here (6 dicts x ~N*B
+            # f-string builds) and matching split() back in the report subprocess
+            # was pure round-trip overhead on the reward-lock-held prep path.
+            # The two-level copy snapshots the live defaultdicts for thread-safe
+            # msgpack packing (same concurrency profile as the old flatten).
+            def _nested_snapshot(d):
+                return {uid: dict(books) for uid, books in d.items()}
 
-            volume_sums_flat = serialize_nested_dict(self.volume_sums)
-            maker_volume_sums_flat = serialize_nested_dict(self.maker_volume_sums)
-            taker_volume_sums_flat = serialize_nested_dict(self.taker_volume_sums)
-            self_volume_sums_flat = serialize_nested_dict(self.self_volume_sums)
-            fee_sums_flat = serialize_nested_dict(getattr(self, 'fee_sums', {}))
-            roundtrip_volume_sums_flat = serialize_nested_dict(self.roundtrip_volume_sums)
+            volume_sums_flat = _nested_snapshot(self.volume_sums)
+            maker_volume_sums_flat = _nested_snapshot(self.maker_volume_sums)
+            taker_volume_sums_flat = _nested_snapshot(self.taker_volume_sums)
+            self_volume_sums_flat = _nested_snapshot(self.self_volume_sums)
+            fee_sums_flat = _nested_snapshot(getattr(self, 'fee_sums', {}))
+            roundtrip_volume_sums_flat = _nested_snapshot(self.roundtrip_volume_sums)
 
             bt.logging.debug(f"Serialized volume sums ({time.time()-serialize_start:.4f}s)")
 
@@ -1717,6 +1730,17 @@ if __name__ != "__mp_main__":
 
             bt.logging.debug(f"Assembled final structure ({time.time()-final_start:.4f}s)")
 
+            # One-line prep breakdown at INFO (sections run sequentially, so each
+            # duration is next_start - this_start) so the dominant contributor to
+            # prep is visible without enabling DEBUG. Cheap; ~1 line per report.
+            bt.logging.info(
+                "Reporting prep breakdown (s): "
+                f"pnl={inv_start-pnl_start:.2f} inv={serialize_start-inv_start:.2f} "
+                f"volser={meta_start-serialize_start:.2f} meta={trades_start-meta_start:.2f} "
+                f"trades={state_start-trades_start:.2f} state={pos_start-state_start:.2f} "
+                f"pos={final_start-pos_start:.2f} final={time.time()-final_start:.2f}"
+            )
+
             return data
 
         async def _report(self):
@@ -1763,6 +1787,7 @@ if __name__ != "__mp_main__":
                         self._prepare_reporting_data
                     )
                 prep_time = time.time() - prep_start
+                published_step = data.get('step') if isinstance(data, dict) else None
                 bt.logging.info(f"Prepared reporting data ({prep_time:.4f}s)")
 
                 serialize_start = time.time()
@@ -1841,6 +1866,17 @@ if __name__ != "__mp_main__":
                 time.time()
                 result = msgpack.unpackb(result_bytes, raw=False, strict_map_key=False)
                 bt.logging.info(f"Read reporting response data ({time.time()-read_start:.4f}s | {result_mb:.2f}MB)")
+                # Reject a stale/mismatched response: under backlog the validator can
+                # pick up a prior cycle's signal and read the wrong cycle's result from
+                # shared memory. The subprocess echoes the step it processed; if it does
+                # not match the step we published, discard rather than ingest stale stats.
+                _resp_step = result.get('step') if isinstance(result, dict) else None
+                if _resp_step is not None and published_step is not None and _resp_step != published_step:
+                    bt.logging.warning(
+                        f"Discarding stale reporting response: got step {_resp_step}, "
+                        f"expected {published_step} (desync — not ingesting stale stats)"
+                    )
+                    return
                 self.initial_balances_published = result['initial_balances_published']
                 self.miner_stats = result['miner_stats']
 
@@ -1899,6 +1935,10 @@ if __name__ != "__mp_main__":
                     start = time.time()
 
                     try:
+                        # Sync mutation on _reward's coroutine — atomic against
+                        # other coroutines (no awaits inside update_trade_volumes)
+                        # and against the MVTRX push builder via the two-step
+                        # atomic-snapshot pattern in _build_sim_push_payload.
                         self._update_trade_volumes(state)
                         if timestamp % self.config.scoring.interval != 0:
                             bt.logging.info(f"Agent Scores Data Updated for {duration} ({time.time()-start:.4f}s)")
@@ -1954,6 +1994,282 @@ if __name__ != "__mp_main__":
             bt.logging.debug(f"[REWARD] Scheduling from thread: {threading.current_thread().name}")
             bt.logging.debug(f"[REWARD] Main loop ID: {id(self.main_loop)}, Current loop ID: {id(asyncio.get_event_loop())}")
             self.main_loop.call_soon_threadsafe(lambda: self.main_loop.create_task(self._reward(state)))
+
+        def _build_sim_push_payload(self, state) -> dict:
+            """Build the MVTRX data-service push payload for a simulation state update.
+
+            Runs in _mvtrx_push_executor via _push_sim_state_bg. The former
+            hot loop (agent_pnl_book re-summing realized_pnl_history O(N*T*B)
+            per push) was the last remaining Python-CPU spike per state cycle
+            in 0.5.x. It's been eliminated by maintaining agent_pnl_by_book /
+            agent_pnl_total as incremental running totals in trade.py, which
+            reduces the pnl aggregation portion of the push builder from
+            ~5-7s to a direct dict read.
+
+            The remaining volatile-dict reads (volume_sums, fee_sums, etc.)
+            are already O(N*B) — tiny compared to what was replaced. They use
+            a two-step atomic dict.copy() pattern to stay race-safe against
+            trade.py's concurrent mutations (single C-level PyDict_Copy holds
+            the GIL throughout, so no interleaving).
+            """
+            _sim_fills: list = []
+            _sim_rejects: list = []
+            _seen_trade_ids: set = set()
+            for _uid_str, _evs in (getattr(state, 'notices', {}) or {}).items():
+                for _ev in (_evs or []):
+                    if not isinstance(_ev, dict):
+                        continue
+                    _ev_type = _ev.get("y") or _ev.get("type")
+                    if _ev_type in ("ET", "EVENT_TRADE"):
+                        _tid = _ev.get("i") if _ev.get("i") is not None else _ev.get("tradeId")
+                        if _tid is None:
+                            continue
+                        _book_id = _ev.get("b") if _ev.get("b") is not None else _ev.get("bookId")
+                        _price   = float(_ev.get("p") or _ev.get("price") or 0)
+                        _qty     = float(_ev.get("q") or _ev.get("quantity") or 0)
+                        _side    = int(_ev.get("s") if _ev.get("s") is not None else _ev.get("side", 0))
+                        _taker   = _ev.get("Ta") if _ev.get("Ta") is not None else _ev.get("takerAgentId")
+                        _maker   = _ev.get("Ma") if _ev.get("Ma") is not None else _ev.get("makerAgentId")
+                        _ti      = _ev.get("Ti")
+                        _mi      = _ev.get("Mi")
+                        _cr_raw  = _ev.get("cr", 0) or 0
+                        _cr      = "SL" if _cr_raw == 1 else ("TP" if _cr_raw == 2 else None)
+                        _toi     = _ev.get("Toi") or None
+                        for _agent_uid, _is_taker in ((_taker, True), (_maker, False)):
+                            if _agent_uid is None:
+                                continue
+                            _key = (_tid, int(_agent_uid))
+                            if _key in _seen_trade_ids:
+                                continue
+                            _seen_trade_ids.add(_key)
+                            _dir  = _side if _is_taker else (1 - _side)
+                            _oid  = _ti if _is_taker else _mi
+                            _fill_cr  = _cr if _is_taker else None
+                            _fill_toi = _toi if (_is_taker and _cr) else None
+                            _sim_fills.append({
+                                "uid":              int(_agent_uid),
+                                "netuid":           int(_book_id) if _book_id is not None else 0,
+                                "price":            _price,
+                                "qty":              _qty,
+                                "alpha_volume":     _qty,
+                                "tao_volume":       round(_price * _qty, 9),
+                                "direction":        _dir,
+                                "side":             "buy" if _dir == 0 else "sell",
+                                "role":             "taker" if _is_taker else "maker",
+                                "trade_id":         _tid,
+                                "order_id":         int(_oid) if _oid is not None else None,
+                                "close_reason":     _fill_cr,
+                                "linked_order_id":  int(_fill_toi) if _fill_toi is not None else None,
+                                "maker_uid":        int(_maker) if _maker is not None else None,
+                                "is_partial":       False,
+                                "timestamp":        state.timestamp,
+                            })
+                    elif _ev_type in ("ERDPOL", "ERDPOM"):
+                        _agent_uid = _ev.get("a") if _ev.get("a") is not None else _ev.get("agentId")
+                        if _agent_uid is None:
+                            continue
+                        _seen_rej = (_ev_type, int(_agent_uid))
+                        if _seen_rej in _seen_trade_ids:
+                            continue
+                        _seen_trade_ids.add(_seen_rej)
+                        _sim_rejects.append({
+                            "uid":    int(_agent_uid),
+                            "netuid": int(_ev.get("b") if _ev.get("b") is not None else (_ev.get("bookId") or 0)),
+                            "reason": _ev.get("m") or _ev.get("message") or "rejected",
+                            "side":   int(_ev.get("s") if _ev.get("s") is not None else _ev.get("side", 0)),
+                            "qty":    float(_ev.get("q") or _ev.get("quantity") or 0),
+                            "price":  float(_ev.get("p") or _ev.get("price") or 0),
+                        })
+            _sim_open_orders: dict = {}
+            _sim_orders_detail: dict = {}
+            for _uid_str, _uid_data in (getattr(state, 'accounts', {}) or {}).items():
+                try:
+                    _uid = int(_uid_str)
+                    if not isinstance(_uid_data, dict):
+                        continue
+                    for _nid_str, _acct in _uid_data.items():
+                        if not isinstance(_acct, dict):
+                            continue
+                        for _o in (_acct.get('o') or []):
+                            if not isinstance(_o, dict):
+                                continue
+                            _sim_open_orders[_uid] = _sim_open_orders.get(_uid, 0) + 1
+                            _sim_orders_detail.setdefault(_uid, []).append({
+                                "order_id":  _o.get('i') or _o.get('id'),
+                                "netuid":    int(_nid_str),
+                                "side":      int(_o.get('s', _o.get('side', 0))),
+                                "price":     float(_o.get('p', _o.get('price', 0))),
+                                "quantity":  float(_o.get('q', _o.get('quantity', 0))),
+                                "placed_at": int(_o.get('t') or 0) // 1_000_000,
+                            })
+                except Exception:
+                    continue
+            # Two-step atomic snapshot — no lock. Each dict(some_dict) call is a
+            # single C-level PyDict_Copy that holds the GIL for the whole copy,
+            # so mutations from other Python threads (trade.py inside _reward,
+            # etc.) cannot preempt during it. Step A snapshots the OUTER level
+            # atomically. Step B iterates the STABLE snapshot to produce inner
+            # copies — safe because the snapshot's key set is fixed, and each
+            # dict(v) inside the comprehension is itself atomic.
+            #
+            # A single-step comprehension `{u: dict(h) for u, h in self.X.items()}`
+            # is NOT safe: the outer for-loop is multiple bytecodes and a
+            # concurrent add to self.X during iteration raises
+            # `RuntimeError: dictionary changed size during iteration`.
+            # Splitting into two atomic steps eliminates that window.
+            _vs_outer  = dict(getattr(self, 'volume_sums', {}))
+            _mvs_outer = dict(getattr(self, 'maker_volume_sums', {}))
+            _tvs_outer = dict(getattr(self, 'taker_volume_sums', {}))
+            _fs_outer  = dict(getattr(self, 'fee_sums', {}))
+            _rt_outer  = dict(getattr(self, 'roundtrip_volume_sums', {}))
+            _af_outer  = dict(getattr(self, 'activity_factors', {}))
+            _snap_kv   = dict(getattr(self, 'kappa_values', {}))
+            _snap_scores = list(self.scores) if getattr(self, 'scores', None) is not None else None
+            # MVTRX push agent_pnl / agent_pnl_book: read pre-aggregated running
+            # totals maintained incrementally by trade.py, NOT re-walk of
+            # realized_pnl_history (which cost ~5-7s of Python CPU per push
+            # cycle at N=259 UIDs × T~2000 timestamps × B=128 books).
+            _snap_pnl_book  = {u: dict(b) for u, b in dict(getattr(self, 'agent_pnl_by_book', {})).items()}
+            _snap_pnl_total = dict(getattr(self, 'agent_pnl_total', {}))
+            _snap_vs   = {u: dict(b) for u, b in _vs_outer.items()}
+            _snap_mvs  = {u: dict(b) for u, b in _mvs_outer.items()}
+            _snap_tvs  = {u: dict(b) for u, b in _tvs_outer.items()}
+            _snap_fs   = {u: dict(b) for u, b in _fs_outer.items()}
+            _snap_rt   = {u: dict(b) for u, b in _rt_outer.items()}
+            _snap_af   = {u: dict(b) for u, b in _af_outer.items()}
+            def _sv(d):
+                return {str(uid): sum(float(v) for v in list(bks.values()))
+                        for uid, bks in list(d.items()) if bks}
+            _vs  = _sv(_snap_vs)
+            _mvs = _sv(_snap_mvs)
+            _tvs = _sv(_snap_tvs)
+            _pnl = {str(uid): round(float(v), 6) for uid, v in _snap_pnl_total.items() if v != 0.0}
+            _sc  = _snap_scores
+            _sc_dict = ({str(i): float(_sc[i]) for i in range(len(_sc))}
+                        if _sc is not None else {})
+            _kappa_raw   = {}
+            _kappa_score = {}
+            _kappa_books = {}
+            _kappa_books_w = {}
+            for _kuid, _kv in _snap_kv.items():
+                if _kv and isinstance(_kv, dict):
+                    if _kv.get('total') is not None:
+                        _kappa_raw[str(_kuid)] = float(_kv['total'])
+                    if _kv.get('normalized_total') is not None:
+                        _kappa_score[str(_kuid)] = float(_kv['normalized_total'])
+                    _bks = {str(bid): float(v) for bid, v in (_kv.get('books') or {}).items() if v is not None}
+                    if _bks:
+                        _kappa_books[str(_kuid)] = _bks
+                    _bw = {str(bid): float(v) for bid, v in (_kv.get('books_weighted') or {}).items() if v is not None}
+                    if _bw:
+                        _kappa_books_w[str(_kuid)] = _bw
+            _book_vol: dict = {}
+            for _uid_bk, _bk_dict in _snap_vs.items():
+                for _bid, _bvol in _bk_dict.items():
+                    _book_vol[int(_bid)] = _book_vol.get(int(_bid), 0.0) + float(_bvol)
+            _sim_pools: dict = dict(state.pools or {})
+            for _bid, _bvol in _book_vol.items():
+                _bk = _sim_pools.get(_bid) or _sim_pools.get(str(_bid))
+                if _bk is not None:
+                    _bk['volume_24h'] = round(_bvol, 4)
+            _sim_live_triggers = dict(getattr(getattr(self, 'engine', None), '_live_triggers', {}))
+            if hasattr(self.engine, '_sltp_changed'):
+                self.engine._sltp_changed = False
+            return {
+                "mode":                "simulation",
+                "simulation_id":       getattr(self.simulation, 'simulation_id', None),
+                "timestamp":           state.timestamp,
+                "block":               state.block,
+                "books":               state.books or {},
+                "accounts":            state.accounts or {},
+                "pools":               _sim_pools,
+                "benchmark_agents":    [{"uid": _ba["uid"], "coldkey": _ba.get("coldkey", ""), "hotkey": _ba.get("hotkey", ""), "name": _ba.get("name", "")} for _ba in getattr(self, 'benchmark_agents', [])],
+                "reconciliation":      {"fills": _sim_fills, "rejections": _sim_rejects},
+                "notices":             {str(k): list(v) for k, v in (state.notices or {}).items()},
+                "agent_open_orders":   _sim_open_orders,
+                "agent_orders_detail": _sim_orders_detail,
+                "validator_uid":       getattr(self, 'uid', None),
+                "chain_block":         getattr(self, 'current_block', None),
+                "metagraph":           (lambda _m: {
+                    "hotkeys":         [str(hk) for hk in _m.hotkeys],
+                    "coldkeys":        [str(ck) for ck in _m.coldkeys] if hasattr(_m, 'coldkeys') else [],
+                    "stake":           _m.stake.tolist(),
+                    "emission":        _m.emission.tolist(),
+                    "incentive":       _m.incentive.tolist(),
+                    "validator_trust": _m.validator_trust.tolist(),
+                    "validator_permit":[bool(v) for v in _m.validator_permit] if hasattr(_m, 'validator_permit') else [],
+                    "dividends":       _m.dividends.tolist() if hasattr(_m, 'dividends') else [],
+                    "last_update":     _m.last_update.tolist() if hasattr(_m, 'last_update') else [],
+                } if _m is not None else {})(getattr(self, 'metagraph', None)),
+                "agent_scores":        _sc_dict,
+                "agent_kappa":         _kappa_raw,
+                "agent_kappa_score":   _kappa_score,
+                "agent_kappa_books":   _kappa_books,
+                "agent_kappa_books_w": _kappa_books_w,
+                "agent_volume":        _vs,
+                "agent_maker_volume":  _mvs,
+                "agent_taker_volume":  _tvs,
+                "agent_pnl":           _pnl,
+                "agent_pnl_book":      {str(uid): {str(bid): round(float(v), 6)
+                                        for bid, v in bks.items() if v != 0}
+                                       for uid, bks in _snap_pnl_book.items() if bks},
+                "agent_volume_book":   {str(uid): {str(bid): round(float(v), 4)
+                                        for bid, v in bks.items() if v}
+                                       for uid, bks in _snap_vs.items() if bks},
+                "agent_fee_book":      {str(uid): {str(bid): round(float(v), 6)
+                                        for bid, v in bks.items() if v != 0}
+                                       for uid, bks in _snap_fs.items() if bks},
+                "agent_roundtrip_volume": {str(uid): round(float(sum(bks.values())), 4)
+                                           for uid, bks in _snap_rt.items() if bks},
+                "agent_activity_factor":   {str(uid): round(float(sum(bks.values()) / len(bks)), 4)
+                                            for uid, bks in _snap_af.items() if bks},
+                "agent_median_kappa":      {str(uid): round(float(kv.get('activity_weighted_normalized_median') or 0), 6)
+                                           for uid, kv in _snap_kv.items() if kv},
+                "fee_policy":              ({"fee_type": self.simulation.fee_policy.fee_type,
+                                            **{k: float(v) for k, v in self.simulation.fee_policy.params.items()
+                                               if k in ("targetMTR", "makerFee", "takerFee", "maxMakerRate", "maxTakerRate")}}
+                                           if getattr(self.simulation, 'fee_policy', None) else None),
+                "exchange_constraints":    ({"min_order_size":     float(getattr(self.simulation, 'min_order_size', 0.0)),
+                                             "max_open_orders":    int(getattr(self.simulation, 'max_open_orders', 0) or 0),
+                                             "max_leverage":       float(getattr(self.simulation, 'max_leverage', 0)),
+                                             "max_loan":           float(getattr(self.simulation, 'max_loan', 0)),
+                                             "maintenance_margin": float(getattr(self.simulation, 'maintenance_margin', 0)),
+                                             "price_decimals":     int(getattr(self.simulation, 'priceDecimals', 4)),
+                                             "volume_decimals":    int(getattr(self.simulation, 'volumeDecimals', 4)),
+                                             "init_price":         float(getattr(self.simulation, 'init_price', 0)),
+                                             "time_unit":          str(getattr(self.simulation, 'time_unit', 'ns')),
+                                             "grace_period":       int(getattr(self.simulation, 'grace_period', 0)),
+                                            }
+                                           if getattr(self, 'simulation', None) else None),
+                "sltp_triggers": _sim_live_triggers,
+            }
+
+        async def _push_sim_state_bg(self, state, url: str) -> None:
+            """Async wrapper: build the MVTRX push payload in a dedicated
+            executor pool (_mvtrx_push_executor), then POST it. Introduced to
+            move ~7-11s of Python payload construction off the main event loop;
+            the main loop was falling ~6x behind the 5s scoring interval
+            because agent_pnl_book iterates realized_pnl_history for every UID
+            (259 UIDs × ~2000 timestamps × 128 books).
+
+            Race handling: no lock. _build_sim_push_payload uses a two-step
+            atomic-snapshot pattern (outer dict.copy() first, then inner
+            copies over the stable snapshot) — safe against trade.py mutations
+            in _reward because each dict() call is a single C-level
+            PyDict_Copy that holds the GIL. Removes lock contention that was
+            blocking _reward and causing "waiting for rewarding to catch up"
+            (5+ pending tasks blocking queries).
+            """
+            try:
+                loop = asyncio.get_event_loop()
+                payload = await loop.run_in_executor(
+                    self._mvtrx_push_executor,
+                    self._build_sim_push_payload,
+                    state,
+                )
+                await _push_mvtrx(payload, url=url)
+            except Exception as _exc:
+                bt.logging.warning(f"_push_sim_state_bg failed: {_exc}")
 
         async def handle_state(self, state: NormalizedState, receive_start: float) -> dict:
             """
@@ -2012,22 +2328,17 @@ if __name__ != "__mp_main__":
             # Process deregistration notices
             self.process_resets(state)
 
-            # GenTRX: push state to gradient server before the mining query.
-            # Offloaded to a thread for the msgpack packing, and time-bounded so
-            # a slow/hung gradient server can never stall the validator's hot
-            # path (state -> query -> reward -> weights). On timeout the executor
-            # thread keeps running harmlessly (push_state is enqueue-only); we
-            # just stop awaiting and proceed.
+            # GenTRX: enqueue the raw state for the background packager.
+            # As of PR-1 of the GenTRX isolation plan, push_state() does
+            # NO extract_state / msgpack work synchronously — it just
+            # appends a state-object reference to a bounded queue (drop-
+            # oldest on overflow), which is sub-millisecond. The heavy
+            # extract + pack runs on `GenTRX-pack` worker thread, the
+            # HTTP POST on `GenTRX-tx` worker thread. Neither sits on
+            # the validator's hot path.
             if self._gentrx is not None:
                 try:
-                    await asyncio.wait_for(
-                        asyncio.get_event_loop().run_in_executor(
-                            None, self._gentrx.push_state, state
-                        ),
-                        timeout=10.0,
-                    )
-                except asyncio.TimeoutError:
-                    gtx_log.warning("handle_state push_state exceeded 10s — proceeding without it")
+                    self._gentrx.push_state(state)
                 except Exception as _gex:
                     bt.logging.warning(f"[GTX] handle_state push_state error: {_gex}")
 
@@ -2227,224 +2538,17 @@ if __name__ != "__mp_main__":
                     response['responses'].extend(_ext)
                     self.engine._external_instructions = []
                     bt.logging.info(f"Injected {len(_ext)} external order(s) into simulation response")
-                # Push simulation state to MVTRX data service each tick
-                # ── Scan notices for fills (ET) and rejections (ERDPOL/ERDPOM) ──
-                _sim_fills: list = []
-                _sim_rejects: list = []
-                _seen_trade_ids: set = set()
-                for _uid_str, _evs in (getattr(state, 'notices', {}) or {}).items():
-                    for _ev in (_evs or []):
-                        if not isinstance(_ev, dict):
-                            continue
-                        _ev_type = _ev.get("y") or _ev.get("type")
-                        if _ev_type in ("ET", "EVENT_TRADE"):
-                            _tid = _ev.get("i") if _ev.get("i") is not None else _ev.get("tradeId")
-                            if _tid is None:
-                                continue
-                            _book_id = _ev.get("b") if _ev.get("b") is not None else _ev.get("bookId")
-                            _price   = float(_ev.get("p") or _ev.get("price") or 0)
-                            _qty     = float(_ev.get("q") or _ev.get("quantity") or 0)
-                            _side    = int(_ev.get("s") if _ev.get("s") is not None else _ev.get("side", 0))
-                            _taker   = _ev.get("Ta") if _ev.get("Ta") is not None else _ev.get("takerAgentId")
-                            _maker   = _ev.get("Ma") if _ev.get("Ma") is not None else _ev.get("makerAgentId")
-                            _ti      = _ev.get("Ti")   # taker order ID
-                            _mi      = _ev.get("Mi")   # maker order ID
-                            _cr_raw  = _ev.get("cr", 0) or 0
-                            _cr      = "SL" if _cr_raw == 1 else ("TP" if _cr_raw == 2 else None)
-                            _toi     = _ev.get("Toi") or None  # originating order ID (SL/TP only)
-                            for _agent_uid, _is_taker in ((_taker, True), (_maker, False)):
-                                if _agent_uid is None:
-                                    continue
-                                _key = (_tid, int(_agent_uid))
-                                if _key in _seen_trade_ids:
-                                    continue
-                                _seen_trade_ids.add(_key)
-                                _dir  = _side if _is_taker else (1 - _side)
-                                _oid  = _ti if _is_taker else _mi
-                                _fill_cr  = _cr if _is_taker else None
-                                _fill_toi = _toi if (_is_taker and _cr) else None
-                                _sim_fills.append({
-                                    "uid":              int(_agent_uid),
-                                    "netuid":           int(_book_id) if _book_id is not None else 0,
-                                    "price":            _price,
-                                    "qty":              _qty,
-                                    "alpha_volume":     _qty,
-                                    "tao_volume":       round(_price * _qty, 9),
-                                    "direction":        _dir,
-                                    "side":             "buy" if _dir == 0 else "sell",
-                                    "role":             "taker" if _is_taker else "maker",
-                                    "trade_id":         _tid,
-                                    "order_id":         int(_oid) if _oid is not None else None,
-                                    "close_reason":     _fill_cr,
-                                    "linked_order_id":  int(_fill_toi) if _fill_toi is not None else None,
-                                    "maker_uid":        int(_maker) if _maker is not None else None,
-                                    "is_partial":       False,
-                                    "timestamp":        state.timestamp,
-                                })
-                        elif _ev_type in ("ERDPOL", "ERDPOM"):
-                            _agent_uid = _ev.get("a") if _ev.get("a") is not None else _ev.get("agentId")
-                            if _agent_uid is None:
-                                continue
-                            _seen_rej = (_ev_type, int(_agent_uid))
-                            if _seen_rej in _seen_trade_ids:
-                                continue
-                            _seen_trade_ids.add(_seen_rej)
-                            _sim_rejects.append({
-                                "uid":    int(_agent_uid),
-                                "netuid": int(_ev.get("b") if _ev.get("b") is not None else (_ev.get("bookId") or 0)),
-                                "reason": _ev.get("m") or _ev.get("message") or "rejected",
-                                "side":   int(_ev.get("s") if _ev.get("s") is not None else _ev.get("side", 0)),
-                                "qty":    float(_ev.get("q") or _ev.get("quantity") or 0),
-                                "price":  float(_ev.get("p") or _ev.get("price") or 0),
-                            })
-                # ── Extract open orders from accounts ─────────────────────────────
-                _sim_open_orders: dict = {}
-                _sim_orders_detail: dict = {}
-                for _uid_str, _uid_data in (getattr(state, 'accounts', {}) or {}).items():
-                    try:
-                        _uid = int(_uid_str)
-                        if not isinstance(_uid_data, dict):
-                            continue
-                        for _nid_str, _acct in _uid_data.items():
-                            if not isinstance(_acct, dict):
-                                continue
-                            for _o in (_acct.get('o') or []):
-                                if not isinstance(_o, dict):
-                                    continue
-                                _sim_open_orders[_uid] = _sim_open_orders.get(_uid, 0) + 1
-                                _sim_orders_detail.setdefault(_uid, []).append({
-                                    "order_id":  _o.get('i') or _o.get('id'),
-                                    "netuid":    int(_nid_str),
-                                    "side":      int(_o.get('s', _o.get('side', 0))),
-                                    "price":     float(_o.get('p', _o.get('price', 0))),
-                                    "quantity":  float(_o.get('q', _o.get('quantity', 0))),
-                                    "placed_at": int(_o.get('t') or 0) // 1_000_000,
-                                })
-                    except Exception:
-                        continue
-                # Build per-agent volume / pnl / score dicts for the data service.
-                # volume_sums / maker_volume_sums / taker_volume_sums:
-                #   defaultdict(uid → defaultdict(book_id → float)) — sum across books.
-                # realized_pnl_history: defaultdict(uid → defaultdict(ts → {book_id: pnl}))
-                def _sv(d):
-                    return {str(uid): sum(float(v) for v in list(bks.values()))
-                            for uid, bks in list(d.items()) if bks}
-                _vs  = _sv(getattr(self, 'volume_sums', {}))
-                _mvs = _sv(getattr(self, 'maker_volume_sums', {}))
-                _tvs = _sv(getattr(self, 'taker_volume_sums', {}))
-                _pnl = {str(uid): sum(p for ts_d in list(hist.values()) for p in list(ts_d.values()))
-                        for uid, hist in list((getattr(self, 'realized_pnl_history', {}) or {}).items()) if hist}
-                _sc  = getattr(self, 'scores', None)
-                _sc_dict = ({str(i): float(_sc[i]) for i in range(len(_sc))}
-                            if _sc is not None else {})
-                _kappa_raw   = {}
-                _kappa_score = {}
-                _kappa_books = {}        # per-book raw kappa: {uid: {book_id: float}}
-                _kappa_books_w = {}      # per-book weighted:  {uid: {book_id: float}}
-                for _kuid, _kv in getattr(self, 'kappa_values', {}).items():
-                    if _kv and isinstance(_kv, dict):
-                        if _kv.get('total') is not None:
-                            _kappa_raw[str(_kuid)] = float(_kv['total'])
-                        if _kv.get('normalized_total') is not None:
-                            _kappa_score[str(_kuid)] = float(_kv['normalized_total'])
-                        _bks = {str(bid): float(v) for bid, v in (_kv.get('books') or {}).items() if v is not None}
-                        if _bks:
-                            _kappa_books[str(_kuid)] = _bks
-                        _bw = {str(bid): float(v) for bid, v in (_kv.get('books_weighted') or {}).items() if v is not None}
-                        if _bw:
-                            _kappa_books_w[str(_kuid)] = _bw
-                # Augment pools with per-book 24H volume (sum across all agents)
-                _book_vol: dict = {}
-                for _uid_bk, _bk_dict in getattr(self, 'volume_sums', {}).items():
-                    for _bid, _bvol in _bk_dict.items():
-                        _book_vol[int(_bid)] = _book_vol.get(int(_bid), 0.0) + float(_bvol)
-                _sim_pools: dict = dict(state.pools or {})
-                for _bid, _bvol in _book_vol.items():
-                    _bk = _sim_pools.get(_bid) or _sim_pools.get(str(_bid))
-                    if _bk is not None:
-                        _bk['volume_24h'] = round(_bvol, 4)
-                _sim_live_triggers = dict(getattr(getattr(self, 'engine', None), '_live_triggers', {}))
-                if hasattr(self.engine, '_sltp_changed'):
-                    self.engine._sltp_changed = False
-                asyncio.create_task(_push_mvtrx({
-                    "mode":                "simulation",
-                    "simulation_id":       getattr(self.simulation, 'simulation_id', None),
-                    "timestamp":           state.timestamp,
-                    "block":               state.block,
-                    "books":               state.books or {},
-                    "accounts":            state.accounts or {},
-                    "pools":               _sim_pools,
-                    "benchmark_agents":    [{"uid": _ba["uid"], "coldkey": _ba.get("coldkey", ""), "hotkey": _ba.get("hotkey", ""), "name": _ba.get("name", "")} for _ba in getattr(self, 'benchmark_agents', [])],
-                    "reconciliation":      {"fills": _sim_fills, "rejections": _sim_rejects},
-                    "notices":             {str(k): list(v) for k, v in (state.notices or {}).items()},
-                    "agent_open_orders":   _sim_open_orders,
-                    "agent_orders_detail": _sim_orders_detail,
-                    "validator_uid":       getattr(self, 'uid', None),
-                    "chain_block":         getattr(self, 'current_block', None),
-                    "metagraph":           (lambda _m: {
-                        "hotkeys":         [str(hk) for hk in _m.hotkeys],
-                        "coldkeys":        [str(ck) for ck in _m.coldkeys] if hasattr(_m, 'coldkeys') else [],
-                        "stake":           _m.stake.tolist(),
-                        "emission":        _m.emission.tolist(),
-                        "incentive":       _m.incentive.tolist(),
-                        "validator_trust": _m.validator_trust.tolist(),
-                        "validator_permit":[bool(v) for v in _m.validator_permit] if hasattr(_m, 'validator_permit') else [],
-                        "dividends":       _m.dividends.tolist() if hasattr(_m, 'dividends') else [],
-                        "last_update":     _m.last_update.tolist() if hasattr(_m, 'last_update') else [],
-                    } if _m is not None else {})(getattr(self, 'metagraph', None)),
-                    "agent_scores":        _sc_dict,
-                    "agent_kappa":         _kappa_raw,
-                    "agent_kappa_score":   _kappa_score,
-                    "agent_kappa_books":   _kappa_books,
-                    "agent_kappa_books_w": _kappa_books_w,
-                    "agent_volume":        _vs,
-                    "agent_maker_volume":  _mvs,
-                    "agent_taker_volume":  _tvs,
-                    "agent_pnl":           _pnl,
-                    # NB: dict(...) snapshots the OUTER mapping before iteration. These
-                    # dicts (realized_pnl_history, volume_sums, fee_sums, roundtrip_volume_sums,
-                    # activity_factors, kappa_values) get mutated from concurrent async tasks
-                    # (state-update handler at l.1302, trade.py:417-449, etc.). Without the
-                    # snapshot, building this push payload races with key adds and raises
-                    # RuntimeError: dictionary changed size during iteration. Inner dicts (bks)
-                    # are smaller and only mutated within a single state-update cycle, so the
-                    # race window is narrower — fixed here only at the outer level.
-                    "agent_pnl_book":      {str(uid): {str(bid): round(float(v), 6)
-                                            for bid, v in (
-                                                {bid: sum(ts_d.get(bid, 0) for ts_d in hist.values())
-                                                 for bid in set(bid for ts_d in hist.values() for bid in ts_d)}
-                                            ).items() if v != 0}
-                                           for uid, hist in dict(getattr(self, 'realized_pnl_history', {})).items() if hist},
-                    "agent_volume_book":   {str(uid): {str(bid): round(float(v), 4)
-                                            for bid, v in bks.items() if v}
-                                           for uid, bks in dict(getattr(self, 'volume_sums', {})).items() if bks},
-                    "agent_fee_book":      {str(uid): {str(bid): round(float(v), 6)
-                                            for bid, v in bks.items() if v != 0}
-                                           for uid, bks in dict(getattr(self, 'fee_sums', {})).items() if bks},
-                    "agent_roundtrip_volume": {str(uid): round(float(sum(bks.values())), 4)
-                                               for uid, bks in dict(getattr(self, 'roundtrip_volume_sums', {})).items() if bks},
-                    "agent_activity_factor":   {str(uid): round(float(sum(bks.values()) / len(bks)), 4)
-                                                for uid, bks in dict(getattr(self, 'activity_factors', {})).items() if bks},
-                    "agent_median_kappa":      {str(uid): round(float(kv.get('activity_weighted_normalized_median') or 0), 6)
-                                               for uid, kv in dict(getattr(self, 'kappa_values', {})).items() if kv},
-                    "fee_policy":              ({"fee_type": self.simulation.fee_policy.fee_type,
-                                                **{k: float(v) for k, v in self.simulation.fee_policy.params.items()
-                                                   if k in ("targetMTR", "makerFee", "takerFee", "maxMakerRate", "maxTakerRate")}}
-                                               if getattr(self.simulation, 'fee_policy', None) else None),
-                    "exchange_constraints":    ({"min_order_size":     float(getattr(self.simulation, 'min_order_size', 0.0)),
-                                                 "max_open_orders":    int(getattr(self.simulation, 'max_open_orders', 0) or 0),
-                                                 "max_leverage":       float(getattr(self.simulation, 'max_leverage', 0)),
-                                                 "max_loan":           float(getattr(self.simulation, 'max_loan', 0)),
-                                                 "maintenance_margin": float(getattr(self.simulation, 'maintenance_margin', 0)),
-                                                 "price_decimals":     int(getattr(self.simulation, 'priceDecimals', 4)),
-                                                 "volume_decimals":    int(getattr(self.simulation, 'volumeDecimals', 4)),
-                                                 "init_price":         float(getattr(self.simulation, 'init_price', 0)),
-                                                 "time_unit":          str(getattr(self.simulation, 'time_unit', 'ns')),
-                                                 "grace_period":       int(getattr(self.simulation, 'grace_period', 0)),
-                                                }
-                                               if getattr(self, 'simulation', None) else None),
-                    "sltp_triggers": _sim_live_triggers,
-                }, url=getattr(getattr(self.config, 'simulation', None), 'data_service_url', '') or getattr(getattr(self.config, 'exchange', None), 'data_service_url', '')))
+                # Push simulation state to MVTRX data service each tick. Payload
+                # construction is O(N * T * B) over realized_pnl_history and cost
+                # ~7-11s per state on the main event loop; offloaded to
+                # reporting_ipc_executor via _push_sim_state_bg. Skip when the URL
+                # isn't configured so we don't spawn no-op tasks every tick.
+                _push_url = (
+                    getattr(getattr(self.config, 'simulation', None), 'data_service_url', '')
+                    or getattr(getattr(self.config, 'exchange', None), 'data_service_url', '')
+                )
+                if _push_url:
+                    asyncio.create_task(self._push_sim_state_bg(state, _push_url))
 
             # GenTRX: poll for round advance and deliver assignments after the
             # mining query completes. Round-check stays triggered per state
@@ -2632,6 +2736,15 @@ if __name__ != "__mp_main__":
 
             try:
                 while True:
+                    # Shutdown guard: cleanup() sets _cleanup_done and tears down
+                    # the executors. Without this break the loop would keep
+                    # calling engine.receive() -> run_in_executor on dead
+                    # executors, catch "cannot schedule new futures after
+                    # shutdown", and spin a tight PD-alert loop (the shutdown
+                    # crash-loop). Exit cleanly instead.
+                    if getattr(self, '_cleanup_done', False):
+                        bt.logging.info("Shutdown in progress — exiting listener loop.")
+                        break
                     response = {"responses": []}
                     raw_message = None
                     try:
@@ -2639,13 +2752,23 @@ if __name__ != "__mp_main__":
                         if normalized_state is not None:
                             response = await self.handle_state(normalized_state, receive_start)
                     except Exception as ex:
+                        # Terminal teardown error: once the executors are gone,
+                        # run_in_executor raises "cannot schedule new futures
+                        # after shutdown". Retrying can never recover — break.
+                        if getattr(self, '_cleanup_done', False) or \
+                                "cannot schedule new futures after shutdown" in str(ex):
+                            bt.logging.info("Executors shut down — exiting listener loop.")
+                            break
                         traceback.print_exc()
                         self.pagerduty_alert(
                             f"Exception in listener loop: {ex}",
                             details={"trace": traceback.format_exc()}
                         )
                     finally:
-                        self.engine.respond(raw_message, response)
+                        # Don't attempt to respond during teardown — respond()
+                        # also hits run_in_executor/IPC on torn-down resources.
+                        if not getattr(self, '_cleanup_done', False):
+                            self.engine.respond(raw_message, response)
             finally:
                 pass
 

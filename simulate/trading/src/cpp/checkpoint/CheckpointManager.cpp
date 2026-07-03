@@ -11,8 +11,69 @@
 
 #include <fmt/chrono.h>
 
-#include <fstream>
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstring>
 #include <latch>
+#include <stdexcept>
+
+//-------------------------------------------------------------------------
+
+namespace
+{
+
+// Write `size` bytes from `data` to `path` (create/truncate), close. Raw POSIX
+// with explicit error checks rather than std::ofstream so a failed write (e.g.
+// disk full) THROWS instead of silently setting failbit — atomicWrite relies on
+// this to avoid renaming a truncated temp file over a good checkpoint. No fsync:
+// we want atomicity (via rename below), not power-loss durability, and per-file
+// fsync cost multi-second stalls per checkpoint (esp. on WSL2).
+void writeFile(const std::filesystem::path& path, const char* data, std::size_t size)
+{
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        throw std::runtime_error{fmt::format(
+            "open({}) failed: {}", path.string(), std::strerror(errno))};
+    }
+    std::size_t written = 0;
+    while (written < size) {
+        const auto n = ::write(fd, data + written, size - written);
+        if (n < 0) {
+            const auto err = errno;
+            ::close(fd);
+            throw std::runtime_error{fmt::format(
+                "write({}) failed: {}", path.string(), std::strerror(err))};
+        }
+        written += static_cast<std::size_t>(n);
+    }
+    ::close(fd);
+}
+
+// Atomically publish `size` bytes to `path`: write to a sibling temp file, then
+// rename it over the target. POSIX rename is atomic on the same filesystem, so a
+// process crash / restart mid-write leaves either the previous checkpoint or the
+// complete new one, never a truncated file. Throws on any failure (and removes
+// the temp) so the caller aborts rather than leaving a partial file at the real
+// path. Not fsync-backed: survives process crashes, not power loss (see A/B/C
+// tradeoff — atomicity was the goal, fsync's stall cost was not worth it).
+void atomicWrite(const std::filesystem::path& path, const char* data, std::size_t size)
+{
+    auto tmp = path;
+    tmp += ".tmp";
+    writeFile(tmp, data, size);
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        std::error_code rm_ec;
+        std::filesystem::remove(tmp, rm_ec);
+        throw std::runtime_error{fmt::format(
+            "rename({} -> {}) failed: {}", tmp.string(), path.string(), ec.message())};
+    }
+}
+
+}  // namespace
 
 //-------------------------------------------------------------------------
 
@@ -76,8 +137,7 @@ void CheckpointManager::saveCheckpointImpl()
     taosim::checkpoint::serialization::packCommon(packer, m_simuMngr);
 
     const auto commonCkptFile = m_latestCkptDir / fmt::format("common{}", s_fileExtension);
-    std::ofstream ofs{commonCkptFile, std::ios::binary};
-    ofs.write(stream.data(), stream.size());
+    atomicWrite(commonCkptFile, stream.data(), stream.size());
 
     // Blocks.
     std::latch latch{m_simuMngr->blockInfo().count};
@@ -85,14 +145,23 @@ void CheckpointManager::saveCheckpointImpl()
         boost::asio::post(
             *m_simuMngr->threadPool(),
             [&] {
-                taosim::serialization::BinaryStream stream;
-                msgpack::packer packer{stream};
-                taosim::checkpoint::serialization::packBlock(packer, *simulation);
+                // atomicWrite throws on failure; catch here so a block-write
+                // error is logged rather than escaping the thread-pool task
+                // (which would std::terminate), and — critically — so the latch
+                // is ALWAYS counted down. Skipping count_down() would leave
+                // latch.wait() below blocked forever and hang the simulation.
+                try {
+                    taosim::serialization::BinaryStream stream;
+                    msgpack::packer packer{stream};
+                    taosim::checkpoint::serialization::packBlock(packer, *simulation);
 
-                const auto blockCkptFile =
-                    m_latestCkptDir / fmt::format("{}{}", simulation->blockIdx(), s_fileExtension);
-                std::ofstream ofs{blockCkptFile, std::ios::binary};
-                ofs.write(stream.data(), stream.size());
+                    const auto blockCkptFile =
+                        m_latestCkptDir / fmt::format("{}{}", simulation->blockIdx(), s_fileExtension);
+                    atomicWrite(blockCkptFile, stream.data(), stream.size());
+                }
+                catch (const std::exception& e) {
+                    fmt::println("Error saving checkpoint block: {}", e.what());
+                }
 
                 latch.count_down();
             });

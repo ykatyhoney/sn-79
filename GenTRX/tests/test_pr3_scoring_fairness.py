@@ -7,17 +7,17 @@ Covers the validator-side reward changes (EMA bootstrap-at-0, per-round
 idempotency) and the gradient_server scores-payload additions
 (rejection_reason + held_unavailable).
 
-`score_uid` lives in /taos/dev/taos/im/validator/reward.py. The test
-calls it with a hand-crafted validator_data dict so we don't need to
-spin up a real validator.
+`score_uid` lives in taos/im/validator/reward.py. The test calls it with a
+hand-crafted validator_data dict so we don't need to spin up a real validator.
 """
 from pathlib import Path
 
 import pytest
 
-# Make sure /taos/dev/taos/im is importable as `taos`.
+# Make the repo root importable as `taos` (repo root = two levels up from
+# GenTRX/tests/), so this runs on any checkout regardless of clone location.
 import sys
-sys.path.insert(0, str(Path("/taos/dev").resolve()))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from taos.im.validator.reward import _gentrx_rank_normalize, score_uid
 

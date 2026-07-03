@@ -8,6 +8,8 @@ silently-wrong scale.
 Run: pytest GenTRX/tests/test_scale_binding.py -v
 """
 
+import logging
+
 from GenTRX.src.util.schema import DEFAULT_PRICE_DECIMALS, DEFAULT_VOLUME_DECIMALS
 
 
@@ -50,7 +52,15 @@ def test_explicit_decimals_override_canonical_default(tmp_path):
 
 
 def test_fallback_to_canonical_defaults_when_decimals_missing(tmp_path, caplog):
-    """A bound tick without decimals falls back to simulation_0.xml values."""
+    """A bound tick without decimals falls back to simulation_0.xml values.
+
+    Explicit `caplog.set_level(..., logger=…)` so we capture regardless of
+    what earlier tests in the batch did to the gradient_server logger's
+    propagation state. Without this, the "falling back" record is
+    intermittently swallowed depending on test order — passes in
+    isolation, fails in the full suite.
+    """
+    caplog.set_level(logging.WARNING, logger="GenTRX.src.gradient_server")
     agg = _make_aggregator(tmp_path)
     agg._process_tick(_tick(sim_id="SIM_C"))
     assert agg._price_scale == 10**DEFAULT_PRICE_DECIMALS

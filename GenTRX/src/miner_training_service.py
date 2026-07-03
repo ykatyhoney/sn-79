@@ -480,7 +480,22 @@ class MinerTrainingService:
 
             MODEL_DL_TIMEOUT_S = 60.0
             DATA_DL_TIMEOUT_S = 90.0
-            with ThreadPoolExecutor(max_workers=1 + len(assignments)) as pool:
+            # DO NOT use `with ThreadPoolExecutor(...) as pool:` here — the
+            # context manager calls `pool.shutdown(wait=True)` on exit and
+            # BLOCKS until all submitted futures return. If any boto3 socket
+            # read is genuinely stuck (seen against R2 for miner data
+            # downloads), the `with` block wedges this training thread
+            # forever — `training_in_progress` stays True, `_kick_training`
+            # early-returns on every subsequent assignment, and the pending
+            # queue silently piles up (`pending=27+` in miner logs, no
+            # training progress). Manage the pool manually + shutdown with
+            # `wait=False` so stuck workers are abandoned (daemon threads,
+            # reaped at process exit).
+            pool = ThreadPoolExecutor(
+                max_workers=1 + len(assignments),
+                thread_name_prefix="MTS-dl",
+            )
+            try:
                 f_model = (
                     pool.submit(self._ensure_model_version, target_v, primary)
                     if need_model else None
@@ -506,6 +521,11 @@ class MinerTrainingService:
                         parquet_files.extend(f.result(timeout=DATA_DL_TIMEOUT_S))
                     except FutTimeout:
                         self._tlog.warning(f"data download timed out after {DATA_DL_TIMEOUT_S:.0f}s")
+            finally:
+                # wait=False so a stuck boto3 download doesn't wedge this
+                # thread. The worker keeps running in the background (daemon)
+                # until its next syscall returns or the process exits.
+                pool.shutdown(wait=False)
 
             if not parquet_files:
                 self._tlog.warning("download failed for all files — skipping")
@@ -527,10 +547,29 @@ class MinerTrainingService:
             import traceback
             self._tlog.error(traceback.format_exc())
         finally:
+            # Snapshot pending count under the lock so we can decide whether
+            # to self-kick without racing against a concurrent submit.
             with self._lock:
                 self.state.training_in_progress = False
+                pending_after = len(self.state.pending_assignments)
             self._tlog.info("thread finished")
             self._clear_s3_cache()
+            # Self-kick if any assignments piled up while we were running.
+            # `submit_assignment` only calls `_kick_training` when it observes
+            # `in_progress=False` at submit time — assignments that arrived
+            # WHILE training was in flight get queued but don't trigger a
+            # kick. Without this self-kick, they'd sit until the next fresh
+            # submit — which is fine most of the time (~5-min round cadence
+            # produces regular submits) but not defensible: if the validator
+            # ever stops publishing, the last N assignments would linger
+            # forever. Safe to call because `_kick_training` re-checks
+            # `training_in_progress` under the lock (line 409).
+            if pending_after > 0:
+                self._tlog.info(
+                    f"self-kick: {pending_after} assignment(s) queued during "
+                    f"training — draining now"
+                )
+                self._kick_training()
 
     def _train_background(
         self, parquet_files: list[Path], train_model, assignment: dict | None = None

@@ -35,31 +35,62 @@ def check_repo(self : Validator) -> Tuple[bool, bool, bool, bool]:
         bt.logging.info("Checking repo for updates...")
         start_time = time.time()
         remote = self.repo.remotes[self.config.repo.remote]
+        branch = self.repo.active_branch.name
         fetch_start = time.time()
-        remote.fetch(self.repo.active_branch.name)
+        try:
+            remote.fetch(branch)
+        except Exception as fetch_exc:
+            # The active branch may not exist on the remote (e.g. a local-only
+            # dev/deploy branch). Nothing to update against — skip quietly
+            # rather than error + PD-alert every cycle.
+            bt.logging.info(
+                f"Skipping update check — cannot fetch '{branch}' from remote: {fetch_exc}"
+            )
+            return False, False, False, False
         fetch_time = time.time() - fetch_start
         if fetch_time > 10.0:
             bt.logging.warning(f"Git fetch took {fetch_time:.1f}s (slow network?)")
         local_commit = self.repo.head.commit
-        remote_commit = remote.refs[self.repo.active_branch.name].commit
+        try:
+            remote_commit = remote.refs[branch].commit
+        except (IndexError, KeyError):
+            bt.logging.info(f"Skipping update check — no remote ref for '{branch}'")
+            return False, False, False, False
         validator_py_files_changed = False
         simulator_config_changed = False
         simulator_py_files_changed = False
         simulator_cpp_files_changed = False
-        if local_commit != remote_commit:
+        # Only auto-update when the remote is STRICTLY AHEAD of local — i.e. local
+        # is an ancestor of remote (a clean fast-forward of incoming commits). If
+        # local == remote we're current; if local is AHEAD (outgoing, unpushed
+        # commits) or the histories have DIVERGED, do NOT pull/rebuild. Treating
+        # our own outgoing commits as "changes to pull" was the spurious-update
+        # bug: check_repo diffed remote↔local, saw the local-only commits, and
+        # triggered a pointless pull + rebuild/restart every cycle.
+        if local_commit != remote_commit and not self.repo.is_ancestor(local_commit, remote_commit):
+            bt.logging.info(
+                f"Local '{branch}' is ahead of / diverged from remote "
+                f"({local_commit.hexsha[:8]} vs {remote_commit.hexsha[:8]}) — not auto-updating."
+            )
+        elif local_commit != remote_commit:
             diff_start = time.time()
-            diff = remote_commit.diff(local_commit)
+            # local(old) → remote(new): b_path is the incoming file path.
+            diff = local_commit.diff(remote_commit)
             for cht in diff.change_type:
                 changes = list(diff.iter_change_type(cht))
                 for c in changes:
+                    # b_path is None for pure deletions; fall back to a_path.
+                    path = c.b_path or c.a_path
+                    if not path:
+                        continue
                     # getattr: check_repo can run at startup before the engine
                     # init has set simulator_config_file on the validator.
-                    if str(self.repo_path / c.b_path) == getattr(self, 'simulator_config_file', None):
+                    if str(self.repo_path / path) == getattr(self, 'simulator_config_file', None):
                         simulator_config_changed = True
-                    if c.b_path.endswith('.cpp'):
+                    if path.endswith('.cpp'):
                         simulator_cpp_files_changed = True
-                    if c.b_path.endswith('.py'):
-                        if 'simulate/trading' in c.b_path:
+                    if path.endswith('.py'):
+                        if 'simulate/trading' in path:
                             simulator_py_files_changed = True
                         else:
                             validator_py_files_changed = True

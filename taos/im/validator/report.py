@@ -28,6 +28,7 @@ from taos.im.protocol.events import TradeEvent
 from taos.common.utils.prometheus import prometheus
 from taos.im.utils import duration_from_timestamp
 from prometheus_client import Counter, Gauge, Info, CollectorRegistry, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client.core import GaugeMetricFamily
 from fastapi import FastAPI
 from fastapi.responses import Response
 import uvicorn
@@ -222,23 +223,37 @@ class ReportingService:
         self.prometheus_validator_gauges = Gauge('validator_gauges', 'Gauge summaries for validator-related metrics.', ['wallet', 'netuid', 'sim_id', 'validator_gauge_name'], registry=self.registry_validator)
         self.prometheus_miner_gauges = Gauge('miner_gauges', 'Gauge summaries for miner-related metrics.', ['wallet', 'netuid', 'sim_id', 'agent_id', 'miner_gauge_name'], registry=self.registry_miner)
         self.prometheus_book_gauges = Gauge('book_gauges', 'Gauge summaries for book-related metrics.', ['wallet', 'netuid', 'sim_id', 'book_id', 'level', 'book_gauge_name'], registry=self.registry_books)
-        self.prometheus_agent_gauges = Gauge('agent_gauges', 'Gauge summaries for agent-related metrics.', ['wallet', 'netuid', 'sim_id', 'book_id', 'agent_id', 'agent_gauge_name'], registry=self.registry_agent)
+        # agent_gauges is the high-cardinality family (~1.8M series/cycle). It is
+        # served via a snapshot collector instead of an eager Gauge so the per-cycle
+        # apply cost (gauge.labels()+locked .set() x1.8M) collapses to a dict swap.
+        self.prometheus_agent_gauges = _SnapshotCollector('agent_gauges', 'Gauge summaries for agent-related metrics.', ['wallet', 'netuid', 'sim_id', 'book_id', 'agent_id', 'agent_gauge_name'])
+        self.registry_agent.register(self.prometheus_agent_gauges)
         # Bounded-slot shape: per-trade numeric fields live in the metric VALUE keyed
         # by `trade_gauge_name`, indexed by a fixed `slot` (rolling-buffer position).
         # This caps cardinality at books x buffer_len x fields instead of minting a
         # new series per trade (price/fee/volume/timestamp/id were previously labels).
-        self.prometheus_trades = Gauge('trades', 'Gauge summaries for trade metrics.',
+        # trades / miner_trades / books are clear-and-rebuild families (rolling
+        # slot buffers re-emitted in full each cycle). At mainnet cardinality the
+        # eager path — gauge.clear() then a fresh labels()+set() per series (the
+        # labels() recreates the child the clear() just destroyed) — was ~890K
+        # ops/cycle and the dominant reporting-apply cost. Served instead via
+        # replace-mode snapshot collectors: the per-cycle cost collapses to a
+        # dict build + swap, and serialisation is lock-free on /metrics scrape.
+        self.prometheus_trades = _SnapshotCollector('trades', 'Gauge summaries for trade metrics.',
             ['wallet', 'netuid', 'sim_id', 'book_id', 'slot', 'trade_gauge_name'],
-            registry=self.registry_trades)
-        self.prometheus_miner_trades = Gauge('miner_trades', 'Gauge summaries for agent trade metrics.',
+            carry_forward=False)
+        self.registry_trades.register(self.prometheus_trades)
+        self.prometheus_miner_trades = _SnapshotCollector('miner_trades', 'Gauge summaries for agent trade metrics.',
             ['wallet', 'netuid', 'sim_id', 'book_id', 'uid', 'slot', 'miner_trade_gauge_name'],
-            registry=self.registry_trades)
-        self.prometheus_books = Gauge('books', 'Gauge summaries for book snapshot metrics.', [
+            carry_forward=False)
+        self.registry_trades.register(self.prometheus_miner_trades)
+        self.prometheus_books = _SnapshotCollector('books', 'Gauge summaries for book snapshot metrics.', [
             'wallet', 'netuid', 'sim_id', 'timestamp', 'timestamp_str', 'book_id',
             'bid_5', 'bid_vol_5', 'bid_4', 'bid_vol_4', 'bid_3', 'bid_vol_3', 'bid_2', 'bid_vol_2', 'bid_1', 'bid_vol_1',
             'ask_5', 'ask_vol_5', 'ask_4', 'ask_vol_4', 'ask_3', 'ask_vol_3', 'ask_2', 'ask_vol_2', 'ask_1', 'ask_vol_1',
             'book_gauge_name'
-        ], registry=self.registry_books)
+        ], carry_forward=False)
+        self.registry_books.register(self.prometheus_books)
         self.prometheus_miners = Gauge('miners', 'Gauge summaries for miner metrics.', [
             'wallet', 'netuid', 'sim_id', 'timestamp', 'timestamp_str', 'agent_id',
             'placement', 'base_balance', 'base_loan', 'base_collateral', 'quote_balance', 'quote_loan', 'quote_collateral',
@@ -294,7 +309,47 @@ class ReportingService:
         except Exception as e:
             bt.logging.error(f"Error clearing metrics: {e}")
             bt.logging.error(traceback.format_exc())
-    
+
+    def _apply_snapshot_collectors(self, updates):
+        """Route updates targeting snapshot-collector families into fresh
+        per-cycle snapshots and swap them in; return (remaining, agent_count,
+        cleared_count) where `remaining` is the non-collector updates for the
+        caller to apply via its own path (_set_cached / _set_if_changed).
+
+        agent_gauges carries forward; trades/books/miner_trades replace. Keeping
+        the collector set here means both apply paths in publish_metrics stay in
+        sync — a family added to one is handled by both.
+        """
+        agent_collector = self.prometheus_agent_gauges
+        snapshots = {
+            agent_collector: {},
+            self.prometheus_trades: {},
+            self.prometheus_miner_trades: {},
+            self.prometheus_books: {},
+        }
+        remaining = []
+        for update in updates:
+            snap = snapshots.get(update[0])
+            if snap is not None:
+                snap[update[2:]] = update[1]
+            else:
+                remaining.append(update)
+        for collector, snap in snapshots.items():
+            # Fidelity with the old clear-and-rebuild: the eager path only
+            # clear()'d a family when it had >=1 update this cycle, so a cycle
+            # emitting none (e.g. no new trades) LEFT the prior series in place.
+            # Skip the empty swap for replace families so trades/miner_trades
+            # don't blank out during quiet cycles. agent_gauges (carry-forward)
+            # always updates: an empty merge is a no-op that retains its series.
+            if snap or collector is agent_collector:
+                collector.update(snap)
+        cleared_count = (
+            len(snapshots[self.prometheus_trades])
+            + len(snapshots[self.prometheus_miner_trades])
+            + len(snapshots[self.prometheus_books])
+        )
+        return remaining, len(snapshots[agent_collector]), cleared_count
+
     async def run(self):
         """
         Main async event loop for the reporting service.
@@ -333,7 +388,8 @@ class ReportingService:
                     await self.publish_metrics(data)
                     
                     result = {
-                        'initial_balances_published': self.initial_balances_published,                        
+                        'step': data.get('step'),
+                        'initial_balances_published': self.initial_balances_published,
                         'miner_stats': self.miner_stats
                     }
                     write_start = time.time()
@@ -431,11 +487,20 @@ class ReportingService:
         self.current_sim_id = new_sim_id
         
         def deserialize_to_nested_dict(d):
-            """Convert flat string keys back to nested dict."""
+            """Normalize volume-sum dicts to nested {uid: {book_id: float}} with
+            int keys. Accepts the nested form the validator now sends directly
+            (msgpack preserves int keys under strict_map_key=False) and the legacy
+            flat 'uid:book_id' string-keyed form, so a mixed-version validator /
+            reporting pair can't silently drop volume data."""
             result = defaultdict(lambda: defaultdict(float))
-            for key, vol in d.items():
-                uid, book_id = map(int, key.split(':'))
-                result[uid][book_id] = vol
+            for key, val in d.items():
+                if isinstance(val, dict):
+                    uid = int(key)
+                    for book_id, vol in val.items():
+                        result[uid][int(book_id)] = vol
+                else:
+                    uid, book_id = map(int, str(key).split(':'))
+                    result[uid][book_id] = val
             return result
 
         self.recent_trades = {
@@ -812,6 +877,70 @@ def publish_info(self: ReportingService) -> None:
     publish_validator_gauges(self)
     publish_gentrx_gauges(self)
 
+class _SnapshotCollector:
+    """Snapshot-backed collector replacing an eager high-cardinality Gauge.
+
+    Removes the ~1.8M-per-cycle gauge.labels()+locked .set() apply loop (the
+    reporting-timeout root cause): the per-cycle cost becomes plain dict ops, and
+    serialisation happens lock-free on /metrics scrape via collect().
+
+    Semantics are byte-for-byte identical to the eager Gauge, including
+    persistence: a series **carries forward at its last value** until it is
+    explicitly evicted (evict(), mirroring gauge.remove()) or cleared (clear(),
+    mirroring gauge.clear()). It does NOT drop a series merely because the series
+    was not re-emitted this cycle — matching the eager Gauge, where a child set
+    once survives until removed. Each cycle, update() merges this cycle's emitted
+    values over the retained snapshot and applies pending evictions.
+    """
+
+    def __init__(self, name, documentation, labelnames, carry_forward=True):
+        self._name = name
+        self._documentation = documentation
+        self._labelnames = list(labelnames)
+        self._snapshot = {}
+        self._pending_evict = set()
+        # carry_forward=True (agent_gauges): a series persists at its last value
+        # until explicitly evicted, mirroring an eager Gauge that keeps a child
+        # once set. carry_forward=False (the former clear-and-rebuild families
+        # trades / books / miner_trades): each cycle FULLY replaces the snapshot,
+        # mirroring gauge.clear() + rebuild — the new snapshot is the exposition.
+        self._carry_forward = carry_forward
+
+    def evict(self, labels):
+        # Mark a series for removal at the next update() — mirrors gauge.remove().
+        self._pending_evict.add(labels)
+
+    def update(self, cycle_values):
+        # copy-then-swap keeps collect() (running on the scrape thread) lock-free
+        # and torn-read-safe: collect() only ever sees a fully-built snapshot.
+        if not self._carry_forward:
+            # Replace: the family is re-emitted in full every cycle, so this
+            # cycle's values ARE the complete exposition — no merge/carry-forward
+            # (which would leak stale rolling-buffer slots from prior cycles).
+            self._snapshot = cycle_values
+            self._pending_evict = set()
+            return
+        merged = dict(self._snapshot)
+        merged.update(cycle_values)
+        if self._pending_evict:
+            for key in self._pending_evict:
+                merged.pop(key, None)
+            self._pending_evict = set()
+        self._snapshot = merged
+
+    def clear(self):
+        self._snapshot = {}
+        self._pending_evict = set()
+
+    def collect(self):
+        snapshot = self._snapshot
+        family = GaugeMetricFamily(self._name, self._documentation, labels=self._labelnames)
+        add_metric = family.add_metric
+        for labels, value in snapshot.items():
+            add_metric([str(label) for label in labels], value)
+        yield family
+
+
 def _set_if_changed(gauge, value, *labels):
     """
     Sets a Prometheus gauge value only if it differs from the current value.
@@ -866,7 +995,13 @@ def _remove_and_evict(cache, gauge, *labels):
     Eviction is required so that if the series reappears with the same value it
     was last set to, _set_cached re-creates it rather than short-circuiting on a
     stale last-value entry and leaving the series absent from the registry.
+
+    For a _SnapshotCollector the carry-forward snapshot persists series across
+    cycles, so eviction must be explicit (mirrors gauge.remove()).
     """
+    if isinstance(gauge, _SnapshotCollector):
+        gauge.evict(labels)
+        return
     try:
         gauge.remove(*labels)
     except KeyError:
@@ -1281,7 +1416,8 @@ async def report(self: ReportingService) -> None:
         if not self.last_state.accounts:
             bt.logging.info(f"Applying {len(updates)} metric updates...")
             apply_start = time.time()
-            for update in updates:
+            remaining, _, _ = self._apply_snapshot_collectors(updates)
+            for update in remaining:
                 _set_if_changed(*update)
             bt.logging.info(f"Applied {len(updates)} updates in {time.time()-apply_start:.4f}s")
             bt.logging.info(f"Metrics Published for Step {report_step} ({time.time()-report_start}s).")
@@ -1593,23 +1729,36 @@ async def report(self: ReportingService) -> None:
             )
         bt.logging.debug(f"Miner metrics collected ({time.time()-start:.4f}s).")
         
+        # Diagnostic (env-gated, off by default): dump this cycle's agent series
+        # (value, label-tuple) once, for the offline eager-vs-collector golden diff.
+        # Works identically on the eager (0.4.6) and collector builds.
+        _dump_path = os.environ.get('REPORT_DUMP_AGENT')
+        if _dump_path and not getattr(self, '_agent_dumped', False):
+            import pickle
+            _ag_series = [(u[1], u[2:]) for u in updates if u[0] is self.prometheus_agent_gauges]
+            try:
+                with open(_dump_path, 'wb') as _f:
+                    pickle.dump(_ag_series, _f)
+                self._agent_dumped = True
+                bt.logging.warning(f"REPORT_DUMP_AGENT: dumped {len(_ag_series)} agent series to {_dump_path}")
+            except Exception as _e:
+                bt.logging.warning(f"REPORT_DUMP_AGENT dump failed: {_e}")
+
         bt.logging.info(f"Applying {len(updates)} metric updates...")
         apply_start = time.time()
-        GAUGES_TO_CLEAR = {self.prometheus_trades, self.prometheus_books, self.prometheus_miner_trades}
-        cleared_metrics = set()
         cache = self._child_cache
-        for update in updates:
-            gauge = update[0]
-            if gauge in GAUGES_TO_CLEAR:
-                # Cleared families are rebuilt every cycle (rolling slot buffers);
-                # their children don't survive the clear, so they bypass the cache.
-                if gauge not in cleared_metrics:
-                    gauge.clear()
-                    cleared_metrics.add(gauge)
-                _set_if_changed(*update)
-            else:
-                _set_cached(cache, gauge, update[1], update[2:])
-        bt.logging.info(f"Applied {len(updates)} updates in {time.time()-apply_start:.4f}s")
+        # agent_gauges (~1.8M-series bulk, carry-forward) + trades/books/
+        # miner_trades (~890K, replace) all route into fresh per-cycle snapshots
+        # swapped in at the end — no per-series labels()/.set() and no clear().
+        # Everything else stays on the persistent-child cache (cheap on unchanged).
+        remaining, agent_count, cleared_count = self._apply_snapshot_collectors(updates)
+        for update in remaining:
+            _set_cached(cache, update[0], update[1], update[2:])
+        bt.logging.info(
+            f"Applied {len(updates)} updates in {time.time()-apply_start:.4f}s "
+            f"({agent_count} agent_gauges + {cleared_count} trades/books/miner_trades "
+            f"via snapshot collectors)"
+        )
         
         bt.logging.info(f"Metrics Published for Step {report_step} ({time.time()-report_start}s).")
     except Exception as ex:

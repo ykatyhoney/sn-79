@@ -13,6 +13,10 @@ Run: pytest GenTRX/tests/test_restart_resilience.py -v
 def _make_aggregator(tmp_path, validator_store=None):
     from GenTRX.src.gradient_server import GradientAggregator
 
+    # `no_startup_cleanup=False` re-enables the wipe path — the whole
+    # point of this file is to exercise sim-id-mismatch wipe behaviour.
+    # The constructor default flipped to True (op-safety) in ea26b8d3,
+    # which would otherwise suppress the very code paths under test.
     return GradientAggregator(
         checkpoint_path=str(tmp_path / "ckpt.pt"),
         val_data_path=str(tmp_path / "val"),
@@ -23,6 +27,7 @@ def _make_aggregator(tmp_path, validator_store=None):
         warmup_rounds=0,
         rollback=False,
         validator_store=validator_store,
+        no_startup_cleanup=False,
     )
 
 
