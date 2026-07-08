@@ -108,6 +108,11 @@ NETUID=79
 GRAD_PORT=8100
 GRAD_BIND=127.0.0.1
 VALIDATOR_UID=""
+# Training-data shard for the gradient server's --mode (simulation|exchange).
+# Distinct from -m/-G, which is the ROLE (aggregator|sibling). Callers
+# (run_mvtrx.sh / run_validator.sh) pass -M "$MODE" so an exchange stack's
+# aggregator uses the gentrx/<net>/exchange/ prefix instead of simulation.
+GRAD_TRAIN_MODE="simulation"
 CHECKPOINT_PATH=checkpoints/GenTRX/best.pt
 VAL_DATA_PATH=data/gentrx_val
 OUTPUT_PATH=checkpoints/GenTRX/latest.pt
@@ -128,9 +133,10 @@ SKIP_UPDATE=1
 # clobber each other's instance — pm2 start with an existing name REPLACES it.
 GRADIENT_SERVER_NAME="${GRADIENT_SERVER_NAME:-gradient-server}"
 
-while getopts m:G:e:u:p:b:V:c:d:o:E:B:w:W:k:s:l:x:nUN: flag; do
+while getopts m:G:e:u:p:b:V:c:d:o:E:B:w:W:k:s:l:x:nUN:M: flag; do
     case "${flag}" in
         m|G) GENTRX_ROLE=${OPTARG};;
+        M) GRAD_TRAIN_MODE=${OPTARG};;
         N) GRADIENT_SERVER_NAME=${OPTARG};;
         e) ENDPOINT=${OPTARG};;
         u) NETUID=${OPTARG};;
@@ -157,6 +163,14 @@ done
 case "$GENTRX_ROLE" in
     a|agg|aggregator) GENTRX_ROLE=aggregator; AGG_FLAG="--is-aggregator" ;;
     *)                GENTRX_ROLE=sibling;    AGG_FLAG="--no-is-aggregator" ;;
+esac
+
+# Normalize training-data shard: only 'exchange' is special; anything else
+# (obs, blank, typo) falls back to 'simulation' so the gradient server's
+# --mode choices=[simulation,exchange] never rejects it.
+case "$GRAD_TRAIN_MODE" in
+    exchange) GRAD_TRAIN_MODE=exchange ;;
+    *)        GRAD_TRAIN_MODE=simulation ;;
 esac
 
 # ── CPU core pinning ──────────────────────────────────────────────────────────
@@ -420,6 +434,7 @@ exec "$_PYTHON" -m GenTRX.src.gradient_server \
     --netuid $NETUID \
     --subtensor-network $ENDPOINT \
     --validator-uid "${VALIDATOR_UID:-}" \
+    --mode "$GRAD_TRAIN_MODE" \
     --log-level $LOG_LEVEL \
     \${GENTRX_API_KEY:+--api-key "\$GENTRX_API_KEY"} \
     $_NETWORK_ARG \

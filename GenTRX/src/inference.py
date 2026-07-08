@@ -14,6 +14,7 @@ from transformers import DynamicCache
 from GenTRX.src.model import OrderModel
 from GenTRX.src.orderbook import MatchingEngine, LobSnapshot
 from GenTRX.src.tokenizer import OrderTokenizer
+from GenTRX.src.util.schema import ASK, BID, CANCEL, EXEC_BUY, EXEC_SELL
 
 
 def _sample_last(logits: dict, temperature: float) -> dict:
@@ -80,6 +81,19 @@ class GeneratedOrder:
     price: int = 0
 
 
+def _evict_oldest(cache, block: int) -> None:
+    layers = getattr(cache, "layers", None)
+    if layers is not None:
+        for layer in layers:
+            if getattr(layer, "keys", None) is not None:
+                layer.keys = layer.keys[:, :, block:, :]
+                layer.values = layer.values[:, :, block:, :]
+        return
+    for i in range(len(cache.key_cache)):
+        cache.key_cache[i] = cache.key_cache[i][:, :, block:, :]
+        cache.value_cache[i] = cache.value_cache[i][:, :, block:, :]
+
+
 def generate_with_engine(
     model: OrderModel,
     tokenizer: OrderTokenizer,
@@ -90,9 +104,16 @@ def generate_with_engine(
     device: str = "cuda",
     vol_scale: float = 1.0,
     horizon_ns: int | None = None,
+    slide_block: int = 0,
 ) -> list[GeneratedOrder]:
     """
     Generate orders autoregressively with matching engine feedback.
+
+    slide_block > 0 enables a rolling KV-cache window: when the cache fills to
+    max_seq_len, the oldest slide_block entries are evicted and generation
+    continues past the context limit (absolute positions keep growing so RoPE
+    relative offsets stay within the trained range). slide_block == 0 keeps the
+    hard stop at max_seq_len.
 
     After each sampled order the matching engine processes it and provides an
     updated LOB snapshot, which is fed back into the next model step.
@@ -140,8 +161,10 @@ def generate_with_engine(
         for _ in range(n_orders):
             if horizon_ns is not None and cum_ns >= horizon_ns:
                 break
-            if position >= max_ctx:
-                break
+            if cache.get_seq_length() >= max_ctx:
+                if slide_block <= 0:
+                    break
+                _evict_oldest(cache, min(slide_block, max_ctx - 1))
 
             sampled = _sample_last(logits, temperature)
             otype = sampled["order_type"].item()
@@ -152,24 +175,13 @@ def generate_with_engine(
 
             snap = engine.snapshot()
             mid = snap.mid_price
-            price = bin_to_price(p_bin, cfg.price, mid)
+            price = bin_to_price(p_bin, cfg.price, mid, asset_ref=_ar(cfg))
             volume = bins_to_volume(
-                vi_bin, vd_bin, cfg.vol_int, cfg.vol_dec, scale=vol_scale,
+                vi_bin, vd_bin, cfg.vol_int, cfg.vol_dec, scale=vol_scale, asset_ref=_ar(cfg),
             )
-            is_buy = otype == 0
-            apply_engine = True
-            if otype == 2:
-                resolved_side, snapped_price, ok = _resolve_cancel_target(engine, price)
-                if ok:
-                    is_buy = resolved_side
-                    price = snapped_price
-                else:
-                    # FIXME: model emitted a cancel against an empty book side; dropped
-                    # for now. Proper fix is at sampling time (constrain CANCEL token to
-                    # books with resting levels).
-                    apply_engine = False
+            eng_otype, price, is_buy, apply_engine = _decode_for_engine(otype, price, snap, engine)
             if volume > 0 and apply_engine:
-                engine.process_order(otype, price, volume, is_buy)
+                engine.process_order(eng_otype, price, volume, is_buy)
 
             new_snap = engine.snapshot()
             new_lob = _snap_to_tensor(new_snap, cfg.lob_depth, device).unsqueeze(0)
@@ -207,6 +219,22 @@ def generate_with_engine(
     return generated
 
 
+def _decode_for_engine(otype, price, snap, engine):
+    """Map a sampled order_type to (engine_type, price, is_buy, apply). Limits pass
+    through; cancels snap to a resting level; executions become a marketable order
+    consuming the opposite best (skipped if that side is empty)."""
+    if otype == CANCEL:
+        side, snapped, ok = _resolve_cancel_target(engine, price)
+        return CANCEL, snapped, side, ok
+    if otype in (EXEC_BUY, EXEC_SELL):
+        is_buy = otype == EXEC_BUY
+        opp = snap.ask_prices if is_buy else snap.bid_prices
+        if opp and opp[0] > 0:
+            return (BID if is_buy else ASK), opp[0], is_buy, True
+        return BID, price, is_buy, False
+    return otype, price, (otype == BID), True
+
+
 def _resolve_cancel_target(engine, price_ticks: int) -> tuple[bool, int, bool]:
     """Infer cancel side from price vs touch, snap price to nearest level. ok=False if no levels exist."""
     snap = engine.snapshot()
@@ -233,9 +261,19 @@ def _resolve_cancel_target(engine, price_ticks: int) -> tuple[bool, int, bool]:
     return is_buy, nearest.price, True
 
 
-def bin_to_price(bin_idx: int, cfg, mid_price: int) -> int:
-    """Inverse of digitize for price bins. Uses cfg.center so the
-    reconstruction respects symmetric_log spacing (dense around mid)."""
+def _ar(cfg):
+    """The tokenizer config's asset_ref iff normalized (else None), for decode branching.
+    Pass the FULL tokenizer config (tokenizer.config), not a per-field BinConfig."""
+    return cfg.asset_ref if getattr(cfg, "normalize", False) else None
+
+
+def bin_to_price(bin_idx: int, cfg, mid_price: int, asset_ref=None) -> int:
+    """Inverse of digitize for price bins. cfg.center respects symmetric_log spacing.
+    With asset_ref (normalized model) cfg.center is p_norm -> invert via price_from_norm
+    to rel_price ticks; else cfg.center is already rel_price ticks."""
+    if asset_ref is not None:
+        from GenTRX.src.asset_norm import price_from_norm
+        return mid_price + int(price_from_norm(cfg.center(bin_idx), mid_price, asset_ref))
     return mid_price + int(round(cfg.center(bin_idx)))
 
 
@@ -245,11 +283,15 @@ def bins_to_volume(
     vi_cfg,
     vd_cfg,
     scale: float = 1.0,
+    asset_ref=None,
 ) -> int:
     """Reconstruct volume from int + dec bins. scale=1.0 for natural-
     unit engines (offline path), 10**volumeDecimals when the engine
-    is in tick units (live state-stream path)."""
+    is in tick units (live state-stream path). With asset_ref (normalized
+    model), vi+vd reconstruct qty/median_qty -> multiply by median_qty."""
     natural = vi_cfg.center(vi_bin) + vd_cfg.center(vd_bin)
+    if asset_ref is not None:
+        natural *= float(asset_ref["median_qty"])
     return max(1, int(round(natural * scale)))
 
 
@@ -278,6 +320,7 @@ def generate_trajectory(
     mode: str = "closed",
     horizon_ns: int | None = None,
     block_size: int = 8,
+    slide_block: int = 0,
 ) -> list[dict]:
     """Generate one trajectory as list of dicts. mode: closed | open | hybrid (block_size for hybrid)."""
     if seed is not None:
@@ -299,7 +342,7 @@ def generate_trajectory(
         raw = generate_with_engine(
             model=model, tokenizer=tokenizer, engine=engine, prompt=prompt,
             n_orders=n_orders, temperature=temperature, device=device,
-            vol_scale=vol_scale, horizon_ns=horizon_ns,
+            vol_scale=vol_scale, horizon_ns=horizon_ns, slide_block=slide_block,
         )
 
     cfg = tokenizer.config
@@ -307,7 +350,7 @@ def generate_trajectory(
     for o in raw:
         volume = bins_to_volume(
             o.vol_int_bin, o.vol_dec_bin, cfg.vol_int, cfg.vol_dec,
-            scale=vol_scale,
+            scale=vol_scale, asset_ref=_ar(cfg),
         )
         interval_ns = bin_to_interval_ns(o.interval_bin, cfg.interval)
         out.append({
@@ -340,7 +383,8 @@ def generate_with_engine_open_loop(
 
     seqs = {k: v.to(device) for k, v in prompt.items()}
     T_prompt = seqs["order_types"].shape[1]
-    engine.snapshot()
+    init_snap = engine.snapshot()
+    session_open_mid = init_snap.mid_price if init_snap.mid_price > 0 else None
     fixed_lob = seqs["lob_volumes"][:, -1:, :]
     fixed_tod = seqs["time_of_day"][:, -1:]
     fixed_md = seqs["mid_deltas"][:, -1:]
@@ -386,19 +430,11 @@ def generate_with_engine_open_loop(
     for (otype, p_bin, vi_bin, vd_bin, i_bin) in sampled_bins:
         snap = engine.snapshot()
         mid = snap.mid_price
-        price = bin_to_price(p_bin, cfg.price, mid)
-        volume = bins_to_volume(vi_bin, vd_bin, cfg.vol_int, cfg.vol_dec, scale=vol_scale)
-        is_buy = otype == 0
-        apply_engine = True
-        if otype == 2:
-            resolved_side, snapped_price, ok = _resolve_cancel_target(engine, price)
-            if ok:
-                is_buy = resolved_side
-                price = snapped_price
-            else:
-                apply_engine = False  # see FIXME in generate_with_engine
+        price = bin_to_price(p_bin, cfg.price, mid, asset_ref=_ar(cfg))
+        volume = bins_to_volume(vi_bin, vd_bin, cfg.vol_int, cfg.vol_dec, scale=vol_scale, asset_ref=_ar(cfg))
+        eng_otype, price, is_buy, apply_engine = _decode_for_engine(otype, price, snap, engine)
         if volume > 0 and apply_engine:
-            engine.process_order(otype, price, volume, is_buy)
+            engine.process_order(eng_otype, price, volume, is_buy)
         new_snap = engine.snapshot()
         if apply_engine:
             generated.append(GeneratedOrder(
@@ -498,19 +534,11 @@ def generate_with_engine_hybrid(
             for (otype, p_bin, vi_bin, vd_bin, i_bin) in block_samples:
                 snap = engine.snapshot()
                 mid = snap.mid_price
-                price = bin_to_price(p_bin, cfg.price, mid)
-                volume = bins_to_volume(vi_bin, vd_bin, cfg.vol_int, cfg.vol_dec, scale=vol_scale)
-                is_buy = otype == 0
-                apply_engine = True
-                if otype == 2:
-                    resolved_side, snapped_price, ok = _resolve_cancel_target(engine, price)
-                    if ok:
-                        is_buy = resolved_side
-                        price = snapped_price
-                    else:
-                        apply_engine = False  # see FIXME in generate_with_engine
+                price = bin_to_price(p_bin, cfg.price, mid, asset_ref=_ar(cfg))
+                volume = bins_to_volume(vi_bin, vd_bin, cfg.vol_int, cfg.vol_dec, scale=vol_scale, asset_ref=_ar(cfg))
+                eng_otype, price, is_buy, apply_engine = _decode_for_engine(otype, price, snap, engine)
                 if volume > 0 and apply_engine:
-                    engine.process_order(otype, price, volume, is_buy)
+                    engine.process_order(eng_otype, price, volume, is_buy)
                 new_snap = engine.snapshot()
                 interval_ns = bin_to_interval_ns(i_bin, cfg.interval)
                 cum_ns += interval_ns
@@ -626,31 +654,19 @@ def generate_trajectories_batched(
             new_tod_rows: list[torch.Tensor] = []
             new_md_rows: list[torch.Tensor] = []
             for k in range(K):
-                otype = int(otype_b[k])
-                p_bin = int(p_bin_b[k])
-                vi_bin = int(vi_bin_b[k])
-                vd_bin = int(vd_bin_b[k])
+                otype = int(otype_b[k]); p_bin = int(p_bin_b[k])
+                vi_bin = int(vi_bin_b[k]); vd_bin = int(vd_bin_b[k])
                 i_bin = int(i_bin_b[k])
 
                 snap = engines[k].snapshot()
                 mid = snap.mid_price
-                price = bin_to_price(p_bin, cfg.price, mid) if mid > 0 else 0
+                price = bin_to_price(p_bin, cfg.price, mid, asset_ref=_ar(cfg)) if mid > 0 else 0
                 volume = bins_to_volume(
-                    vi_bin, vd_bin, cfg.vol_int, cfg.vol_dec, scale=vol_scale,
+                    vi_bin, vd_bin, cfg.vol_int, cfg.vol_dec, scale=vol_scale, asset_ref=_ar(cfg),
                 )
-                is_buy = otype == 0
-                apply_engine = True
-                if otype == 2:
-                    resolved_side, snapped_price, ok = _resolve_cancel_target(
-                        engines[k], price,
-                    )
-                    if ok:
-                        is_buy = resolved_side
-                        price = snapped_price
-                    else:
-                        apply_engine = False  # see FIXME in generate_with_engine
+                eng_otype, price, is_buy, apply_engine = _decode_for_engine(otype, price, snap, engines[k])
                 if volume > 0 and apply_engine:
-                    engines[k].process_order(otype, price, volume, is_buy)
+                    engines[k].process_order(eng_otype, price, volume, is_buy)
 
                 new_snap = engines[k].snapshot()
                 new_lob_rows.append(_snap_to_tensor(new_snap, cfg.lob_depth, device))
@@ -722,11 +738,17 @@ def init_engine_from_data(
 
         snap = engine.snapshot()
         mid = snap.mid_price
-        price = _bin_to_price(p_bin, cfg.price, mid)
-        volume = _bins_to_volume(vi_bin, vd_bin, cfg.vol_int, cfg.vol_dec)
+        price = _bin_to_price(p_bin, cfg.price, mid, asset_ref=_ar(cfg))
+        volume = _bins_to_volume(vi_bin, vd_bin, cfg.vol_int, cfg.vol_dec, asset_ref=_ar(cfg))
         is_buy = otype == 0
-
-        if volume > 0:
-            engine.process_order(otype, price, volume, is_buy)
+        eng_otype = otype
+        if otype in (EXEC_BUY, EXEC_SELL):  # execution -> marketable order consuming opp best
+            is_buy = otype == EXEC_BUY
+            opp = snap.ask_prices if is_buy else snap.bid_prices
+            eng_otype = (BID if is_buy else ASK) if (opp and opp[0] > 0) else None
+            if eng_otype is not None:
+                price = opp[0]
+        if volume > 0 and eng_otype is not None:
+            engine.process_order(eng_otype, price, volume, is_buy)
 
     return engine

@@ -24,7 +24,7 @@ Each position in the sequence is one order event. An order is decomposed into 8 
 
 | Field | Type | Bins | Range | Meaning |
 |-------|------|------|-------|---------|
-| `order_type` | categorical | 3 | {Bid, Ask, Cancel} | What kind of order |
+| `order_type` | categorical | 5 | {Bid, Ask, Cancel, Exec buy, Exec sell} | What kind of order |
 | `price` | binned int | 100 | symmetric log [-500, +500] ticks | Price relative to current mid |
 | `vol_int` | binned int | 64 | log-scale [0, 10000] | Integer part of quantity |
 | `vol_dec` | binned float | 8 | [0.0, 1.0) | Fractional part of quantity |
@@ -96,14 +96,14 @@ At each position t, the transformer produces a hidden vector `h_t` of dimension 
 ```mermaid
 flowchart LR
     HT[h_t]
-    HT --> LN1[LayerNorm] --> L1["Linear(d, 3)"] --> O1["P(order_type at t+1)"]
+    HT --> LN1[LayerNorm] --> L1["Linear(d, 5)"] --> O1["P(order_type at t+1)"]
     HT --> LN2[LayerNorm] --> L2["Linear(d, 100)"] --> O2["P(price_bin at t+1)"]
     HT --> LN3[LayerNorm] --> L3["Linear(d, 64)"] --> O3["P(vol_int_bin at t+1)"]
     HT --> LN4[LayerNorm] --> L4["Linear(d, 8)"] --> O4["P(vol_dec_bin at t+1)"]
     HT --> LN5[LayerNorm] --> L5["Linear(d, 64)"] --> O5["P(interval_bin at t+1)"]
 ```
 
-**Total output dimensionality**: 3 + 100 + 64 + 8 + 64 = **239 logits** per position.
+**Total output dimensionality**: 5 + 100 + 64 + 8 + 64 = **241 logits** per position.
 
 ### Training objective
 
@@ -113,7 +113,7 @@ Weighted sum of per-field cross-entropy losses:
 L = 2.0·CE(order_type) + 1.5·CE(price) + 0.5·CE(vol_int) + 0.5·CE(vol_dec) + 0.3·CE(interval)
 ```
 
-Per-class weights: bid=2.0, ask=4.0, cancel=0.5 (compensates for class imbalance).
+Per-class weights are equal across all five order-type classes (bid, ask, cancel, exec buy, exec sell): `[1.0, 1.0, 1.0, 1.0, 1.0]`.
 
 Each field is trained independently. The model learns joint patterns through the shared hidden state, but the loss decomposes cleanly per field.
 
@@ -210,9 +210,9 @@ Simulator → Validator
   │
   └── Gradient server (separate process - same host or GPU host):
         - _process_tick: replay events through MatchingEngine, accumulate rows
-        - _flush_book_parquet: write parquet to validator bucket every parquet_interval_ns
+        - _flush_book_parquet: write a fixed-row page to the validator bucket once a book reaches max_pending_rows_per_book
         - Read gradients from per-miner buckets (chain-discovered)
-        - Double-score: score_own + score_held, overfitting penalty
+        - Score against held-out: score_held is the reward (score_own fallback when no held-out); overfitting flag logged (diagnostic only)
         - All validators: aggregate locally, publish proposals/<validator-uid>/{round_id:08d}.grad
         - Aggregator (uid 0): evaluate proposals from all validators, pick best delta, publish checkpoint
         - Sibling (uid 1+): publish proposal to own bucket, sync model from uid-0 each round
@@ -221,11 +221,12 @@ Simulator → Validator
 Miner (GenTRXAgent):
   1. On startup: commits read creds for own bucket on-chain
   2. Receives assignment via GenTRXAssignment synapse (carries data bucket creds)
-  3. If assignment.model_version > local: download checkpoint from uid-0's bucket
-     (canonical model source; discovered via chain)
-  4. Downloads model + parquets in parallel (concurrent futures)
-     parquets use assignment-embedded data bucket creds
-  5. Trains on assigned books/time window
+  3. If assignment.model_version > local: advance the model by applying the
+     canonical per-version delta(s) from uid-0's bucket (usually one). Cold
+     start or a missing delta falls back to the latest baseline checkpoint + replay.
+  4. Downloads any needed deltas/checkpoint + parquets (canonical model source
+     discovered via chain; parquets use assignment-embedded data bucket creds)
+  5. Trains the assigned pages incrementally within the round budget (recent first)
   6. Uploads compressed gradient to own bucket (gradients/<miner-uid>/{round_id:08d}.grad)
      retries with exponential backoff (30s-300s)
 ```
@@ -242,7 +243,7 @@ For local development:
 
 GenTRX gradient scores measure training contribution quality: "did this miner produce useful gradients?" This is orthogonal to trading quality (kappa / PnL).
 
-Each round, the gradient server double-evaluates every submitted gradient: `score_own` on the miner's assigned books and `score_held` on held-out val books for the same time window. When `score_own > score_held * overfit_ratio` the combined score is `score_held * overfit_penalty`; otherwise it is `score_held` (or `score_own` as fallback when no held-out data is available). Gradients below `min_score` are excluded from aggregation.
+Each round, the gradient server evaluates every submitted gradient on held-out val pages the miner did not train on. The score is `score_held` (or `score_own` as fallback when no held-out data is available); held-out improvement is the reward. `score_own` on the miner's assigned pages is also computed, and when `score_own > score_held * overfit_ratio` the gradient is flagged as overfitting, which is logged as a diagnostic and does not change the score. Gradients below `min_score` are excluded from aggregation. Only gradients that enter aggregation are rewarded; a version-mismatched submission is not paid.
 
 Scores flow into the validator's weight computation in two stages:
 

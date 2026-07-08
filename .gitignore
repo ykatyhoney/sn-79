@@ -195,3 +195,17 @@ taos/im/config/batch_signer_ledger.db
 taos/im/config/benchmark_agents_test.json
 burn.py
 .claude/
+
+# Query-path fan-out runtime toggles (see query.py:_query_fanout_enabled)
+.query_threaded
+.query_fanout
+# Kappa fingerprint-cache runtime toggles (see kappa.py:_kappa_cache_enabled)
+.kappa_nocache
+.kappa_cache
+
+# Session/agent progress notes (operator state — never track or publish)
+runbooks/progress/doing/
+runbooks/progress/done/
+
+# runbooks/testing holds test RUNBOOKS (docs), not test-output — exempt from 'testing/' above
+!runbooks/testing/

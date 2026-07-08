@@ -93,3 +93,41 @@ def test_build_validator_state_snapshots_miner_stats():
     rt = msgpack.unpackb(msgpack.packb(out, use_bin_type=True), raw=False, strict_map_key=False)
     assert rt["miner_stats"][0]["timeouts"] == 34
     assert rt["miner_stats"][1]["requests"] == 50
+
+
+def _pack_via_stream(obj, depth):
+    from taos.im.validator.persistence import _stream_pack
+    packer = msgpack.Packer(use_bin_type=True)
+    buf = bytearray()
+    _stream_pack(packer, buf.extend, obj, depth)
+    return bytes(buf)
+
+
+def test_stream_pack_byte_identical_to_packb():
+    """_stream_pack must produce EXACTLY the same bytes as msgpack.packb at every
+    recursion depth — the save serialization is only safe if the chunked stream
+    is byte-for-byte identical to what load_state expects to unpack."""
+    obj = {
+        "scores": {0: 1.5, 1: -2.25, 2: 0.0},
+        "realized_pnl_history": {
+            i: {1000 + j: {b: float(i * j * b) for b in range(3)} for j in range(4)}
+            for i in range(5)
+        },
+        "meta": {"hotkeys": ["a", "b", "c"], "stake": [1.0, 2.0], "nested": {"x": None, "y": True}},
+        "a_list": [1, "two", 3.0, {"k": "v"}, [4, 5]],
+        "a_tuple_val": (1, 2, {"z": 9}),
+        "bytes": b"\x00\x01\x02",
+        7: "int-key",
+        "empty_dict": {},
+        "empty_list": [],
+    }
+    ref = msgpack.packb(obj, use_bin_type=True)
+    ref_round = msgpack.unpackb(ref, raw=False, strict_map_key=False)
+    for depth in (0, 1, 2, 3, 8):
+        got = _pack_via_stream(obj, depth)
+        assert got == ref, f"depth={depth}: not byte-identical to packb"
+        assert msgpack.unpackb(got, raw=False, strict_map_key=False) == ref_round
+
+    # Non-dict top-level object also byte-identical.
+    for top in ([1, 2, {"a": 3}], 42, "scalar", None):
+        assert _pack_via_stream(top, 2) == msgpack.packb(top, use_bin_type=True)

@@ -26,6 +26,8 @@ The data schema written by collect_row() is defined in
 GenTRX/src/util/schema.py (order_stream_schema).
 """
 
+from __future__ import annotations
+
 from pathlib import Path
 from typing import Any
 
@@ -186,108 +188,88 @@ class CustomTrainingAgent(GenTRXAgent):
         Called on a background thread after select_training_files() is applied.
         train_model is a deep copy of self._gtx.model — safe to mutate in place.
 
-        The required contract:
-          - Produce a TrainingDelta (via train_window or your own loop).
-          - Compress it with compress(delta, top_k_frac=...).
-          - Serialize and upload via self._gtx.write_store.put_gradient().
-        If you deviate from train_window(), keep the compress/serialize/upload
-        block unchanged — the validator scores the gradient, not the model.
+        This mirrors the base GenTRXAgent.train() one-pass contract:
+          - Build one interleaved DataLoader over the assigned pages.
+          - Train with train_incremental() — one budget-governed pass over the
+            data, not a fixed step count — using self._make_window_config() so
+            the trained model_version and the label-smoothing width the
+            validator scores against are always stamped on the WindowConfig.
+          - Hand the delta to self._submit_gradient(), which compresses,
+            uploads, prunes old gradients, retries to a local file on S3
+            failure, and advances the window counter.
 
         Customisation ideas:
-          - Change the optimizer or learning-rate schedule inside WindowConfig
-          - Run multiple passes with different subsets of files
-          - Apply data augmentation by wrapping the DataLoader
-          - Use a different top_k_frac to control gradient sparsity
+          - Override ONLY the tunable knobs, e.g.
+                win_cfg = self._make_window_config(n_steps=500, lr=self._gtx.train_lr * 0.5)
+            n_steps > 0 caps total optimizer steps; leave it 0 (the default) for
+            a full budget-governed pass. Do NOT hand-build WindowConfig() — that
+            drops model_version / label_smooth_sigma, and the aggregator will
+            reject the gradient (version mismatch) or misscore it (baseline
+            trained at a different smoothing width).
+          - Filter or reweight pages in select_training_files().
+          - Keep _submit_gradient() as the publish surface — the validator reads
+            that exact S3 path.
         """
-        from GenTRX.src.dataloader import OrderDataset, ChunkSampler
-        from GenTRX.src.distributed import train_window, WindowConfig
-        from GenTRX.src.gradient import compress, serialize
+        from GenTRX.src.dataloader import OrderDataset, InterleaveSampler
+        from GenTRX.src.distributed import train_incremental
         from torch.utils.data import DataLoader
+        import pyarrow.parquet as _pq
 
-        self._gtx.tlog.info(f"building dataset from {len(parquet_files)} files...")
-        dataset = OrderDataset(
-            parquet_files,
-            seq_len=self._gtx.train_seq_len,
-            tokenizer=self._gtx.tokenizer,
-            max_cached=2,
-        )
-        sampler = ChunkSampler(dataset, shuffle=True)
-        loader = DataLoader(
-            dataset,
-            batch_size=self._gtx.train_batch_size,
-            sampler=sampler,
-            num_workers=0,
-        )
+        parquet_files = self.select_training_files(parquet_files, assignment)
+        if not parquet_files:
+            self._gtx.tlog.info("select_training_files returned empty list — skipping")
+            return
+
+        # Keep only pages with more rows than one training sequence; a shorter
+        # page cannot yield a single sample and would build an empty loader.
+        good = []
+        for f in sorted(parquet_files):
+            try:
+                if _pq.read_metadata(f).num_rows > self._gtx.train_seq_len:
+                    good.append(f)
+            except Exception as exc:
+                self._gtx.tlog.debug(f"skip page {f}: {exc}")
+        if not good:
+            self._gtx.tlog.info("no trainable pages, skipping")
+            return
+
+        block = int(getattr(self._gtx, "shuffle_block", 1024))
+        alpha = float(getattr(self._gtx, "recency_alpha", 1.0))
+        max_cached = min(len(good), int(getattr(self._gtx, "train_max_cached", 4)))
+        try:
+            ds = OrderDataset(
+                good,
+                seq_len=self._gtx.train_seq_len,
+                tokenizer=self._gtx.tokenizer,
+                max_cached=max_cached,
+            )
+        except Exception as exc:
+            self._gtx.tlog.info(f"dataset build failed ({exc}), skipping")
+            return
+        loaders = [
+            DataLoader(
+                ds,
+                batch_size=self._gtx.train_batch_size,
+                sampler=InterleaveSampler(ds, shuffle=True, block=block, recency_alpha=alpha),
+                num_workers=0,
+            )
+        ]
         self._gtx.tlog.info(
-            f"dataset ready: {dataset.total_orders} orders, "
-            f"{len(loader)} batches, training {self._gtx.train_steps} steps..."
+            f"{len(good)} files, block={block} recency_alpha={alpha} "
+            f"max_cached={max_cached}, budget={self._gtx.round_budget_s:.0f}s..."
         )
 
-        # --- Customise WindowConfig to change optimizer / LR schedule: ---
-        # win_cfg = WindowConfig(
-        #     n_steps=self._gtx.train_steps * 2,   # train longer
-        #     lr=self._gtx.train_lr * 0.5,          # smaller LR
-        #     window_id=self._gtx.train_window_id,
-        #     miner_uid=self.uid,
-        # )
-        win_cfg = WindowConfig(
-            n_steps=self._gtx.train_steps,
-            lr=self._gtx.train_lr,
-            window_id=self._gtx.train_window_id,
-            miner_uid=self.uid,
-        )
-
-        delta = train_window(train_model, loader, win_cfg, self._gtx.device)
+        # Override only the tunable knobs, e.g.
+        #   win_cfg = self._make_window_config(n_steps=500, lr=self._gtx.train_lr * 0.5)
+        win_cfg = self._make_window_config()
+        delta = train_incremental(train_model, loaders, win_cfg, self._gtx.device)
         self._gtx.tlog.info(
             f"training done: loss {delta.metadata.loss_before:.4f} → {delta.metadata.loss_after:.4f}"
         )
 
-        # --- Compress: top_k_frac controls gradient sparsity (lower = smaller
-        # gradient, potentially lower score; higher = larger upload) ----------
-        comp = compress(delta, top_k_frac=self._gtx.top_k_frac)
-        data = serialize(comp)
-
-        # --- Upload — do not change this block unless you know what you're
-        # doing; the validator reads this exact S3 path ----------------------
-        if self._gtx.write_store is None:
-            raise RuntimeError(
-                "No S3 store configured. Set GENTRX_S3_* env vars to enable gradient upload."
-            )
-
-        round_id = (assignment or {}).get("round", self._gtx.train_window_id)
-        try:
-            self._gtx.write_store.put_gradient(
-                miner_uid=self.uid,
-                round_id=round_id,
-                data=data,
-            )
-            self._gtx.tlog.info(f"gradient uploaded to S3 (round={round_id})")
-            if self._gtx.keep_gradients > 0:
-                try:
-                    n = self._gtx.write_store.prune_keep_latest(
-                        "gradients/", keep=self._gtx.keep_gradients, suffix=".grad"
-                    )
-                    if n:
-                        self._gtx.tlog.info(
-                            f"pruned {n} old gradient(s), keeping latest {self._gtx.keep_gradients}"
-                        )
-                except Exception as prune_exc:
-                    self._gtx.tlog.debug(f"gradient prune failed: {prune_exc}")
-        except Exception as exc:
-            self._gtx.tlog.warning(f"S3 upload failed: {exc} — saving for retry")
-            pending_dir = self._gtx.gradient_dir / "pending"
-            pending_dir.mkdir(parents=True, exist_ok=True)
-            pending_path = pending_dir / f"block_{round_id:08d}_miner_{self.uid}.grad"
-            pending_path.write_bytes(data)
-            self._gtx.last_gradient_path = pending_path
-
-        self._gtx.tlog.info(
-            f"window {self._gtx.train_window_id} COMPLETE | "
-            f"loss {delta.metadata.loss_before:.4f} → {delta.metadata.loss_after:.4f} | "
-            f"gradient {len(data)/1024:.1f} KB"
-        )
-
-        self._gtx.train_window_id += 1
+        # Publish surface shared with the base agent — compress + upload + prune
+        # + retry-on-failure + window advance. Do not hand-roll this.
+        self._submit_gradient(delta, assignment)
 
 
 if __name__ == "__main__":

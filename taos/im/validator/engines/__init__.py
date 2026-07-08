@@ -9,6 +9,7 @@ branches on mode below handle_state().
 
 from __future__ import annotations
 
+import asyncio
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -163,6 +164,51 @@ class MarketEngine(ABC):
 
     def stop(self) -> None:
         """Called from validator.cleanup()."""
+
+    # ── Shared external-order polling ────────────────────────────────────────
+    # UI/wallet-submitted orders are fetched from the data service on a
+    # background task, not inline in receive(), so a slow or busy data service
+    # never adds latency to the round and the per-order sr25519 verify stays off
+    # the critical path. The data-service GET is an atomic destructive pop
+    # (exactly-once), so faster polling cannot double-inject. receive() drains
+    # the buffer with no await. _fetch_external_orders() is implemented per-engine.
+
+    _EXTERNAL_POLL_INTERVAL = 1.0
+
+    def _ensure_external_poller(self) -> None:
+        """Start the background poll task on first call (requires a running loop)."""
+        if getattr(self, "_external_poll_task", None) is None:
+            self._external_poll_task = asyncio.ensure_future(self._external_orders_loop())
+
+    async def _external_orders_loop(self) -> None:
+        while True:
+            try:
+                instrs = await self._fetch_external_orders()
+                if instrs:
+                    self._external_buffer.extend(instrs)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                import bittensor as bt
+
+                bt.logging.debug(f"external orders poll failed: {exc}")
+            await asyncio.sleep(self._EXTERNAL_POLL_INTERVAL)
+
+    def _drain_external_orders(self) -> list:
+        """Return buffered external instructions and clear the buffer.
+
+        Sync with no await between the read and the reset, so it is atomic
+        against the background poller under single-threaded asyncio.
+        """
+        instrs = self._external_buffer
+        self._external_buffer = []
+        return instrs
+
+    def _stop_external_poller(self) -> None:
+        task = getattr(self, "_external_poll_task", None)
+        if task is not None:
+            task.cancel()
+            self._external_poll_task = None
 
     @property
     @abstractmethod

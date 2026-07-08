@@ -19,6 +19,7 @@ submitter's assignment and calls `_deliver_scores` directly.
 Run: pytest GenTRX/tests/test_scoring.py -v
 """
 
+import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -234,6 +235,69 @@ def test_n_counters_reflect_submitters_only(aggregator):
     assert payload["n_scored"] == 2
     assert payload["n_accepted"] == 1
     assert payload["n_rejected"] == 1
+
+
+def test_positive_score_excluded_from_accepted_is_not_rewarded(aggregator):
+    """Reward-leak guard: a submitter with score > threshold that was dropped
+    from the accepted list (dedup duplicate or version-mismatch) must report
+    accepted=False. The reward path keys purely on this flag, so `score >
+    threshold` alone is NOT sufficient to be paid."""
+    aggregator._agg_round = 1
+    a1 = _plant_assignment(aggregator, 1, 1, submitted=True, score=0.9)
+    a2 = _plant_assignment(aggregator, 2, 1, submitted=True, score=0.8)
+    round_assignments = [(1, a1), (2, a2)]
+    scored = [(1, 1, 0.9, b"c", a1), (2, 1, 0.8, b"c", a2)]
+    threshold = aggregator._effective_min_score
+    # uid 2 dropped as a duplicate despite a positive score above threshold.
+    accepted = [(1, 1, 0.9, b"c", a1)]
+    rejected = [(2, 1, 0.8, {**a2, "_duplicate_of": 1})]
+    aggregator._deliver_scores(scored, accepted, rejected, threshold, round_assignments)
+
+    scores = aggregator._latest_scores["scores"]
+    assert scores["1"]["accepted"] is True
+    assert scores["2"]["accepted"] is False          # not paid
+    assert scores["2"]["score"] == pytest.approx(0.8)  # score still reported
+
+
+def test_pushed_val_books_are_round_keyed(aggregator):
+    """The validator-pushed held-out split is authoritative and per-round;
+    a round with no pushed split falls back to a (non-empty) local derivation."""
+    aggregator._pushed_val_books[5] = frozenset({"3"})
+    aggregator._pushed_val_books[6] = frozenset({"1"})
+    assert aggregator._get_val_books(5) == {"3"}
+    assert aggregator._get_val_books(6) == {"1"}
+    assert aggregator._get_val_books(7)  # derived fallback, non-empty
+
+
+def test_held_baseline_key_tracks_forward_window(aggregator):
+    """The held-out baseline cache key must key on the FORWARD ranges the
+    loader was built from, not the raw training ranges.
+
+    Regression: two gradients with the SAME raw [ts_start, ts_end] scored while
+    _max_timestamp_ns has advanced get DIFFERENT forward windows (and different
+    loaders). Keying on raw ranges collided them onto one cached baseline and
+    scored a miner as baseline_A - loss_after_B across mismatched held-out data.
+    """
+    aggregator._forward_scoring = True
+    raw = [(0, 500)]
+
+    aggregator._max_timestamp_ns = 1000
+    fwd1 = aggregator._forward_val_ranges(raw)
+    assert fwd1 == [(500, 1000)]
+    key1 = aggregator._held_baseline_key(3, aggregator._version, fwd1)
+
+    aggregator._max_timestamp_ns = 2000
+    fwd2 = aggregator._forward_val_ranges(raw)
+    assert fwd2 == [(500, 2000)]
+    key2 = aggregator._held_baseline_key(3, aggregator._version, fwd2)
+
+    # Distinct forward windows must not share a baseline entry.
+    assert key1 != key2
+    # Same forward window (same round/version/max_ts) reuses the same entry.
+    key2_again = aggregator._held_baseline_key(
+        3, aggregator._version, aggregator._forward_val_ranges(raw)
+    )
+    assert key2_again == key2
 
 
 # ---------------------------------------------------------------------------

@@ -365,6 +365,57 @@ def defragment_histories(self: Validator):
     bt.logging.info(f"Defragmentation complete ({time.time()-start:.4f}s)")
 
 
+# How many levels _stream_pack recurses before packing a value whole. 2 =>
+# top-level map + one level into each value (per-UID for the {uid: {...}} state
+# dicts), so a huge value like realized_pnl_history is packed as ~N per-UID
+# calls (~10-30ms each) instead of one multi-second call that holds the GIL
+# solid and freezes the event loop for the whole save.
+_SAVE_STREAM_DEPTH = 2
+
+# Save every Nth scoring interval (default 2 = every 10th sim update at the
+# 5s scoring interval). The ~480MB validator save spans 9-16s of prep+pack+io
+# per firing; at every-interval cadence it was the largest single contributor
+# to the background GIL/io load that stalls scoring-round receives. Trade-off:
+# a crash loses up to N intervals of scoring history. Override via env.
+_SAVE_EVERY_INTERVALS = max(1, int(os.environ.get("SAVE_EVERY_INTERVALS", "2")))
+
+
+def _stream_pack(packer, write, obj, depth):
+    """Write msgpack bytes for `obj` via `write(bytes)`, BYTE-IDENTICAL to
+    packer.pack(obj) / msgpack.packb(obj, use_bin_type=True).
+
+    For a dict/list at depth>0, emit the map/array header then stream each
+    element (recursing with depth-1) instead of packing the container in one
+    call. A msgpack map/array is exactly its header followed by its packed
+    elements in iteration order, so the concatenated stream is identical to a
+    single pack() — but it splits one huge C-level pack() (which holds the GIL
+    for its entire duration) into many small ones with GIL-switch points
+    between, so a large state value can't monopolise the GIL during a save.
+    At depth 0, or for scalars, packs the object whole. Returns bytes written.
+    """
+    total = 0
+    if depth > 0 and isinstance(obj, dict):
+        chunk = packer.pack_map_header(len(obj))
+        write(chunk)
+        total += len(chunk)
+        for k, v in obj.items():
+            chunk = packer.pack(k)
+            write(chunk)
+            total += len(chunk)
+            total += _stream_pack(packer, write, v, depth - 1)
+    elif depth > 0 and isinstance(obj, (list, tuple)):
+        chunk = packer.pack_array_header(len(obj))
+        write(chunk)
+        total += len(chunk)
+        for item in obj:
+            total += _stream_pack(packer, write, item, depth - 1)
+    else:
+        chunk = packer.pack(obj)
+        write(chunk)
+        total += len(chunk)
+    return total
+
+
 async def save_state_async(self: Validator) -> bool:
     """
     Saves simulation and validator state asynchronously via executor workers.
@@ -450,37 +501,23 @@ async def save_state_async(self: Validator) -> bool:
                 loop = asyncio.get_event_loop()
 
                 def _pack_stream_fsync(path, obj):
-                    """Stream-pack `obj` straight into `path` and fsync.
+                    """Stream-pack `obj` straight into `path` (via _stream_pack)
+                    and fsync.
 
-                    Byte-identical to writing msgpack.packb(obj, use_bin_type=True):
-                    a msgpack map is its header followed by the packed key/value
-                    pairs in iteration order (verified by byte-compare against
-                    packb on a real state file). Streaming avoids materialising
-                    the full multi-hundred-MB intermediate buffer and overlaps
-                    serialization with the file write. fsync BEFORE the atomic
-                    os.replace guarantees the temp file's bytes are durable
+                    Byte-identical to writing msgpack.packb(obj, use_bin_type=True)
+                    — see _stream_pack. Streaming avoids materialising the full
+                    multi-hundred-MB intermediate buffer, overlaps serialization
+                    with the file write, and (via _stream_pack's recursion) keeps
+                    any single C-level pack() call small so it can't hold the GIL
+                    solid and freeze the event loop mid-save. fsync BEFORE the
+                    atomic os.replace guarantees the temp file's bytes are durable
                     before it takes the state file's place — without it, a power
-                    loss right after the rename could leave a truncated state
-                    with the previous good file gone. Returns bytes written.
+                    loss right after the rename could leave a truncated state with
+                    the previous good file gone. Returns bytes written.
                     """
                     packer = msgpack.Packer(use_bin_type=True)
-                    total = 0
                     with open(path, 'wb', buffering=1024 * 1024) as f:
-                        if isinstance(obj, dict):
-                            chunk = packer.pack_map_header(len(obj))
-                            f.write(chunk)
-                            total += len(chunk)
-                            for k, v in obj.items():
-                                chunk = packer.pack(k)
-                                f.write(chunk)
-                                total += len(chunk)
-                                chunk = packer.pack(v)
-                                f.write(chunk)
-                                total += len(chunk)
-                        else:
-                            chunk = packer.pack(obj)
-                            f.write(chunk)
-                            total += len(chunk)
+                        total = _stream_pack(packer, f.write, obj, _SAVE_STREAM_DEPTH)
                         f.flush()
                         os.fsync(f.fileno())
                     return total
@@ -629,7 +666,7 @@ def schedule_save(self: Validator) -> None:
     Returns:
         None
     """
-    if not self.last_state or self.last_state.timestamp % self.config.scoring.interval != 4_000_000_000:
+    if not self.last_state or self.last_state.timestamp % (_SAVE_EVERY_INTERVALS * self.config.scoring.interval) != 4_000_000_000:
         return
     if self.shared_state_saving:
         bt.logging.warning(f"Skipping save at step {self.step} — previous save still running.")

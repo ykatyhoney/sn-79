@@ -191,8 +191,7 @@ class MatchingEngine:
     ) -> int:
         """Correct engine state against an authoritative L2 snapshot.
 
-        Mirrors LimitOrderBook.correct_from_l2 logic from
-        e-rnd-taos/src/dataprocessing/reconstruction.py:
+        Mirrors the authoritative L2-correction logic:
           1. Remove phantom bids above L2 best bid.
           2. Remove phantom asks below L2 best ask.
           3. Insert missing bid levels above current engine best bid.

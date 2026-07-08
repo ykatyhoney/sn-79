@@ -104,7 +104,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gtx-train-batch-size", type=int, default=16)
     parser.add_argument("--gtx-train-seq-len", type=int, default=256)
     parser.add_argument("--gtx-train-lr", type=float, default=1e-4)
-    parser.add_argument("--gtx-top-k-frac", type=float, default=0.05)
+    parser.add_argument("--gtx-top-k-frac", type=float, default=0.10)
     parser.add_argument(
         "--gtx-label-smooth-sigma", type=float, default=1.0,
         help="Ordinal-aware soft-CE width in bins (0 = strict CE). Must match "

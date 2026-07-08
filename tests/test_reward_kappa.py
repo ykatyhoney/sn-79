@@ -14,7 +14,8 @@ from taos.im.validator.reward import calculate_kappa_score
 # kappa_3 gating knobs kept permissive so the maths, not the gates, is under test.
 _K = dict(
     tau=0.0,
-    lookback=100,
+    lookback=10800_000_000_000,  # permissive: >> any synthetic series span
+                                 # (kappa_3 now applies lookback as an explicit window)
     norm_min=0.0,
     norm_max=2.0,
     min_lookback=1,
@@ -98,3 +99,68 @@ def test_calculate_kappa_score_unknown_uid_is_zero():
         simulation_timestamp=1_000_000_000,
     )
     assert score == 0.0
+
+
+def test_kappa_cache_flag_default_off_with_optin(monkeypatch):
+    """The fingerprint cache defaults OFF (all UIDs -> loky); KAPPA_CACHE=1 or a
+    .kappa_cache sentinel re-enables it (sentinel wins over the env)."""
+    import taos.im.utils.kappa as k
+
+    monkeypatch.setattr(k.os.path, "exists", lambda p: False)
+    monkeypatch.delenv("KAPPA_CACHE", raising=False)
+    assert k._kappa_cache_enabled() is False
+
+    monkeypatch.setenv("KAPPA_CACHE", "1")
+    assert k._kappa_cache_enabled() is True
+
+    monkeypatch.setenv("KAPPA_CACHE", "0")
+    assert k._kappa_cache_enabled() is False
+
+    # .kappa_cache sentinel is an override that wins over env=0.
+    monkeypatch.setattr(k.os.path, "exists", lambda p: str(p).endswith(".kappa_cache"))
+    monkeypatch.setenv("KAPPA_CACHE", "0")
+    assert k._kappa_cache_enabled() is True
+
+
+def test_kappa_3_batch_skips_cache_updates_when_disabled():
+    """Cache-off path: build_cache_updates=False returns the SAME kappa results
+    but an EMPTY cache_updates dict — the redundant (fingerprint, kappa_values)
+    copy that dominated the parent's collect is not built/pickled. Results must
+    stay identical so scoring is unaffected."""
+    from taos.im.utils.kappa import kappa_3_batch
+
+    pnl = {
+        1: _series([1.0, 2.0, 1.5, 2.5, 1.0]),
+        2: _series([2.0, 2.0, 2.0, 2.0, 2.0, 2.0]),
+    }
+    res_on, upd_on = kappa_3_batch(pnl, **_K, build_cache_updates=True)
+    res_off, upd_off = kappa_3_batch(pnl, **_K, build_cache_updates=False)
+
+    assert res_on == res_off              # scoring output unchanged
+    assert upd_off == {}                  # nothing built when disabled
+    assert set(upd_on) == {1, 2}          # built when enabled
+    for uid in (1, 2):
+        _fp, kv = upd_on[uid]
+        assert kv == res_on[uid]          # cache copy mirrors the result exactly
+
+
+def test_kappa3_lookback_excludes_old_observations():
+    """kappa_3 applies `lookback` as an explicit window: observations older than
+    the last `lookback` ns are dropped. Here the old obs would satisfy
+    min_realized_observations but the windowed recent obs alone do not, so book0
+    resolves to None — proving the old observations were excluded."""
+    k = dict(_K)
+    k["lookback"] = 5_000_000          # 5e6 ns window
+    k["min_realized_observations"] = 3
+    series = {
+        0: {0: 1.0}, 1_000_000: {0: 1.0}, 2_000_000: {0: 1.0}, 3_000_000: {0: 1.0},  # 4 old
+        100_000_000: {0: 2.0}, 101_000_000: {0: 2.0},                                # 2 recent (in window)
+    }
+    out = kappa_3(1, series, **k)
+    assert out is None or out.get("books", {}).get(0) is None
+    # sanity: with a permissive window (all 6 obs) book0 IS valid — confirms the
+    # None above is caused by windowing, not by the data itself.
+    k_wide = dict(k)
+    k_wide["lookback"] = 10800_000_000_000
+    out_wide = kappa_3(1, series, **k_wide)
+    assert out_wide is not None and out_wide["books"][0] is not None

@@ -29,7 +29,7 @@ Full path: [`validator_setup.md`](validator_setup.md). Quickstart:
 1. Create one R2 (or Hippius) bucket. Generate write + read tokens.
 2. Set `GENTRX_VALIDATOR_S3_*` env vars. The validator process commits the read pair on-chain at startup.
 3. Run [`bin/gentrx_preflight`](preflight.md) to verify deps, S3 reach, wallet registration, and chain commitments before launch.
-4. Run `./run_validator.sh -G -w <coldkey> -h <hotkey> -u 79` — starts the gradient server and validator together on first run, no flags needed on subsequent runs. For a separate GPU machine, run `./run_gradients.sh -G` on the GPU host first, then `./run_validator.sh -Q http://<gpu-host>:8100/gentrx` on the validator host.
+4. Run `./run_validator.sh -G -w <coldkey> -h <hotkey> -u 79`. This starts the gradient server and validator together on first run, no flags needed on subsequent runs. For a separate GPU machine, run `./run_gradients.sh -G` on the GPU host first, then `./run_validator.sh -Q http://<gpu-host>:8100/gentrx` on the validator host.
 5. `pm2 logs validator | grep "\[GTX\]"` should show round transitions and checkpoint publishes.
 
 ### First time, just learning
@@ -69,7 +69,7 @@ flowchart LR
     MODEL -->|load into| MINERS
 ```
 
-Each round is short, about five minutes on finney with the default `blocks_per_round=25`. Miners receive a slice of sim state for their assigned books and time window, train locally on it, and submit a compressed gradient.  Validators score every gradient against held-out data to block overfitting, and the aggregator applies the single best-scoring proposal.
+Each round is short, about five minutes on finney with the default `blocks_per_round=25`. Miners receive a slice of sim state for their assigned books and time window, train locally on it, and submit a compressed gradient.  Validators score every gradient by how much it improves a held-out set the miner did not train on, and the aggregator applies the single best-scoring proposal.
 
 The new checkpoint loads into every miner at the start of the next round and the cycle repeats.
 
@@ -85,7 +85,7 @@ See [`validator_setup.md`](validator_setup.md) for the UID configuration.
 
 ### Scoring and weights
 
-Gradient quality is scored against held-out data each round (with an overfit penalty applied when own-data loss runs ahead of held-out loss), rank-normalized across miners, and smoothed with an EMA before entering the validator's weight computation alongside kappa and PnL. The pipeline is wired end to end in `taos/im/validator/reward.py`.
+Gradient quality is scored by how much a gradient improves a held-out set the miner did not train on, rank-normalized across miners, and smoothed with an EMA before entering the validator's weight computation alongside kappa and PnL. Only gradients that enter aggregation are rewarded; version-mismatched submissions are not paid. The pipeline is wired end to end in `taos/im/validator/reward.py`.
 
 The `--scoring.gentrx.simulation_share` knob caps the share of miner rewards reserved for GenTRX gradient submitters. Default is `0.05`, meaning rewards split 95% to trading and up to 5% to training, scaled by participation (`N_active / N_registered_miners`); the unused training portion returns to trading. When GenTRX is not running, no gradients are submitted and 100% of rewards go to trading regardless of this setting. For production parameter values active on mainnet, see the MVTRX (SN-79) incentive mechanism in the [repo README](../../README.md#mechanism).
 

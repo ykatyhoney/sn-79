@@ -23,7 +23,7 @@ GenTRX adds **one new long-running process** beyond the base validator setup: th
 
 ### pm2 (matches the existing `run_validator.sh` model)
 
-For most operators, `run_gradients.sh` (same-machine) or `run_validator.sh -G` (all-in-one) handles pm2 lifecycle automatically — see [`validator_setup.md`](validator_setup.md). The raw commands below are for operators who manage pm2 outside the run scripts (e.g., custom startup order, separate restart policies).
+For most operators, `run_gradients.sh` (same-machine) or `run_validator.sh -G` (all-in-one) handles pm2 lifecycle automatically (see [`validator_setup.md`](validator_setup.md)). The raw commands below are for operators who manage pm2 outside the run scripts (e.g., custom startup order, separate restart policies).
 
 ```bash
 # Validator (already covered by run_validator.sh)
@@ -316,7 +316,7 @@ tail -f data/localnet_test/aggregation.jsonl | jq -c 'select(.type=="aggregation
 ```
 Healthy: a new `{"type":"aggregation", "round":N, "n_accepted":>=1, "loss_before":X, "loss_after":Y}` entry every `blocks_per_round` blocks. `loss_after < loss_before` means a round improved the model.
 
-**2. Model version rolling.** `v00001`, `v00002`, `v00003` ... in the validator bucket's `checkpoints/` prefix. Each successful aggregation creates a new version. Version stuck at `v00001` for > 2 rounds means aggregation is not completing.
+**2. Model version rolling.** Each successful aggregation creates a new version and publishes a per-version delta under `deltas/<uid>/v*.grad`; a full checkpoint lands in `checkpoints/` only every `--checkpoint-interval` versions. The `head.json` pointer tracks the current version. Head stuck for > 2 rounds (no new deltas) means aggregation is not completing.
 
 **3. Aggregation duration within budget.** Grep `aggregate_round` in the gradient server log:
 ```

@@ -33,6 +33,51 @@ except ImportError:
     ExchangeStateUpdate = None  # type: ignore[assignment,misc]
 
 
+def _query_fanout_enabled():
+    """True if the single-loop fan-out path should be used this round.
+
+    Fan-out is the DEFAULT — the mainnet canary showed it eliminates the ~1s
+    thread-dispatch stagger (query wait 4.0s -> 3.4s) with full response parity.
+    Fall back to the legacy thread-per-call path only to disable it:
+      - drop a `.query_threaded` sentinel at the repo root — checked every round,
+        so it's a live kill-switch with no env-file relaunch or restart; or
+      - set QUERY_FANOUT=0 in the env.
+    The sentinel wins over the env so it always works as an emergency revert.
+    """
+    try:
+        _sentinel = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", ".query_threaded"
+        )
+        if os.path.exists(_sentinel):
+            return False
+    except Exception:
+        pass
+    return os.environ.get("QUERY_FANOUT", "1") != "0"
+
+
+def _log_query_profile(tag, offsets, durations):
+    """[QUERY-PROFILE] dispatch stagger vs per-call duration for a query round.
+
+    Wide dispatch spread => the fan-out can't start calls together (thread
+    pool / GIL). Tight dispatch but wide call-dur => the stagger is inside the
+    call (prep + network). Shared by the threaded and fan-out query paths.
+    """
+    if not offsets:
+        return
+
+    def _pctl(vals, p):
+        s = sorted(vals)
+        return s[min(len(s) - 1, int(round((p / 100.0) * (len(s) - 1))))]
+
+    bt.logging.info(
+        f"[QUERY-PROFILE{tag}] n={len(offsets)} "
+        f"dispatch p50={_pctl(offsets, 50):.3f}s p95={_pctl(offsets, 95):.3f}s "
+        f"max={max(offsets):.3f}s | call-dur n={len(durations)} "
+        f"p50={_pctl(durations, 50):.3f}s p95={_pctl(durations, 95):.3f}s "
+        f"max={max(durations, default=0.0):.3f}s"
+    )
+
+
 class DendriteManager:
     @staticmethod
     def configure_session(validator):
@@ -357,6 +402,189 @@ class QueryService:
         finally:
             gc.enable()
 
+    async def _query_threaded(self, axon_synapses, uid_list, deregistered_uids, query_start, per_task_timeout):
+        """Thread-per-call fan-out (default). Each miner call runs in its own OS
+        thread with its own event loop so bittensor's synchronous dendrite prep
+        (request signing + JSON serialisation) doesn't block the main loop's
+        asyncio timers. A dedicated executor sized to the task count starts all
+        threads without queuing. Returns (synapse_responses, completed_count).
+        """
+        synapse_responses = {}
+        wallet = self.wallet
+        neuron_timeout = self.config.neuron.timeout
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(len(uid_list), 1))
+
+        # [QUERY-PROFILE] dispatch offset = when a thread first runs, vs
+        # query_start; call-dur = full time in the thread (prep + network).
+        _prof_thread_offsets = []
+        _prof_call_durations = []
+
+        async def query_uid(uid, axon, synapse):
+            loop = asyncio.get_running_loop()
+
+            def run_in_thread():
+                _t_thread = time.time()
+                _prof_thread_offsets.append(_t_thread - query_start)
+                thread_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(thread_loop)
+
+                async def _call():
+                    async with bt.Dendrite(wallet=wallet) as d:
+                        try:
+                            return await asyncio.wait_for(
+                                d(
+                                    axons=axon,
+                                    synapse=synapse,
+                                    timeout=neuron_timeout,
+                                    deserialize=False,
+                                ),
+                                timeout=per_task_timeout,
+                            )
+                        except asyncio.TimeoutError:
+                            synapse.dendrite.status_code = 408
+                            return synapse
+
+                try:
+                    return thread_loop.run_until_complete(_call())
+                finally:
+                    _prof_call_durations.append(time.time() - _t_thread)
+                    thread_loop.close()
+                    asyncio.set_event_loop(None)
+
+            try:
+                response = await loop.run_in_executor(executor, run_in_thread)
+                return uid, response
+            except asyncio.CancelledError:
+                synapse.dendrite.status_code = 408
+                return uid, synapse
+            except Exception as e:
+                bt.logging.debug(f"Error querying UID {uid}: {e}\n{traceback.format_exc()}")
+                synapse.dendrite.status_code = 500
+                return uid, synapse
+
+        query_tasks = [
+            asyncio.create_task(query_uid(uid, self.metagraph.axons[index], axon_synapses[uid]))
+            for index, uid in enumerate(uid_list)
+            if uid not in deregistered_uids
+        ]
+
+        bt.logging.info(
+            f"Created {len(query_tasks)} query tasks, "
+            f"starting wait with {self.config.neuron.global_query_timeout}s timeout"
+        )
+
+        done, pending = await asyncio.wait(
+            query_tasks,
+            timeout=self.config.neuron.global_query_timeout,
+            return_when=asyncio.ALL_COMPLETED,
+        )
+
+        elapsed = time.time() - query_start
+        bt.logging.info(f"Wait completed: {len(done)} done, {len(pending)} pending in {elapsed:.4f}s")
+
+        if pending:
+            bt.logging.warning(
+                f"Global timeout ({self.config.neuron.global_query_timeout}s) reached with "
+                f"{len(pending)} tasks still pending — cancelling"
+            )
+            for task in pending:
+                task.cancel()
+            # Drain the cancellations so each task's CancelledError handler runs
+            # (query_uid returns status-408 synapses) before the closure unbinds.
+            await asyncio.gather(*pending, return_exceptions=True)
+            pending = set()
+
+        completed_count = 0
+        for task in (*done, *pending):
+            try:
+                uid, response = task.result()
+                synapse_responses[uid] = response
+                completed_count += 1
+            except Exception as e:
+                bt.logging.debug(f"Task failed: {e}\n{traceback.format_exc()}")
+
+        _log_query_profile("", _prof_thread_offsets, _prof_call_durations)
+        executor.shutdown(wait=False)
+        return synapse_responses, completed_count
+
+    async def _query_fanout(self, axon_synapses, uid_list, deregistered_uids, query_start, per_task_timeout):
+        """Single-event-loop fan-out (QUERY_FANOUT=1). No per-call threads: reuses
+        bt.Dendrite.call on the shared pooled session, so request signing and
+        process_server_response are byte-for-byte bittensor's own — only the
+        concurrency model changes vs the threaded path. Step 1 leaves the
+        sign/serialise prep inline (dispatch stays staggered at high miner count);
+        Step 2 will move that prep to the compression process pool to kill the
+        stagger. Returns (synapse_responses, completed_count).
+        """
+        synapse_responses = {}
+        neuron_timeout = self.config.neuron.timeout
+        _prof_offsets = []
+        _prof_durations = []
+
+        async def fire_uid(uid, axon, synapse):
+            _t = time.time()
+            _prof_offsets.append(_t - query_start)
+            try:
+                response = await asyncio.wait_for(
+                    self.dendrite.call(axon, synapse, timeout=neuron_timeout, deserialize=False),
+                    timeout=per_task_timeout,
+                )
+                return uid, response
+            except asyncio.TimeoutError:
+                synapse.dendrite.status_code = 408
+                return uid, synapse
+            except Exception as e:
+                bt.logging.debug(f"Error querying UID {uid}: {e}\n{traceback.format_exc()}")
+                synapse.dendrite.status_code = 500
+                return uid, synapse
+            finally:
+                _prof_durations.append(time.time() - _t)
+
+        query_tasks = [
+            asyncio.create_task(fire_uid(uid, self.metagraph.axons[index], axon_synapses[uid]))
+            for index, uid in enumerate(uid_list)
+            if uid not in deregistered_uids
+        ]
+
+        bt.logging.info(
+            f"Created {len(query_tasks)} fanout query tasks, "
+            f"starting wait with {self.config.neuron.global_query_timeout}s timeout"
+        )
+
+        done, pending = await asyncio.wait(
+            query_tasks,
+            timeout=self.config.neuron.global_query_timeout,
+            return_when=asyncio.ALL_COMPLETED,
+        )
+
+        elapsed = time.time() - query_start
+        bt.logging.info(f"Wait completed (fanout): {len(done)} done, {len(pending)} pending in {elapsed:.4f}s")
+
+        if pending:
+            bt.logging.warning(
+                f"Global timeout ({self.config.neuron.global_query_timeout}s) reached with "
+                f"{len(pending)} tasks still pending — cancelling"
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        # Only `done` tasks carry a (uid, response); cancelled ones fall through
+        # to the missing-UID 408 stub in query_miners, matching the threaded path.
+        completed_count = 0
+        for task in done:
+            try:
+                uid, response = task.result()
+                synapse_responses[uid] = response
+                completed_count += 1
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                bt.logging.debug(f"Fanout task failed: {e}\n{traceback.format_exc()}")
+
+        _log_query_profile(" fanout", _prof_offsets, _prof_durations)
+        return synapse_responses, completed_count
+
     async def query_miners(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Issues parallel dendrite requests to all miners and collects results.
@@ -409,6 +637,14 @@ class QueryService:
                 e * (_version_int_base**i) for i, e in enumerate(reversed(_version_info))
             )
 
+            # Exchange mode normally restricts miners to loopback (co-located with the
+            # validator). On localnet the chain rejects loopback axon serves, so miners
+            # post the host's primary-interface IP; EXCHANGE_LOCAL_AXON_IPS (comma-sep)
+            # opt-in-allows those co-located IPs. Empty (mainnet default) => loopback only.
+            _extra_axon_ips = {
+                ip.strip() for ip in os.environ.get("EXCHANGE_LOCAL_AXON_IPS", "").split(",") if ip.strip()
+            }
+
             for uid, axon_data in enumerate(request_data['metagraph_axons']):
                 axon = bt.AxonInfo(
                     version=version_as_int,
@@ -422,7 +658,11 @@ class QueryService:
                     placeholder2=0,
                 )
                 if axon_data['ip'] != "0.0.0.0":
-                    if request_data.get('engine_mode') == 'exchange' and not axon_data['ip'].startswith('127.'):
+                    if (
+                        request_data.get('engine_mode') == 'exchange'
+                        and not axon_data['ip'].startswith('127.')
+                        and axon_data['ip'] not in _extra_axon_ips
+                    ):
                         continue
                     axon_list.append(axon)
                     uid_list.append(uid)
@@ -521,117 +761,29 @@ class QueryService:
             query_start = time.time()
             synapse_responses = {}
             # Hard asyncio cap per task — must not exceed the global ceiling.
+            # NOTE: neuron.timeout+1.0 is intentionally lenient — it matches the
+            # historical effective deadline (calls collected up to ~4.0s from
+            # issue). Tightening to +0.25 to enforce the 3.0s budget strictly
+            # drops ~12 responses/round (miners at 3.25-4.0s round-trip) and is a
+            # deliberate scoring change, not a perf tweak — do it separately.
             per_task_timeout = min(
                 self.config.neuron.timeout + 1.0,
                 self.config.neuron.global_query_timeout,
             )
 
-            # Bittensor's dendrite does synchronous work (request signing, JSON
-            # serialisation of the synapse body) before its first internal await.
-            # Running 33 of these in the same event loop serialises that prep:
-            # 33 × ~270ms = ~9s of event-loop blocking, during which no asyncio
-            # timer can fire.  Running each call in its own OS thread with its
-            # own event loop keeps the main loop free so asyncio.wait's timeout
-            # fires on time.
-            #
-            # A dedicated executor sized to the task count ensures all threads
-            # start immediately (no queuing) — the default pool has only ~8
-            # workers, causing the last batches to start late and GC their
-            # dendrite objects long after the query is done.
-            #
-            # Each thread uses `async with bt.Dendrite(...)` (the approach
-            # recommended in bittensor's docs) so session lifecycle is always
-            # handled correctly, even on timeout or cancellation.
-            wallet         = self.wallet
-            neuron_timeout = self.config.neuron.timeout
-            executor       = concurrent.futures.ThreadPoolExecutor(
-                max_workers=max(len(uid_list), 1)
-            )
-
-            async def query_uid(uid, axon, synapse):
-                loop = asyncio.get_running_loop()
-
-                def run_in_thread():
-                    thread_loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(thread_loop)
-
-                    async def _call():
-                        async with bt.Dendrite(wallet=wallet) as d:
-                            try:
-                                return await asyncio.wait_for(
-                                    d(
-                                        axons=axon,
-                                        synapse=synapse,
-                                        timeout=neuron_timeout,
-                                        deserialize=False,
-                                    ),
-                                    timeout=per_task_timeout,
-                                )
-                            except asyncio.TimeoutError:
-                                synapse.dendrite.status_code = 408
-                                return synapse
-
-                    try:
-                        return thread_loop.run_until_complete(_call())
-                    finally:
-                        thread_loop.close()
-                        asyncio.set_event_loop(None)
-
-                try:
-                    response = await loop.run_in_executor(executor, run_in_thread)
-                    return uid, response
-                except asyncio.CancelledError:
-                    synapse.dendrite.status_code = 408
-                    return uid, synapse
-                except Exception as e:
-                    bt.logging.debug(f"Error querying UID {uid}: {e}\n{traceback.format_exc()}")
-                    synapse.dendrite.status_code = 500
-                    return uid, synapse
-
-            query_tasks = [
-                asyncio.create_task(query_uid(uid, self.metagraph.axons[index], axon_synapses[uid]))
-                for index, uid in enumerate(uid_list)
-                if uid not in deregistered_uids
-            ]
-
-            bt.logging.info(
-                f"Created {len(query_tasks)} query tasks, "
-                f"starting wait with {self.config.neuron.global_query_timeout}s timeout"
-            )
-
-            done, pending = await asyncio.wait(
-                query_tasks,
-                timeout=self.config.neuron.global_query_timeout,
-                return_when=asyncio.ALL_COMPLETED,
-            )
-
-            elapsed = time.time() - query_start
-            bt.logging.info(f"Wait completed: {len(done)} done, {len(pending)} pending in {elapsed:.4f}s")
-
-            if pending:
-                bt.logging.warning(
-                    f"Global timeout ({self.config.neuron.global_query_timeout}s) reached with "
-                    f"{len(pending)} tasks still pending — cancelling"
+            # Single-event-loop fan-out is the default query path (see
+            # _query_fanout_enabled); drop a .query_threaded sentinel or set
+            # QUERY_FANOUT=0 to fall back to the legacy thread-per-call path.
+            # Both build the same synapse_responses dict + completed_count; the
+            # missing-UID stub and validation below are shared.
+            if _query_fanout_enabled():
+                synapse_responses, completed_count = await self._query_fanout(
+                    axon_synapses, uid_list, deregistered_uids, query_start, per_task_timeout
                 )
-                for task in pending:
-                    task.cancel()
-                # Drain the cancellations so each task's CancelledError
-                # handler runs (and finishes touching axon_synapses) before
-                # the outer scope unbinds the closure cell at end-of-function.
-                # query_uid catches CancelledError and returns (uid, synapse)
-                # with status 408, so these are real responses we must collect.
-                await asyncio.gather(*pending, return_exceptions=True)
-                pending = set()
-
-            collect_start = time.time()
-            completed_count = 0
-            for task in (*done, *pending):
-                try:
-                    uid, response = task.result()
-                    synapse_responses[uid] = response
-                    completed_count += 1
-                except Exception as e:
-                    bt.logging.debug(f"Task failed: {e}\n{traceback.format_exc()}")
+            else:
+                synapse_responses, completed_count = await self._query_threaded(
+                    axon_synapses, uid_list, deregistered_uids, query_start, per_task_timeout
+                )
 
             # Stub out any UID that never made it into synapse_responses.
             missing_count = 0
@@ -645,7 +797,7 @@ class QueryService:
             if missing_count > 0:
                 bt.logging.info(f"Filled in {missing_count} missing responses as timeouts")
 
-            bt.logging.info(f"Collected {completed_count} Responses ({time.time()-collect_start:.4f}s)") 
+            bt.logging.info(f"Collected {completed_count} Responses")
 
             bt.logging.info(
                 f"Dendrite call completed ({time.time()-query_start:.4f}s | "
@@ -661,18 +813,13 @@ class QueryService:
             )
             bt.logging.info(f"Validated Responses ({time.time()-validate_start:.4f}s).")
 
-            executor.shutdown(wait=False)
-
-            del compressed_books
-            del axon_synapses
-            del query_tasks
-            del done
-            del self.metagraph
-
-            await DendriteManager.close_session(self.dendrite)
-
-            if old_dendrite:
-                del old_dendrite
+            # Heavy cleanup (dealloc of ~255 request synapses + compressed books,
+            # aiohttp session teardown) is DEFERRED to after the response is
+            # written + the main loop notified (run() calls _post_query_cleanup) —
+            # it contributed ~0.1-0.3s to the pre-notify gap and the main loop
+            # doesn't need to wait for it. The subprocess idles after notify, so
+            # cleanup there is free.
+            self._cleanup_refs = (compressed_books, axon_synapses)
 
             return {
                 'success': True,
@@ -696,6 +843,25 @@ class QueryService:
         finally:
             if gc_was_enabled:
                 gc.enable()
+
+    async def _post_query_cleanup(self):
+        """Deferred query cleanup, run AFTER the response is written and the main
+        loop notified: drop the big request-synapse/compressed-book refs and tear
+        down the per-query aiohttp session. Tolerant of the error path (stash may
+        be absent) and never raises — a cleanup failure must not kill the loop.
+        """
+        _t = time.time()
+        try:
+            refs = getattr(self, '_cleanup_refs', None)
+            self._cleanup_refs = None
+            del refs
+            if hasattr(self, 'metagraph'):
+                del self.metagraph
+            if getattr(self, 'dendrite', None) is not None:
+                await DendriteManager.close_session(self.dendrite)
+        except Exception as e:
+            bt.logging.warning(f"_post_query_cleanup: {e}")
+        bt.logging.info(f"[QPOST-PROFILE] deferred_cleanup={time.time()-_t:.3f}s")
 
 
     async def deliver_gentrx_miners(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -942,13 +1108,23 @@ class QueryService:
 
                     write_start = time.time()
                     result_bytes = pickle.dumps(result, protocol=5)
+                    _q2_dumps_s = time.time() - write_start
                     del result
+                    _q2_shmw = time.time()
                     self.response_mem.seek(0)
                     self.response_mem.write(struct.pack('Q', len(result_bytes)))
                     self.response_mem.write(result_bytes)
                     self.response_mem.flush()
+                    _q2_resp_mb = len(result_bytes) / 1048576
                     del result_bytes
-                    
+                    # [Q2-PROFILE] subprocess side of the forward IPC gap: how much
+                    # of it is the response pickle.dumps vs the shm write, and how
+                    # big the pickled payload is (drives both dumps here and loads
+                    # on the main loop). Pairs with the [Q2-PROFILE main] line.
+                    bt.logging.info(
+                        f"[Q2-PROFILE subproc] resp_dumps={_q2_dumps_s:.3f}s "
+                        f"shm_write={time.time()-_q2_shmw:.3f}s resp={_q2_resp_mb:.1f}MB"
+                    )
                     bt.logging.info(f"Wrote Query response data ({time.time()-write_start:.4f}s).")
                     
                     if self.notify_fd is not None:
@@ -959,7 +1135,11 @@ class QueryService:
                             bt.logging.error(f"Failed to send notification: {e}\n{traceback.format_exc()}")
                     else:
                         bt.logging.error("Cannot send notification - notify_fd is None!")
-                    
+
+                    # Main loop already has the result — heavy dealloc + session
+                    # teardown deferred to here (was ~0.1-0.3s pre-notify).
+                    await self._post_query_cleanup()
+
                     gc_start = time.time()
                     gc.collect(generation=2)
                     bt.logging.info(f"Query GC completed in {time.time()-gc_start:.4f}s")

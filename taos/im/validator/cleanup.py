@@ -197,6 +197,14 @@ def cleanup_executors(self: Validator):
     Returns:
         None
     """
+    if getattr(self, '_mg_worker', None) is not None:
+        try:
+            bt.logging.info("Stopping metagraph sync worker...")
+            self._mg_worker.stop()
+        except Exception as ex:
+            bt.logging.warning(f"Error stopping metagraph sync worker: {ex}")
+        self._mg_worker = None
+
     if hasattr(self, 'reward_executor') and self.reward_executor is not None:
         try:
             bt.logging.info("Shutting down reward_executor...")

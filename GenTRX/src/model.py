@@ -8,7 +8,7 @@ Architecture (~12.1M params)
 Input: Each order at position t is represented by 8 embedding components (summed):
 
     Predicted fields (tokenized → embedding → also have output heads):
-        emb_type       : Embedding(3, d)       — Bid(0) / Ask(1) / Cancel(2)
+        emb_type       : Embedding(5, d)       — Bid(0) / Ask(1) / Cancel(2) / ExecBuy(3) / ExecSell(4)
         emb_price      : Embedding(100, d)     — relative price bin (symmetric log-scale)
         emb_vol_int    : Embedding(64, d)      — integer part of volume (log-scale)
         emb_vol_dec    : Embedding(8, d)       — fractional part of volume
@@ -29,11 +29,11 @@ FiLM conditioning: At layers 2, 5, 7, time-of-day + LOB features are injected
     instead of just a constant additive offset. ~140K extra params.
 
 Output heads: 5 independent Linear(d, n_bins) with LayerNorm:
-    order_type(3) + price(100) + vol_int(64) + vol_dec(8) + interval(64) = 239 total
+    order_type(5) + price(100) + vol_int(64) + vol_dec(8) + interval(64) = 241 total
 
 Loss: weighted sum of per-field cross-entropy losses.
     Position t predicts fields at position t+1 (standard causal LM shift).
-    Class weights: bid=2.0, ask=4.0, cancel=0.5
+    Class weights: equal ([1.0] × 5)
     Field weights: order_type=2.0, price=1.5, vol_int=0.5, vol_dec=0.5, interval=0.3
 
 Inference modes:
@@ -43,7 +43,7 @@ Inference modes:
 
 Key design choice: NO composite vocabulary. Fields are independent output heads,
 not a single flattened token space. This avoids the combinatorial explosion of
-3 × 100 × 64 × 8 × 64 = 9,830,400 composite tokens and allows per-field loss
+5 × 100 × 64 × 8 × 64 = 16,384,000 composite tokens and allows per-field loss
 weighting and accuracy tracking.
 """
 
@@ -60,7 +60,7 @@ from transformers import LlamaConfig, LlamaForCausalLM
 @dataclass
 class ModelConfig:
     # Per-field bin counts (must match tokenizer)
-    n_types: int = 3
+    n_types: int = 5
     n_price_bins: int = 100
     n_vol_int_bins: int = 64
     n_vol_dec_bins: int = 8
@@ -77,10 +77,25 @@ class ModelConfig:
     # Conditioning
     lob_dim: int = 20
     max_mid_delta: int = 2000
+    # Session-relative time: when session_close_s > session_open_s, encode
+    # position WITHIN the trading session (monotonic), not 24h-cyclic. US
+    # equities RTH: open 34200s, close 57600s.
+    session_open_s: int = 0
+    session_close_s: int = 0
+    time_bin_seconds: int = 5
 
     # FiLM conditioning: inject time+LOB as scale+shift at these backbone layers
     film_layers: tuple[int, ...] = (2, 5, 7)
     film_d_cond: int = 64  # hidden dim of FiLM projection MLP
+
+    # Intra-order field attention: attend across the 5 per-order fields before
+    # the cross-order backbone (instead of summing them), to capture field
+    # coupling while keeping one position per order (fast, not token-by-token).
+    field_attention: bool = False
+    field_attn_heads: int = 4
+
+    # Multi-scale regime conditioning input dim (0 = off); matches tokenizer regime features.
+    regime_dim: int = 0
 
     @property
     def mid_delta_buckets(self) -> int:
@@ -156,6 +171,20 @@ class OrderModel(nn.Module):
         )
         self.lob_proj = nn.Sequential(nn.Linear(config.lob_dim, d), nn.LayerNorm(d))
 
+        # --- Optional intra-order field attention (over the 5 fields) ---
+        if config.field_attention:
+            self.field_pos = nn.Parameter(torch.zeros(5, d))
+            self.field_attn = nn.TransformerEncoderLayer(
+                d_model=d, nhead=config.field_attn_heads, dim_feedforward=2 * d,
+                dropout=config.dropout, batch_first=True, activation="gelu",
+            )
+
+        # --- Optional multi-scale regime conditioning (additive, like lob_proj) ---
+        if config.regime_dim > 0:
+            self.regime_proj = nn.Sequential(
+                nn.Linear(config.regime_dim, d), nn.LayerNorm(d)
+            )
+
         # --- LLaMA backbone ---
         llama_config = LlamaConfig(
             hidden_size=d,
@@ -208,11 +237,18 @@ class OrderModel(nn.Module):
             lines.append(f"  {g:20s}: {count:>10,} ({pct:.1f}%)")
         return "\n".join(lines)
 
-    @staticmethod
-    def _time_sincos(time_of_day: torch.Tensor) -> torch.Tensor:
-        """Convert time-of-day bin index to sin/cos features. (B, T) → (B, T, 2)."""
-        tod_frac = time_of_day.float() * 5.0 / 86400.0  # 5s bins → fraction of day
-        angle = tod_frac * 2.0 * 3.141592653589793
+    def _time_sincos(self, time_of_day: torch.Tensor) -> torch.Tensor:
+        """Time-of-day bin index → sin/cos features. (B, T) → (B, T, 2).
+
+        Session-relative (close>open): monotonic position in the session,
+        open→0, close→π (distinct). Else 24h-cyclic (legacy)."""
+        tod_s = time_of_day.float() * self.config.time_bin_seconds
+        o, c = self.config.session_open_s, self.config.session_close_s
+        if c > o:
+            frac = ((tod_s - o) / (c - o)).clamp(0.0, 1.0)
+            angle = frac * 3.141592653589793
+        else:
+            angle = (tod_s / 86400.0) * 2.0 * 3.141592653589793
         return torch.stack([angle.sin(), angle.cos()], dim=-1)
 
     def _embed(
@@ -225,6 +261,7 @@ class OrderModel(nn.Module):
         lob_volumes: torch.Tensor | None = None,
         time_of_day: torch.Tensor | None = None,
         mid_deltas: torch.Tensor | None = None,
+        regime: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Build input embeddings and FiLM conditioning vector.
 
@@ -233,13 +270,25 @@ class OrderModel(nn.Module):
             film_cond: (B, T, 22) — concatenated [time_sin, time_cos, lob_volumes]
                        for FiLM layers, or None if conditioning unavailable
         """
-        x = (
-            self.emb_type(order_types)
-            + self.emb_price(price_bins)
-            + self.emb_vol_int(vol_int_bins)
-            + self.emb_vol_dec(vol_dec_bins)
-            + self.emb_interval(interval_bins)
-        )
+        if self.config.field_attention:
+            fields = torch.stack([
+                self.emb_type(order_types),
+                self.emb_price(price_bins),
+                self.emb_vol_int(vol_int_bins),
+                self.emb_vol_dec(vol_dec_bins),
+                self.emb_interval(interval_bins),
+            ], dim=2)  # (B, T, 5, d)
+            b, t, f, dm = fields.shape
+            fields = (fields + self.field_pos).reshape(b * t, f, dm)
+            x = self.field_attn(fields).mean(dim=1).reshape(b, t, dm)
+        else:
+            x = (
+                self.emb_type(order_types)
+                + self.emb_price(price_bins)
+                + self.emb_vol_int(vol_int_bins)
+                + self.emb_vol_dec(vol_dec_bins)
+                + self.emb_interval(interval_bins)
+            )
 
         # Build FiLM conditioning: [time_sin, time_cos, lob_volumes]
         film_cond = None
@@ -251,6 +300,9 @@ class OrderModel(nn.Module):
 
         if lob_volumes is not None:
             x = x + self.lob_proj(lob_volumes)
+
+        if regime is not None and self.config.regime_dim > 0:
+            x = x + self.regime_proj(regime)
 
         # Concatenate conditioning for FiLM (only if both available)
         if tod_features is not None and lob_volumes is not None:
@@ -317,6 +369,7 @@ class OrderModel(nn.Module):
         lob_volumes: torch.Tensor | None = None,
         time_of_day: torch.Tensor | None = None,
         mid_deltas: torch.Tensor | None = None,
+        regime: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Forward pass. Returns dict of per-field logits, each (B, T, field_size)."""
         embeds, film_cond = self._embed(
@@ -328,6 +381,7 @@ class OrderModel(nn.Module):
             lob_volumes,
             time_of_day,
             mid_deltas,
+            regime,
         )
         hidden = self._run_backbone(embeds, film_cond)
 
@@ -343,13 +397,14 @@ class OrderModel(nn.Module):
         lob_volumes: torch.Tensor | None = None,
         time_of_day: torch.Tensor | None = None,
         mid_deltas: torch.Tensor | None = None,
+        regime: torch.Tensor | None = None,
         past_key_values=None,
         position_offset: int = 0,
     ) -> dict[str, torch.Tensor]:
         """Cache-aware forward. Pass DynamicCache + current length; cache is mutated in place."""
         embeds, film_cond = self._embed(
             order_types, price_bins, vol_int_bins, vol_dec_bins,
-            interval_bins, lob_volumes, time_of_day, mid_deltas,
+            interval_bins, lob_volumes, time_of_day, mid_deltas, regime,
         )
         hidden = self._run_backbone(
             embeds, film_cond,
@@ -418,9 +473,9 @@ class OrderModel(nn.Module):
         return generated
 
 
-# Order type class weights: deprioritize cancel, prioritize bid/ask direction
-# Cancel (48% of data) at 0.5, bid (38%) at 2.0, ask (14%) at 4.0
-_ORDER_TYPE_WEIGHTS = torch.tensor([2.0, 4.0, 0.5])  # [bid, ask, cancel]
+# Equal per-class weights. Upweighting the rare directional/execution classes over
+# the easy cancel-guess forced usability at the cost of generalization.
+_ORDER_TYPE_WEIGHTS = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0])  # [bid, ask, cancel, exec_buy, exec_sell]
 
 # Per-field loss multipliers: order_type and price matter most for trading.
 # Interval reduced from 1.0 → 0.3: it consumed ~30% of total loss at ~6% accuracy,
@@ -453,34 +508,13 @@ def _soft_ordinal_targets(labels: torch.Tensor, n_bins: int, sigma: float) -> to
     return torch.softmax(-(dist ** 2) / (2.0 * sigma * sigma), dim=-1)
 
 
-def _finite_rows_loss(name, flat_logits, flat_labels, label_smooth_sigma):
-    """Per-field loss over only the rows whose loss is finite (drops degenerate
-    positions). Returns nan if every row is non-finite. Mirrors compute_loss's
-    reductions, including F.cross_entropy's weighted-mean normalisation."""
-    device = flat_logits.device
-    if name == "order_type":
-        weight = _ORDER_TYPE_WEIGHTS.to(device)
-        per_row = F.cross_entropy(flat_logits, flat_labels, weight=weight, reduction="none")
-        finite = torch.isfinite(per_row)
-        if not bool(finite.any()):
-            return per_row.new_tensor(float("nan"))
-        return per_row[finite].sum() / weight[flat_labels][finite].sum()
-    if label_smooth_sigma > 0 and name in _ORDINAL_FIELDS:
-        n_bins = flat_logits.size(-1)
-        soft_targets = _soft_ordinal_targets(flat_labels, n_bins, label_smooth_sigma)
-        log_probs = F.log_softmax(flat_logits, dim=-1)
-        per_row = -(soft_targets * log_probs).sum(dim=-1)
-    else:
-        per_row = F.cross_entropy(flat_logits, flat_labels, reduction="none")
-    finite = torch.isfinite(per_row)
-    return per_row[finite].mean() if bool(finite.any()) else per_row.new_tensor(float("nan"))
-
-
 def compute_loss(
     logits: dict[str, torch.Tensor],
     labels: dict[str, torch.Tensor],
     label_smooth_sigma: float = 0.0,
     mask_nonfinite_rows: bool = False,
+    order_type_weights: "torch.Tensor | list[float] | None" = None,
+    exclude_fields: tuple[str, ...] = (),
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Weighted sum of per-field CE losses. Returns (total_loss, per_field_losses).
 
@@ -495,30 +529,27 @@ def compute_loss(
     bit-exactly. Typical non-zero values are 0.5-2.0 bins; pick by
     empirical sweep, not intuition.
 
-    `mask_nonfinite_rows=True` (validator-scoring path): when ANY field at
-    a token row produces a non-finite per-row loss, the WHOLE row is
-    dropped from EVERY field's reduction. Previously the mask applied
-    per-field, so a row with `order_type=NaN` but finite `price` still
-    contributed its `price` value to the field-loss average — biasing the
-    score for fields that aren't actually degenerate at the token. With
-    the whole-row mask, a single bad token doesn't poison any field's
-    aggregate. Training (mask_nonfinite_rows=False) keeps the original
-    fast path bit-exactly.
+    `order_type_weights` overrides the order_type class weights
+    (None = the module default `_ORDER_TYPE_WEIGHTS`). Pass an all-ones
+    vector of length n_types for the natural class balance.
     """
     device = next(iter(logits.values())).device
-    details: dict[str, float] = {}
-    field_weight_map = {name: _FIELD_WEIGHTS.get(name, 1.0) for name in logits}
+    ot_weight = (
+        _ORDER_TYPE_WEIGHTS
+        if order_type_weights is None
+        else torch.as_tensor(order_type_weights, dtype=torch.float32)
+    ).to(device)
+    fields = [(n, lg) for n, lg in logits.items() if n not in exclude_fields]
 
     if not mask_nonfinite_rows:
-        # Fast path — training. Unchanged behaviour, bit-exact.
+        # Training path — reduced-mean per field, unchanged (bit-exact).
         total = torch.tensor(0.0, device=device)
-        for name, field_logits in logits.items():
-            field_labels = labels[name]
+        details = {}
+        for name, field_logits in fields:
             flat_logits = field_logits.reshape(-1, field_logits.size(-1))
-            flat_labels = field_labels.reshape(-1)
+            flat_labels = labels[name].reshape(-1)
             if name == "order_type":
-                weight = _ORDER_TYPE_WEIGHTS.to(device)
-                loss = F.cross_entropy(flat_logits, flat_labels, weight=weight)
+                loss = F.cross_entropy(flat_logits, flat_labels, weight=ot_weight)
             elif label_smooth_sigma > 0 and name in _ORDINAL_FIELDS:
                 n_bins = flat_logits.size(-1)
                 soft_targets = _soft_ordinal_targets(flat_labels, n_bins, label_smooth_sigma)
@@ -526,64 +557,53 @@ def compute_loss(
                 loss = -(soft_targets * log_probs).sum(dim=-1).mean()
             else:
                 loss = F.cross_entropy(flat_logits, flat_labels)
-            total = total + loss * field_weight_map[name]
+            total = total + loss * _FIELD_WEIGHTS.get(name, 1.0)
             details[name] = loss.item()
         return total, details
 
-    # Validator scoring path — whole-row mask. Compute per-row losses for
-    # every field, AND their finiteness masks, then reduce each field over
-    # the globally-finite rows.
-    per_row_losses: dict[str, torch.Tensor] = {}
-    weights: dict[str, torch.Tensor | None] = {}  # only order_type carries a per-row weight
-    for name, field_logits in logits.items():
-        field_labels = labels[name]
+    # Scoring path (validators pass mask_nonfinite_rows=True): compute each
+    # field's per-row loss, then drop any row that is non-finite in ANY field
+    # from EVERY field's reduction, so all per-field losses reduce over the
+    # SAME surviving rows. A per-field mask would let a row that's degenerate in
+    # one field still bias the other fields' means — cross-field contamination
+    # that skews the summed score across miners. Clean batches keep every row,
+    # so scoring on healthy data is unchanged.
+    per_row: dict[str, torch.Tensor] = {}
+    flat_labels_by: dict[str, torch.Tensor] = {}
+    for name, field_logits in fields:
         flat_logits = field_logits.reshape(-1, field_logits.size(-1))
-        flat_labels = field_labels.reshape(-1)
+        flat_labels = labels[name].reshape(-1)
+        flat_labels_by[name] = flat_labels
         if name == "order_type":
-            w = _ORDER_TYPE_WEIGHTS.to(device)
-            per_row_losses[name] = F.cross_entropy(flat_logits, flat_labels, weight=w, reduction="none")
-            weights[name] = w[flat_labels]
+            per_row[name] = F.cross_entropy(
+                flat_logits, flat_labels, weight=ot_weight, reduction="none"
+            )
         elif label_smooth_sigma > 0 and name in _ORDINAL_FIELDS:
             n_bins = flat_logits.size(-1)
             soft_targets = _soft_ordinal_targets(flat_labels, n_bins, label_smooth_sigma)
             log_probs = F.log_softmax(flat_logits, dim=-1)
-            per_row_losses[name] = -(soft_targets * log_probs).sum(dim=-1)
-            weights[name] = None
+            per_row[name] = -(soft_targets * log_probs).sum(dim=-1)
         else:
-            per_row_losses[name] = F.cross_entropy(flat_logits, flat_labels, reduction="none")
-            weights[name] = None
+            per_row[name] = F.cross_entropy(flat_logits, flat_labels, reduction="none")
 
-    # Whole-row mask: a row is kept only if every field's per-row loss is
-    # finite. Token counts MUST agree across fields (same B×T flatten);
-    # asserted by min-length to fail loudly if a caller violates this.
-    row_counts = {name: t.numel() for name, t in per_row_losses.items()}
-    n_rows = min(row_counts.values())
-    if any(c != n_rows for c in row_counts.values()):
-        raise ValueError(
-            f"compute_loss: per-field per-row tensor sizes diverge {row_counts}; "
-            "callers must pass logits/labels with consistent B*T flattening."
-        )
-    global_finite = torch.ones(n_rows, dtype=torch.bool, device=device)
-    for t in per_row_losses.values():
-        global_finite &= torch.isfinite(t)
+    finite = None
+    for pr in per_row.values():
+        f = torch.isfinite(pr)
+        finite = f if finite is None else (finite & f)
+    any_finite = finite is not None and bool(finite.any())
 
-    # If ALL rows are non-finite, fall back to NaN per-field (matches the
-    # prior _finite_rows_loss behaviour, which returned NaN in that case).
-    any_finite = bool(global_finite.any())
     total = torch.tensor(0.0, device=device)
-    for name, prl in per_row_losses.items():
+    details = {}
+    for name, pr in per_row.items():
         if not any_finite:
-            details[name] = float("nan")
-            total = total + prl.new_tensor(float("nan")) * field_weight_map[name]
-            continue
-        w = weights[name]
-        if w is not None:
-            # F.cross_entropy weighted-mean: sum(loss*w) / sum(w) over the mask
-            masked = prl[global_finite]
-            masked_w = w[global_finite]
-            loss = masked.sum() / masked_w.sum()
+            loss = pr.new_tensor(float("nan"))
+        elif name == "order_type":
+            # Match F.cross_entropy(weight=...) mean over survivors:
+            # sum(w_y * l) / sum(w_y). per_row already carries the w_y factor.
+            w = ot_weight[flat_labels_by[name]]
+            loss = pr[finite].sum() / w[finite].sum()
         else:
-            loss = prl[global_finite].mean()
-        total = total + loss * field_weight_map[name]
+            loss = pr[finite].mean()
+        total = total + loss * _FIELD_WEIGHTS.get(name, 1.0)
         details[name] = loss.item()
     return total, details

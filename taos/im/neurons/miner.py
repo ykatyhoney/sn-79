@@ -175,6 +175,7 @@ if __name__ != "__mp_main__":
                     "data_access_key": synapse.data_access_key,
                     "data_secret_key": synapse.data_secret_key,
                     "validator_uid": synapse.validator_uid,
+                    "advice":        synapse.advice,
                 })
                 bt.logging.info(
                     f"[GTX] assignment queued: round={synapse.round} "

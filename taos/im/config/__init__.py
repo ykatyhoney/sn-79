@@ -187,6 +187,15 @@ def add_im_validator_args(cls, parser):
     )
 
     parser.add_argument(
+        "--scoring.pnl.lookback",
+        type=int,
+        help="Window in simulation nanoseconds of realized P&L observations used for the "
+             "PnL-score component. Independent of scoring.kappa.lookback; defaults to the "
+             "same 3h so behaviour is unchanged unless explicitly tuned.",
+        default=10800_000_000_000,
+    )
+
+    parser.add_argument(
         "--scoring.pnl.normalization.method",
         type=str,
         help="Method for normalizing P&L: 'daily_return'",
@@ -274,6 +283,13 @@ def add_im_validator_args(cls, parser):
              "has no block-sync config. Default 25 ≈ 5min at mainnet 12s/block, "
              "matches the 5min training window. Pass 0 for timer mode (proxy only).",
         default=25,
+    )
+    parser.add_argument(
+        "--gentrx.books_per_miner",
+        type=int,
+        help="Books (pages) assigned per miner per round. More pages = more "
+             "data per window (a bigger one-pass batch), less overfit.",
+        default=3,
     )
     parser.add_argument(
         "--scoring.activity.trade_volume_sampling_interval",

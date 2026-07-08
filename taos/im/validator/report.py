@@ -759,7 +759,7 @@ def publish_gentrx_gauges(self: ReportingService) -> None:
     g.labels(wallet=wallet_addr, netuid=netuid, sim_id=simid, gentrx_gauge_name="active_miners").set(active_miners)
 
     cfg = getattr(self, 'gentrx_config', {}) or {}
-    for key in ('min_score', 'overfit_penalty', 'overfit_ratio', 'books_per_miner', 'val_fraction'):
+    for key in ('min_score', 'overfit_ratio', 'books_per_miner', 'val_fraction'):
         v = cfg.get(key)
         if v is not None:
             g.labels(wallet=wallet_addr, netuid=netuid, sim_id=simid, gentrx_gauge_name=key).set(float(v))

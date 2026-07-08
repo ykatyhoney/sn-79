@@ -149,6 +149,13 @@ except Exception:
 
 if [ "$PRESERVE_SIMULATOR" = "0" ]; then
     _pm2_clean simulator validator "$VALIDATOR_NAME"
+    # Free the memory-heavy gradient server BEFORE the C++ rebuild so it doesn't
+    # contend for RAM/CPU during cmake (BUILD_JOBS is memory-bounded, so a 6GB
+    # resident aggregator throttles the build). The GenTRX block below restarts
+    # it fresh; its aggregation state persists on disk and reloads on restart.
+    if [ -n "$GENTRX_MODE" ]; then
+        pm2 stop gradient-server 2>/dev/null || true
+    fi
     [ "$USE_TMUX" = "1" ] && tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
 fi
 
@@ -231,6 +238,12 @@ fi
 
 MECHID_ARG="--neuron.mechid $MECHID"
 ENGINE_ARGS="--engine simulation --simulation.xml_config ../../../simulate/trading/run/config/$SIMULATION_CONFIG.xml"
+# Benchmark agents config file. Dev-local env files set BENCHMARK_AGENTS to the
+# test config (../config/benchmark_agents_test.json); when unset the validator
+# falls back to its default (../config/benchmark_agents.json). Mirrors the
+# --benchmark.agents wiring in run_validator.sh / run_mvtrx.sh.
+BENCHMARK_ARG=""
+[ -n "${BENCHMARK_AGENTS:-}" ] && BENCHMARK_ARG="--benchmark.agents ${BENCHMARK_AGENTS}"
 
 VALIDATOR_CMD="python $(pwd)/validator.py \
   --netuid $NETUID \
@@ -245,6 +258,7 @@ VALIDATOR_CMD="python $(pwd)/validator.py \
   --neuron.timeout $TIMEOUT \
   $MECHID_ARG \
   $ENGINE_ARGS \
+  $BENCHMARK_ARG \
   $GENTRX_VAL_ARGS"
 GENTRX_API_KEY="${GENTRX_API_KEY:-}" \
 GENTRX_VALIDATOR_S3_ENDPOINT_URL="${GENTRX_VALIDATOR_S3_ENDPOINT_URL:-}" \

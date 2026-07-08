@@ -37,7 +37,7 @@ from torch.utils.data import DataLoader
 from GenTRX.src.dataloader import create_dataloaders
 from GenTRX.src.metrics import StepMetrics
 from GenTRX.src.model import ModelConfig, OrderModel, compute_loss
-from GenTRX.src.tokenizer import OrderTokenizer, TokenizerConfig
+from GenTRX.src.tokenizer import TokenizerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -66,24 +66,51 @@ class TrainConfig:
     # the live training regime so offline-pretrained bootstrap checkpoints are
     # in-regime. See `model.compute_loss`.
     label_smooth_sigma: float = 1.0
+    # order_type class weights [bid, ask, cancel]; None = model default [2,4,0.5].
+    order_type_weights: list[float] | None = None
+    # Drop LOB / time-of-day / mid_delta conditioning (ablation) — predict from
+    # the event sequence alone, to test whether conditioning is a memorization leak.
+    use_conditioning: bool = True
+    # Content-only / event-clock: drop the wall-clock interval field from input
+    # (zeroed) and loss. Tests whether removing wall-clock time helps content.
+    predict_interval: bool = True
+    # Single integer volume: drop the fractional vol_dec head (real equity shares).
+    predict_vol_dec: bool = True
+
+
+def _excluded(predict_interval: bool, predict_vol_dec: bool) -> tuple[str, ...]:
+    """Fields dropped from the loss (zeroed inputs in _forward_batch)."""
+    excl = []
+    if not predict_interval:
+        excl.append("interval")
+    if not predict_vol_dec:
+        excl.append("vol_dec")
+    return tuple(excl)
 
 
 def _forward_batch(
     model: OrderModel,
     batch: dict[str, torch.Tensor],
     device: str,
+    use_conditioning: bool = True,
+    predict_interval: bool = True,
+    predict_vol_dec: bool = True,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     """Extract batch, run forward, return (logits_dict, labels_dict)."""
     ot = batch["order_types"].to(device)
     pb = batch["price_bins"].to(device)
     vi = batch["vol_int_bins"].to(device)
-    vd = batch["vol_dec_bins"].to(device)
-    ib = batch["interval_bins"].to(device)
-    lob = batch["lob_volumes"].to(device)
-    tod = batch["time_of_day"].to(device)
-    md = batch["mid_deltas"].to(device)
+    vd = (batch["vol_dec_bins"].to(device) if predict_vol_dec
+          else torch.zeros_like(batch["vol_dec_bins"]).to(device))
+    ib = (batch["interval_bins"].to(device) if predict_interval
+          else torch.zeros_like(batch["interval_bins"]).to(device))
+    lob = batch["lob_volumes"].to(device) if use_conditioning else None
+    tod = batch["time_of_day"].to(device) if use_conditioning else None
+    md = batch["mid_deltas"].to(device) if use_conditioning else None
+    rg = batch.get("regime")
+    rg = rg.to(device) if (rg is not None and use_conditioning) else None
 
-    logits = model(ot, pb, vi, vd, ib, lob, tod, md)
+    logits = model(ot, pb, vi, vd, ib, lob, tod, md, regime=rg)
 
     labels = {
         "order_type": batch["label_order_type"].to(device),
@@ -290,10 +317,15 @@ def train(
         logger.info("Epoch %d/%d — %d batches", epoch, start_epoch + train_cfg.epochs - 1, n_batches)
 
         for batch in train_loader:
-            logits, labels = _forward_batch(model, batch, device)
+            logits, labels = _forward_batch(
+                model, batch, device, train_cfg.use_conditioning,
+                train_cfg.predict_interval, train_cfg.predict_vol_dec,
+            )
             loss, field_losses = compute_loss(
                 logits, labels,
                 label_smooth_sigma=train_cfg.label_smooth_sigma,
+                order_type_weights=train_cfg.order_type_weights,
+                exclude_fields=_excluded(train_cfg.predict_interval, train_cfg.predict_vol_dec),
             )
 
             # NaN guard
@@ -354,7 +386,7 @@ def train(
                 )
 
             if global_step % train_cfg.val_interval == 0:
-                vl, vl_fields, vm = _validate(model, val_loader, device, label_smooth_sigma=train_cfg.label_smooth_sigma)
+                vl, vl_fields, vm = _validate(model, val_loader, device, label_smooth_sigma=train_cfg.label_smooth_sigma, order_type_weights=train_cfg.order_type_weights, use_conditioning=train_cfg.use_conditioning, predict_interval=train_cfg.predict_interval, predict_vol_dec=train_cfg.predict_vol_dec)
                 val_losses.append(vl)
                 field_str = " ".join(f"{k}={v:.3f}" for k, v in vl_fields.items())
                 logger.info(
@@ -423,7 +455,7 @@ def train(
 
         avg_train = epoch_loss / max(epoch_steps, 1)
         train_losses.append(avg_train)
-        vl, vl_fields, val_metrics = _validate(model, val_loader, device, label_smooth_sigma=train_cfg.label_smooth_sigma)
+        vl, vl_fields, val_metrics = _validate(model, val_loader, device, label_smooth_sigma=train_cfg.label_smooth_sigma, order_type_weights=train_cfg.order_type_weights, use_conditioning=train_cfg.use_conditioning, predict_interval=train_cfg.predict_interval, predict_vol_dec=train_cfg.predict_vol_dec)
         val_losses.append(vl)
         if vl < best_val:
             best_val = vl
@@ -474,6 +506,10 @@ def _validate(
     device: str,
     max_batches: int = 200,
     label_smooth_sigma: float = 0.0,
+    order_type_weights: list[float] | None = None,
+    use_conditioning: bool = True,
+    predict_interval: bool = True,
+    predict_vol_dec: bool = True,
 ) -> tuple[float, dict[str, float], StepMetrics]:
     """Returns (total_loss, per_field_avg_losses, accuracy_metrics)."""
     model.eval()
@@ -485,9 +521,12 @@ def _validate(
         for i, batch in enumerate(loader):
             if i >= max_batches:
                 break
-            logits, labels = _forward_batch(model, batch, device)
+            logits, labels = _forward_batch(model, batch, device, use_conditioning,
+                                            predict_interval, predict_vol_dec)
             loss, field_losses = compute_loss(
-                logits, labels, label_smooth_sigma=label_smooth_sigma
+                logits, labels, label_smooth_sigma=label_smooth_sigma,
+                order_type_weights=order_type_weights,
+                exclude_fields=_excluded(predict_interval, predict_vol_dec),
             )
             total += loss.item()
             for k, v in field_losses.items():

@@ -164,6 +164,15 @@ def test_create_assignments_from_available_data(mock_server, http_server):
         assert a["model_version"] == 1
 
 
+def test_create_assignments_returns_empty_when_no_pages(mock_server, http_server):
+    """Page-based: no flushed pages yet (books known but empty) → no assignments."""
+    import asyncio
+    for b in mock_server.books.values():
+        b["parquets"] = []
+    s = _service(http_server, miner_uids=[0], poll_interval=0)
+    status = asyncio.run(s._fetch_data_status())
+    assignments = s._create_assignments(status)
+    assert assignments == {}
 def test_create_assignments_returns_empty_when_insufficient_data(mock_server, http_server):
     """When max_ts < window_ns, no assignments are created."""
     import asyncio
@@ -172,6 +181,88 @@ def test_create_assignments_returns_empty_when_insufficient_data(mock_server, ht
     status = asyncio.run(s._fetch_data_status())
     assignments = s._create_assignments(status)
     assert assignments == {}
+
+
+def test_create_assignments_iid_shared_window(mock_server, http_server):
+    """Flavor B: per-miner IID book sample, but ONE shared [ts_start, ts_end]
+    window across all miners (so held-out scoring uses the same baseline)."""
+    import asyncio
+    # Distinct per-book spans so a shared window is observable.
+    for i, b in enumerate(mock_server.books.values()):
+        b["parquets"] = [[f"page{i}.parquet", i * 100, i * 100 + 100]]
+    s = _service(http_server, miner_uids=[0, 1, 2, 3], poll_interval=0)
+    status = asyncio.run(s._fetch_data_status())
+    s._current_round = 7
+    a = s._create_assignments(status)
+    assert set(a.keys()) == {0, 1, 2, 3}
+    starts = {x["ts_start"] for x in a.values()}
+    ends = {x["ts_end"] for x in a.values()}
+    assert len(starts) == 1 and len(ends) == 1  # one shared window for all miners
+    for x in a.values():
+        assert len(x["books"]) == len(set(x["books"]))  # a sample, no repeats
+    assert s._create_assignments(status) == a  # deterministic per round
+
+
+def test_push_round_includes_disjoint_val_books(mock_server, http_server):
+    """The round payload carries the rotating held-out split, disjoint from
+    every miner's assigned (training) books — the server's single source of
+    truth for what to score held-out."""
+    import asyncio
+    s = _service(http_server, miner_uids=[0, 1, 2], poll_interval=0)
+    status = asyncio.run(s._fetch_data_status())
+    s._current_round = 5
+    a = s._create_assignments(status)
+    assert asyncio.run(s._push_round(5, a)) is True
+    pushed = mock_server.received_rounds[-1]
+    val_books = set(pushed["val_books"])
+    assert val_books  # non-empty split
+    for asg in a.values():
+        assert not (set(asg["books"]) & val_books)  # never train on val books
+
+
+def test_create_assignments_flavor_a_identical_books(mock_server, http_server):
+    """Flavor A toggle: every miner gets the identical book sample."""
+    import asyncio
+    for i, b in enumerate(mock_server.books.values()):
+        b["parquets"] = [[f"page{i}.parquet", i * 100, i * 100 + 100]]
+    s = _service(http_server, miner_uids=[0, 1, 2], poll_interval=0)
+    s._iid_shared_books = True
+    status = asyncio.run(s._fetch_data_status())
+    s._current_round = 3
+    a = s._create_assignments(status)
+    book_sets = {tuple(sorted(x["books"])) for x in a.values()}
+    assert len(book_sets) == 1  # identical across miners
+
+
+def test_split_keyed_on_round_id_not_current_round(mock_server, http_server):
+    """The val/train split (and per-miner book sample) is seeded on the round
+    being ASSIGNED, not self._current_round.
+
+    Regression: seeds used self._current_round, which only advances after a
+    successful push. In block mode new_round can jump by >1 (missed blocks), so
+    two validators with different push histories would derive a DIFFERENT split
+    for the same round_id. Passing round_id must fully determine the split
+    regardless of _current_round.
+    """
+    import asyncio
+    s = _service(http_server, miner_uids=[0, 1, 2], poll_interval=0)
+    status = asyncio.run(s._fetch_data_status())
+
+    s._current_round = 0
+    a1 = s._create_assignments(status, round_id=7)
+    val1 = set(s._val_books)
+    books1 = {uid: tuple(sorted(x["books"])) for uid, x in a1.items()}
+
+    # Same round_id, a wildly different _current_round (validator that missed
+    # blocks): the split and per-miner samples must be identical.
+    s._current_round = 99
+    a2 = s._create_assignments(status, round_id=7)
+    val2 = set(s._val_books)
+    books2 = {uid: tuple(sorted(x["books"])) for uid, x in a2.items()}
+
+    assert val1 == val2
+    assert books1 == books2
+    assert all(x["round"] == 7 for x in a2.values())
 
 
 def test_push_round_sends_to_server(mock_server, http_server):
@@ -242,8 +333,10 @@ def test_poll_and_deliver_full_cycle(mock_server, http_server):
 
 
 def test_poll_and_deliver_no_data(mock_server, http_server):
-    """When data is insufficient, no assignments are created or delivered."""
+    """When no pages are flushed yet, no assignments are created or delivered."""
     mock_server.max_ts = 0  # no data
+    for b in mock_server.books.values():
+        b["parquets"] = []
 
     delivered = []
 
@@ -374,6 +467,7 @@ def test_spool_persists_unsent_across_instance(http_server, mock_server, tmp_pat
 
 def test_spool_unbounded_queue_replays_all(http_server, mock_server, tmp_path):
     """C3: when spool is enabled, queue is unbounded so replay > 256 still drains."""
+    import time as _t
     spool = str(tmp_path / "spool.bin")
     packager = MagicMock()
     packager.extract_state.return_value = {"step": 1, "books": {}}

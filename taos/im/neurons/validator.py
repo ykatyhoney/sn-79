@@ -317,6 +317,8 @@ if __name__ != "__mp_main__":
             core_allocation = get_core_allocation(
                 sltp_cores_count=int(os.environ.get("SLTP_CORES_COUNT", "0")),
                 grad_server_cores=int(os.environ.get("GRAD_CORES_COUNT", "0")),
+                sim_cores_count=self._read_block_count(),
+                os_headroom=int(os.environ.get("OS_HEADROOM_CORES", "4")),
             )
             _engine = getattr(self.config, 'engine', 'simulation')
             self._query_ipc_prefix = 'exchange' if _engine == 'exchange' else 'validator'
@@ -424,6 +426,8 @@ if __name__ != "__mp_main__":
             core_allocation = get_core_allocation(
                 sltp_cores_count=int(os.environ.get("SLTP_CORES_COUNT", "0")),
                 grad_server_cores=int(os.environ.get("GRAD_CORES_COUNT", "0")),
+                sim_cores_count=self._read_block_count(),
+                os_headroom=int(os.environ.get("OS_HEADROOM_CORES", "4")),
             )
             # Use mode-specific IPC names so sim and exchange validators don't share queues.
             _engine = getattr(self.config, 'engine', 'simulation')
@@ -684,7 +688,6 @@ if __name__ != "__mp_main__":
             self.gentrx_scores = torch.zeros(
                 self.effective_max_uids, dtype=torch.float32, device=self.device
             )
-
             self.last_state = None
             self.last_response = None
             self.msgpack_error_counter = 0
@@ -702,7 +705,16 @@ if __name__ != "__mp_main__":
             core_allocation = get_core_allocation(
                 sltp_cores_count=int(os.environ.get("SLTP_CORES_COUNT", "0")),
                 grad_server_cores=int(os.environ.get("GRAD_CORES_COUNT", "0")),
+                sim_cores_count=self._read_block_count(),
+                os_headroom=int(os.environ.get("OS_HEADROOM_CORES", "4")),
             )
+            # Dedicated simulator core slice (blockCount-sized); pin the taosim
+            # process to it so its worker threads don't contend with reward/save
+            # on scoring rounds. Re-pinned each maintenance cycle (_sync_and_check).
+            self.sim_cores = core_allocation.get('sim', [])
+            if self.sim_cores:
+                bt.logging.info(f"Simulator core slice: {self.sim_cores}")
+                self._pin_simulator()
             ipc_cores = core_allocation['ipc']
             if len(ipc_cores) >= 2:
                 mid = len(ipc_cores) // 2
@@ -732,6 +744,29 @@ if __name__ != "__mp_main__":
             self.save_state_executor = ThreadPoolExecutor(max_workers=1)
             self.maintenance_executor = ThreadPoolExecutor(max_workers=1)
             self.maintenance_subtensor = bt.Subtensor(self.config.subtensor.chain_endpoint)
+
+            # Metagraph sync worker: the resync's substrate scale-decode is a
+            # 3-5s GIL burst that stalls whichever round it overlaps — do the
+            # fetch+decode in a subprocess and ship back the pickled metagraph
+            # (resync_metagraph swaps it in; falls back to in-process sync when
+            # the worker is unavailable). Pinned to the unallocated OS-headroom
+            # cores. METAGRAPH_WORKER=0 disables (legacy in-process sync).
+            self._mg_worker = None
+            if os.environ.get("METAGRAPH_WORKER", "1") != "0" and not self.config.mock:
+                try:
+                    from taos.im.validator.metagraph_worker import MetagraphSyncWorker
+                    _allocated = {c for v in core_allocation.values() for c in v}
+                    _leftover = sorted(set(range(os.cpu_count() or 1)) - _allocated)
+                    self._mg_worker = MetagraphSyncWorker(
+                        self.subtensor.chain_endpoint, self.config.netuid, cores=_leftover
+                    )
+                    self._mg_worker.start()
+                    bt.logging.info(
+                        f"Metagraph sync worker started (cores: {_leftover or 'unpinned'})"
+                    )
+                except Exception as e:
+                    self._mg_worker = None
+                    bt.logging.warning(f"Metagraph sync worker unavailable, syncing in-process: {e}")
 
             self.maintaining = False
             self.compressing = False
@@ -1268,9 +1303,30 @@ if __name__ != "__mp_main__":
         def resync_metagraph(self):
             """Resyncs the metagraph and updates hotkeys and scores."""
             bt.logging.trace("resync_metagraph()")
-            previous_metagraph = copy.deepcopy(self.metagraph)
-            bt.logging.debug("Syncing metagraph...")
-            self.metagraph.sync(subtensor=self.subtensor)
+            # Preferred path: fetch+decode in the metagraph sync worker process
+            # and swap the returned object in (replace-don't-mutate also makes
+            # `previous_metagraph` a free reference instead of a deepcopy).
+            # Any worker failure falls back to the legacy in-process sync.
+            _new_mg = None
+            _worker = getattr(self, '_mg_worker', None)
+            if _worker is not None:
+                _new_mg = _worker.sync()
+                if _new_mg is None:
+                    bt.logging.warning("Metagraph worker sync failed — falling back to in-process sync")
+            if _new_mg is not None:
+                previous_metagraph = self.metagraph
+                # Worker ships the metagraph with .subtensor stripped (websocket
+                # is unpicklable) — reattach ours so the object is functionally
+                # identical to an in-process-synced one.
+                try:
+                    _new_mg.subtensor = self.subtensor
+                except Exception:
+                    pass
+                self.metagraph = _new_mg
+            else:
+                previous_metagraph = copy.deepcopy(self.metagraph)
+                bt.logging.debug("Syncing metagraph...")
+                self.metagraph.sync(subtensor=self.subtensor)
             if previous_metagraph.axons == self.metagraph.axons and len(self.hotkeys) == len(self.metagraph.hotkeys):
                 bt.logging.debug("No axon changes!")
                 # Re-register benchmark buckets even when the metagraph is unchanged,
@@ -1360,6 +1416,15 @@ if __name__ != "__mp_main__":
                     if bkt:
                         _gtx.register_benchmark_bucket(bm['uid'], bkt)
 
+            # Re-register benchmark buckets after every resync so that a gradient
+            # server restart self-heals without requiring a validator restart.
+            _gtx = getattr(self, '_gentrx', None)
+            if _gtx is not None:
+                for bm in self.benchmark_agents:
+                    bkt = bm.get('gentrx_bucket')
+                    if bkt:
+                        _gtx.register_benchmark_bucket(bm['uid'], bkt)
+
         async def _maintain(self) -> None:
             """
             Executes metagraph sync and maintenance operations asynchronously.
@@ -1374,14 +1439,32 @@ if __name__ != "__mp_main__":
             """
             try:
                 self.maintaining = True
-                bt.logging.info(f"Synchronizing at Step {self.step}...")
+                # Full chain sync (metagraph resync + set_weights check) only every
+                # METAGRAPH_SYNC_EVERY-th firing: the metagraph scale-decode is a
+                # 3-4s GIL burst that lands on some round's receive every interval,
+                # and 26s freshness buys nothing (weights_rate_limit is ~72min,
+                # dereg/axon changes tolerate ~2min). Simulator health check +
+                # core re-pin still run EVERY firing (sim-death detection stays
+                # at interval latency).
+                self._maintain_count = getattr(self, '_maintain_count', 0) + 1
+                _sync_every = max(1, int(os.environ.get("METAGRAPH_SYNC_EVERY", "4")))
+                do_sync = (self._maintain_count % _sync_every) == 1 or _sync_every == 1
+                if do_sync:
+                    bt.logging.info(f"Synchronizing at Step {self.step}...")
+                else:
+                    bt.logging.debug(
+                        f"Maintenance health check at Step {self.step} "
+                        f"(sync {self._maintain_count % _sync_every}/{_sync_every})"
+                    )
                 start = time.time()
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(
                     self.maintenance_executor,
-                    self._sync_and_check
+                    self._sync_and_check,
+                    do_sync
                 )
-                bt.logging.info(f"Synchronized ({time.time()-start:.4f}s)")
+                if do_sync:
+                    bt.logging.info(f"Synchronized ({time.time()-start:.4f}s)")
 
             except Exception as ex:
                 self.pagerduty_alert(f"Failed to sync: {ex}", details={"trace": traceback.format_exc()})
@@ -1428,6 +1511,7 @@ if __name__ != "__mp_main__":
                                 data_access_key=assignment.get("data_access_key", ""),
                                 data_secret_key=assignment.get("data_secret_key", ""),
                                 validator_uid=my_uid,
+                                advice=assignment.get("advice", {}),
                             ),
                         ))
                     except Exception as exc:
@@ -1450,27 +1534,84 @@ if __name__ != "__mp_main__":
                 import traceback
                 gtx_log.error(traceback.format_exc())
 
-        def _sync_and_check(self):
+        def _read_block_count(self) -> int:
+            """Parse the simulation blockCount from the XML config (root attribute).
+
+            Read straight from the XML, not self.simulation, because core allocation
+            runs before the engine loads the config. Sizing the sim core slice to
+            blockCount means bumping blockCount in the XML scales the pin automatically.
+            Returns 0 on any error or when SIM_CORE_PIN=0 (→ no pinning; sim floats).
+            """
+            if os.environ.get("SIM_CORE_PIN", "1") == "0":
+                return 0
+            try:
+                import xml.etree.ElementTree as ET
+
+                root = ET.parse(self.config.simulation.xml_config).getroot()
+                return int(root.attrib["blockCount"])
+            except Exception as ex:
+                bt.logging.warning(f"_read_block_count: could not read blockCount ({ex}); sim will not be pinned")
+                return 0
+
+        def _pin_simulator(self) -> None:
+            """Pin the C++ simulator process to its dedicated core slice.
+
+            The simulator is a separate pm2 process launched with no affinity, so its
+            worker threads otherwise float across the reward/save cores and starve the
+            next-state handshake on scoring rounds. Bind it to self.sim_cores (disjoint
+            from reward+save) to fix that. Best-effort + idempotent: re-run each
+            maintenance cycle to catch simulator restarts.
+            """
+            sim_cores = getattr(self, "sim_cores", None)
+            if not sim_cores:
+                return
+            try:
+                import psutil
+
+                target = set(sim_cores)
+                for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+                    try:
+                        # Match the actual simulator binary only — NOT `htop -f taosim`
+                        # (the run_validator monitor) or anything else that merely
+                        # references taosim in its args.
+                        name = proc.info.get("name") or ""
+                        cmdline = proc.info.get("cmdline") or []
+                        exe = cmdline[0] if cmdline else ""
+                        if name != "taosim" and os.path.basename(exe) != "taosim":
+                            continue
+                        if set(proc.cpu_affinity()) == target:
+                            continue
+                        proc.cpu_affinity(sim_cores)
+                        bt.logging.info(f"Pinned simulator (pid {proc.info['pid']}) to cores: {sim_cores}")
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+            except Exception as ex:
+                bt.logging.warning(f"_pin_simulator: {ex}")
+
+        def _sync_and_check(self, do_sync: bool = True):
             """
             Performs synchronous metagraph maintenance and simulator health checks.
 
             Steps:
-                - Runs Bittensor sync (without saving state).
+                - Runs Bittensor sync (without saving state) when do_sync is True.
                 - Verifies simulator health.
                 - Restarts simulator if unhealthy.
 
             Returns:
                 None
             """
-            # Use a dedicated subtensor connection so this thread doesn't
-            # share a websocket with the chain data provider running concurrently.
-            primary, self.subtensor = self.subtensor, self.maintenance_subtensor
-            try:
-                self.sync(save_state=False)
-            finally:
-                self.subtensor = primary
+            if do_sync:
+                # Use a dedicated subtensor connection so this thread doesn't
+                # share a websocket with the chain data provider running concurrently.
+                primary, self.subtensor = self.subtensor, self.maintenance_subtensor
+                try:
+                    self.sync(save_state=False)
+                finally:
+                    self.subtensor = primary
             if not check_simulator(self):
                 restart_simulator(self)
+            # Re-pin the simulator each cycle (also re-applies after a restart above).
+            self._pin_simulator()
 
         def maintain(self) -> None:
             """
@@ -1484,7 +1625,12 @@ if __name__ != "__mp_main__":
             Returns:
                 None
             """
-            if not self.maintaining and self.last_state and self.last_state.timestamp % self.config.scoring.interval == 2_000_000_000:
+            # Offset +3e9 (was +2e9): reward fires at +0 and completes ~2 rounds
+            # later, releasing _reward_lock — reporting serialize, save queueing
+            # and the mvtrx push all burst right then. +2 put the metagraph
+            # scale-decode inside that same post-reward herd; +3 is the free slot
+            # between the herd and the +4 save trigger. Same 1-interval cadence.
+            if not self.maintaining and self.last_state and self.last_state.timestamp % self.config.scoring.interval == 3_000_000_000:
                 bt.logging.debug(f"[MAINT] Scheduling from thread: {threading.current_thread().name}")
                 bt.logging.debug(f"[MAINT] Main loop ID: {id(self.main_loop)}, Current loop ID: {id(asyncio.get_event_loop())}")
                 self.main_loop.call_soon_threadsafe(lambda: self.main_loop.create_task(self._maintain()))
@@ -1714,6 +1860,7 @@ if __name__ != "__mp_main__":
                         'kappa_normalization_max': self.config.scoring.kappa.normalization_max,
                         'kappa_pnl_impact': self.config.scoring.kappa.pnl.impact,
                         'pnl_weight': self.config.scoring.pnl.weight,
+                        'pnl_lookback': getattr(self.config.scoring.pnl, 'lookback', self.config.scoring.kappa.lookback),
                         'gentrx_simulation_share': getattr(getattr(self.config.scoring, 'gentrx', None), 'simulation_share', 0.0) or 0.0,
                         'pnl_normalization_min_daily_return': self.config.scoring.pnl.min_daily_return,
                         'pnl_normalization_max_daily_return': self.config.scoring.pnl.max_daily_return,
@@ -1735,6 +1882,7 @@ if __name__ != "__mp_main__":
             # prep is visible without enabling DEBUG. Cheap; ~1 line per report.
             bt.logging.info(
                 "Reporting prep breakdown (s): "
+                f"fund={pnl_start-start:.2f} "
                 f"pnl={inv_start-pnl_start:.2f} inv={serialize_start-inv_start:.2f} "
                 f"volser={meta_start-serialize_start:.2f} meta={trades_start-meta_start:.2f} "
                 f"trades={state_start-trades_start:.2f} state={pos_start-state_start:.2f} "
@@ -1791,9 +1939,21 @@ if __name__ != "__mp_main__":
                 bt.logging.info(f"Prepared reporting data ({prep_time:.4f}s)")
 
                 serialize_start = time.time()
+
+                def _pack_report_chunked():
+                    # Byte-identical to msgpack.packb(data, use_bin_type=True)
+                    # (see persistence._stream_pack) but sliced into per-subtree
+                    # pack() calls so serializing the ~35MB report can't hold the
+                    # GIL solid against the event loop in the post-reward window.
+                    import io as _io
+                    from taos.im.validator.persistence import _SAVE_STREAM_DEPTH, _stream_pack
+                    _buf = _io.BytesIO()
+                    _stream_pack(msgpack.Packer(use_bin_type=True), _buf.write, data, _SAVE_STREAM_DEPTH)
+                    return _buf.getvalue()
+
                 data_bytes = await asyncio.get_event_loop().run_in_executor(
                     self.reporting_ipc_executor,
-                    lambda: msgpack.packb(data, use_bin_type=True)
+                    _pack_report_chunked
                 )
                 serialize_time = time.time() - serialize_start
                 data_mb = len(data_bytes) / 1024 / 1024
@@ -2293,6 +2453,10 @@ if __name__ != "__mp_main__":
             Returns:
             dict: Serialized response batch to be returned to the simulator.
             """
+            # [ROUND-PROFILE] phase timers — split the "State update handled"
+            # time into recv_norm/pre/forward/post/sched to locate the tail.
+            _rp_entry = time.time()
+
             # Per-tick simulation-specific updates (logDir, simulation_timestamp,
             # simulation_id, periodic compression/update_repo).
             self.engine.on_tick(state)
@@ -2344,7 +2508,9 @@ if __name__ != "__mp_main__":
 
             # Forward state synapse to miners and collect responses
             start = time.time()
+            _rp_fwd0 = start
             miner_responses = await forward(self, state)
+            _rp_fwd1 = time.time()
             bt.logging.debug(f"Gathered Response Batch ({time.time()-start}s)")
 
             # Exchange: send instructions to LOB, execute on-chain, inject trade events
@@ -2589,10 +2755,18 @@ if __name__ != "__mp_main__":
             self.last_state_time = time.time()
 
             # Calculate latest rewards, update miner scores, save state and publish metrics
+            _rp_sched0 = time.time()
             self.maintain()
             self.reward(state)
             self.save_state()
             self.report()
+            _rp_end = time.time()
+            bt.logging.info(
+                f"[ROUND-PROFILE] recv_norm={_rp_entry - receive_start:.3f}s "
+                f"pre={_rp_fwd0 - _rp_entry:.3f}s forward={_rp_fwd1 - _rp_fwd0:.3f}s "
+                f"post={_rp_sched0 - _rp_fwd1:.3f}s sched={_rp_end - _rp_sched0:.3f}s "
+                f"total={_rp_end - receive_start:.3f}s"
+            )
             bt.logging.info(f"State update handled ({time.time()-receive_start}s)")
 
             return response

@@ -197,6 +197,19 @@ class StatePackager:
         books = _val(state, "books") or {}
         packed_books: dict[int, BookPacket] = {}
 
+        # Exchange event timestamps arrive as Unix SECONDS (chain wall-clock),
+        # but GenTRX pages on a monotonic ns clock like the simulator's. Left as
+        # seconds they all collapse to ~1s (identical ddHHMMSS tag), the sim-time
+        # interval flush never advances, and every event lands in its own 1-row
+        # parquet — so no page ever reaches seq_len rows and miners can't train.
+        # Naive *1e9 would push it to Unix-ns and overflow the ddHHMMSS tag, so
+        # instead stamp exchange rows with the tick's block-relative ns timestamp
+        # (monotonic + tag-safe). The simulator already emits proper sim-ns and is
+        # left untouched (is_exchange=False).
+        tick_ts = int(_get(state, "timestamp", 0))
+        _cfg = _val(state, "config", None)
+        is_exchange = str(_get(_cfg, "simulation_id", "") or "") == "exchange"
+
         for book_id, book in books.items():
             bids = [
                 [_get_price(level), _get_qty(level)]
@@ -206,7 +219,7 @@ class StatePackager:
                 [_get_price(level), _get_qty(level)]
                 for level in (_get(book, "asks") or [])
             ]
-            events = self._extract_events(book)
+            events = self._extract_events(book, tick_ts, is_exchange)
             packed_books[int(book_id)] = {
                 "bids": bids,
                 "asks": asks,
@@ -215,7 +228,7 @@ class StatePackager:
 
         packet: TickPacket = {
             "step": self._step,
-            "ts": int(_get(state, "timestamp", 0)),
+            "ts": tick_ts,
             "books": packed_books,
         }
 
@@ -283,16 +296,24 @@ class StatePackager:
         out["simulation_id"] = sim_id
         return out
 
-    def _extract_events(self, book: Any) -> list[Event]:
+    def _extract_events(
+        self, book: Any, tick_ts: int = 0, is_exchange: bool = False
+    ) -> list[Event]:
         """Extract raw event dicts from book (no matching engine).
 
         Includes trade events (y="t") so the gradient server can reconstruct
         original order sizes: Order.quantity is the REMAINING size after fills,
         so we need Trade.taker_id + Trade.quantity to recover the full volume.
+
+        `t` (row timestamp) is the event's own sim-ns timestamp for the
+        simulator; for the exchange (whose events carry Unix seconds) it is the
+        tick's block-relative ns timestamp so GenTRX paging stays on a monotonic,
+        tag-safe ns clock. See extract_state for the rationale.
         """
         events = _get(book, "events") or []
         out: list[Event] = []
         for e in events:
+            _t = tick_ts if is_exchange else int(_get(e, "timestamp", 0))
             if _is_trade(e):
                 out.append(
                     {
@@ -301,7 +322,7 @@ class StatePackager:
                         "Mi": _get(e, "maker_id", 0),
                         "p": _get(e, "price", 0),
                         "q": float(_get(e, "quantity", 0)),
-                        "t": int(_get(e, "timestamp", 0)),
+                        "t": _t,
                         "s": _get(e, "side", 0),
                     }
                 )
@@ -313,7 +334,7 @@ class StatePackager:
                         "i": _get(e, "orderId", 0),
                         "p": _get(e, "price", 0),
                         "q": float(_get(e, "quantity", 0)),
-                        "t": int(_get(e, "timestamp", 0)),
+                        "t": _t,
                     }
                 )
             else:
@@ -324,7 +345,7 @@ class StatePackager:
                         "i": _get(e, "id", 0),
                         "p": _get(e, "price", 0),
                         "q": float(_get(e, "quantity", 0)),
-                        "t": int(_get(e, "timestamp", 0)),
+                        "t": _t,
                     }
                 )
         return out

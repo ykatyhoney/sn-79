@@ -59,7 +59,7 @@ If you prefer to manage processes individually (systemd, custom scripts), the se
 
 ## Architecture
 
-GenTRX maintains a **canonical model** updated each round by a designated aggregator (uid 0) operated by the MVTRX team. Validators (uid 1+) score miners independently, aggregate locally, and publish proposals to their own bucket; the aggregator evaluates all proposals and publishes the winning checkpoint. All validators commit their bucket to chain at startup, and miners discover buckets from those commitments without pre-configuration.
+GenTRX maintains a **canonical model** updated each round by a designated aggregator (uid 0) operated by the MVTRX team. Validators (uid 1+) score miners independently, aggregate locally, and publish proposals to their own bucket; the aggregator evaluates all proposals and applies the winning delta. Each round it publishes a small per-version delta that miners apply to advance their local model; a full checkpoint is uploaded only every `--checkpoint-interval` versions as a baseline for cold starts. All validators commit their bucket to chain at startup, and miners discover buckets from those commitments without pre-configuration.
 
 For the cross-validator proposal flow, see [`data_flow.md` § Multi-Validator Design](data_flow.md#multi-validator-design).
 
@@ -381,11 +381,11 @@ Sibling validators bootstrap from uid-0's checkpoint on first run (discovered vi
 ## Request flow (what happens per round)
 
 1. Validator's `GenTRXService.push_state(state)` extracts each tick into a msgpack dict and POSTs it to `/gentrx/state`.
-2. Gradient server processes ticks in-memory, replays events through the `MatchingEngine`, accumulates rows per book, and flushes parquets to the validator bucket every `parquet_interval_ns` of sim time.
+2. Gradient server processes ticks in-memory, replays events through the `MatchingEngine`, accumulates rows per book, and flushes a fixed-row page to the validator bucket once a book reaches `max_pending_rows_per_book` rows (with a sim-time tail-flush for stalled books).
 3. Background thread:
    - Reads gradients from per-miner buckets (discovered via chain commitments)
    - Double scoring: `score_own` (miner's assigned data) + `score_held` (held-out validation books)
-   - Overfitting detection: penalises when `score_own > score_held * 3.0`
+   - Overfitting detection: flags (diagnostic) when `score_own > score_held * 3.0`; logged, not applied to the score
    - Aggregates accepted gradients locally and publishes a proposal to `proposals/<own-uid>/{round_id:08d}.grad` in its own bucket
    - **Aggregator only**: reads proposals from every validator bucket and picks the best delta (highest held-out score) to publish as the canonical checkpoint
 4. Validator creates assignments and pushes them to the gradient server via `POST /gentrx/round`, then delivers to miners via dendrite. Each assignment carries `model_version`, data bucket credentials, and `validator_uid` so miners can discover everything from the assignment. The validator checks data readiness via `GET /gentrx/data-status` before initiating a round.
@@ -432,18 +432,21 @@ The gradient server's collect path runs sequentially today, which keeps the loca
 | `--min-score` | -0.1 | Reject gradients with score below this |
 | `--warmup-rounds` | 5 | Skip rejection during initial rounds |
 | `--max-val-batches` | 10 | Held-out val batches per miner; higher = less score noise, more GPU time |
-| `--books-per-miner` | 3 | Books per assignment |
-| `--val-fraction` | 0.10 | Fraction of books reserved for validation |
-| `--parquet-interval-ns` | 5min sim time | One parquet per N sim seconds |
+| `--books-per-miner` | 3 | Page files per assignment (one page per book), trained incrementally. Each miner gets a random overlapping sample of books over a shared held-out window; the shared held-out set (not identical data) is what makes gradients comparable across miners. |
+| `--val-fraction` | 0.10 | Size of the held-out scoring split. The validator picks the split each round, rotating which books are held out and keeping them disjoint from that round's training books, so no book is trained and scored in the same round while every book is covered over time. Server-side fallback size when no split is pushed. |
+| `--max-pending-rows-per-book` | 30000 | Page size: primary parquet flush trigger (rows per book) |
+| `--parquet-interval-ns` | 5min sim time | Sim-time tail-flush fallback for a stalled book's partial page |
 | `--loop-sleep-s` | 5s | Background loop poll interval |
 | `--blocks-per-round` | 25 | Server-side estimate, used only by the heartbeat-loss fallback. Should match the validator's `--gentrx.blocks_per_round`. |
 | `--block-time-s` | 12.0 | Assumed seconds per block on the target chain. Combined with `--blocks-per-round` to estimate round duration for the fallback. |
 | `--round-grace-s` | 30s | Grace seconds added to the heartbeat-loss fallback estimate before force-closing a round. Only fires if the validator stops pushing `POST /gentrx/round`. |
 | `--max-gradient-bytes` | 10 MB | Reject oversized gradients |
 | `--keep-checkpoints` | 10 | Hot-bucket retention. Older `checkpoints/v*.pt` deleted after each successful publish; `latest.json` is preserved. Set `0` to disable pruning - recommended only if you mirror checkpoints to cold storage. |
+| `--checkpoint-interval` | 6 | Upload a full checkpoint every N versions; publish only the per-version delta in between. |
+| `--keep-version-deltas` | 24 | Hot-bucket retention for `deltas/<uid>/v*.grad`. Must exceed `--checkpoint-interval`. |
+| `--publish-state-hash` | (off) | Publish a per-version model hash for the optional miner drift check. |
 | `--keep-proposals` | 10 | Hot-bucket retention for `proposals/<own-uid>/{round_id:08d}.grad`. Set `0` to disable. |
-| `--window-ns` | 5min sim time | Training window per assignment |
-| `--no-is-aggregator` | (on) | Sibling mode: score + propose only. **Always pass this** unless you are the MVTRX team operating the uid-0 aggregator. |
+| `--no-is-aggregator` | (on) | Sibling mode: score + propose only |
 | `--wandb-project` | (empty) | Enable wandb dashboard - see [`wandb.md`](wandb.md) |
 
 ### Validator (CLI)

@@ -108,10 +108,11 @@ def test_aggregate_all_clean_baseline_unchanged():
 
 # ── (2) compute_loss whole-row mask ───────────────────────────────────────
 
-# Field sizes MUST match the real schema: order_type has 3 classes (bid/ask/
-# cancel) and _ORDER_TYPE_WEIGHTS is sized (3,). Mismatching n_types would
-# fail inside F.cross_entropy(weight=...), not in our masking logic.
-_N_TYPES = 3
+# Field sizes MUST match the real schema: order_type now has 5 classes
+# (bid/ask/cancel/exec_buy/exec_sell) and _ORDER_TYPE_WEIGHTS is sized (5,).
+# Mismatching n_types would fail inside F.cross_entropy(weight=...), not in
+# our masking logic.
+_N_TYPES = 5
 _N_BINS = 16
 
 
