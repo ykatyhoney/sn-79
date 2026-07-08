@@ -1735,6 +1735,68 @@ class GradientAggregator:
             logger.warning("uid-0 sync failed: %s", exc)
             return False
 
+    def _bootstrap_from_own_bucket(self) -> bool:
+        """Aggregator-only: pull our own bucket head into checkpoint_path at boot.
+
+        `_sync_from_uid0` is a publish-side no-op for the aggregator, so when the
+        local seed is missing or was quarantined (wrong n_types) the aggregator
+        would fresh-init and then only *version-track* the bucket head — the
+        "Resumed vN" branch never reloads weights — so scoring would run on a
+        fresh (random) model and the next aggregation would publish fresh-derived
+        weights over a trained head. This self-heals that: download the head and
+        adopt it as the local scoring checkpoint, but ONLY when it is
+        architecture-compatible (n_types matches the build). An incompatible head
+        is left untouched so the fresh-init + rebaseline path handles it exactly
+        as before.
+
+        Bootstrap-only (called when checkpoint_path is absent); the per-round
+        sibling sync stays disabled for the aggregator.
+        """
+        if not self.is_aggregator or self.validator_store is None:
+            return False
+        try:
+            import io
+
+            import torch
+
+            from GenTRX.src.model import ModelConfig as _MC
+
+            version = self.validator_store.get_head_version(self._validator_uid)
+            if version <= 0:
+                version = self.validator_store.get_latest_existing_version(
+                    self._validator_uid
+                )
+            if version <= 0:
+                return False
+            data = self.validator_store.get_checkpoint(self._validator_uid, version)
+            ckpt = torch.load(io.BytesIO(data), map_location="cpu", weights_only=False)
+            head_n_types = int((ckpt.get("model_config") or {}).get("n_types", -1))
+            if head_n_types != int(_MC().n_types):
+                logger.warning(
+                    "Aggregator bootstrap: bucket head v%d has n_types=%d, build "
+                    "uses n_types=%d — not pulling; fresh-init will handle it.",
+                    version,
+                    head_n_types,
+                    _MC().n_types,
+                )
+                return False
+            self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            self.checkpoint_path.write_bytes(data)
+            self._version = version
+            self._fresh_start = False
+            logger.info(
+                "Aggregator bootstrap: pulled bucket head v%d into %s "
+                "(n_types=%d) — scoring resumes from the trained baseline "
+                "instead of a fresh model.",
+                version,
+                self.checkpoint_path,
+                head_n_types,
+            )
+            return True
+        except Exception as exc:
+            logger.warning("Aggregator bootstrap pull failed: %s", exc)
+            return False
+
     def start(self) -> None:
         """Start the background aggregation thread.
 
@@ -1761,9 +1823,14 @@ class GradientAggregator:
             self._fresh_start = True
 
         # Ensure a checkpoint exists.
-        # Priority: (1) local file, (2) uid-0 bucket via chain, (3) fresh model.
+        # Priority: (1) local file, (2) bucket head, (3) fresh model.
         if not self.checkpoint_path.exists():
-            self._sync_from_uid0()
+            # Siblings pull uid-0's chain-committed head; the aggregator pulls
+            # its own bucket head (its _sync_from_uid0 is a publish-side no-op),
+            # so a missing/quarantined seed self-heals to the trained baseline
+            # instead of scoring on a fresh-init model.
+            if not self._sync_from_uid0():
+                self._bootstrap_from_own_bucket()
 
         if not self.checkpoint_path.exists():
             logger.info(

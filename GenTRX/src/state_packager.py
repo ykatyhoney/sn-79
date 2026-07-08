@@ -189,7 +189,6 @@ class StatePackager:
 
     def __init__(self) -> None:
         self._step: int = 0
-        self._config_saved: bool = False
         self._current_sim_id: str | None = None
 
     def extract_state(self, state: Any) -> TickPacket:
@@ -242,17 +241,23 @@ class StatePackager:
         if sim_events:
             packet["sim_events"] = sim_events
             if "ESS" in sim_events:
-                self._config_saved = False
                 self._current_sim_id = None
 
-        if not self._config_saved:
-            config = self._extract_config(state)
-            if config is not None:
-                packet["config"] = config
-                sim_id = config.get("simulation_id")
-                if sim_id is not None:
-                    self._config_saved = True
-                    self._current_sim_id = sim_id
+        # Emit the config block (decimals + sim_id) on EVERY tick, not once.
+        # The gradient server binds its price/volume scale from tick["config"]
+        # the first time it sees one and caches it for the process lifetime;
+        # if that server restarts mid-sim it needs config again, but the
+        # validator's packager is long-lived and would never re-send under a
+        # send-once latch — leaving the aggregator to fall back to default
+        # decimals and mis-scale. Config is ~3 tiny fields against a KB–MB book
+        # payload, so re-sending it every tick is negligible and removes that
+        # restart desync. Still never fabricates decimals (see _extract_config).
+        config = self._extract_config(state)
+        if config is not None:
+            packet["config"] = config
+            sim_id = config.get("simulation_id")
+            if sim_id is not None:
+                self._current_sim_id = sim_id
 
         if self._current_sim_id is None:
             cur = _get(_val(state, "config", None), "simulation_id", None)

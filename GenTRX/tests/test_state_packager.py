@@ -47,15 +47,22 @@ def test_missing_decimals_omitted_not_defaulted(caplog):
     assert any("missing decimals" in r.message for r in caplog.records)
 
 
-def test_config_sent_once_then_suppressed():
-    """Once sim_id is bound, later ticks drop the config block but keep sim_id."""
+def test_config_emitted_every_tick():
+    """Config (decimals + sim_id) rides EVERY tick, so a gradient server that
+    restarts mid-sim always re-receives it and binds the correct price/volume
+    scale instead of falling back to default decimals."""
     pkg = StatePackager()
     cfg = {"priceDecimals": 2, "volumeDecimals": 4, "simulation_id": "SIM_C"}
     first = pkg.extract_state(_state(cfg))
     second = pkg.extract_state(_state(cfg))
-    assert "config" in first
-    assert "config" not in second
-    assert second["sim_id"] == "SIM_C"
+    third = pkg.extract_state(_state(cfg))
+    for pkt in (first, second, third):
+        assert pkt["config"] == {
+            "priceDecimals": 2,
+            "volumeDecimals": 4,
+            "simulation_id": "SIM_C",
+        }
+        assert pkt["sim_id"] == "SIM_C"
 
 
 def test_sim_events_extracted_from_uid_keyed_notices():
@@ -74,8 +81,9 @@ def test_sim_events_extracted_from_flat_notices():
     assert packet.get("sim_events") == ["ESE"]
 
 
-def test_ess_marker_rearms_config_emission():
-    """A SimulationStartEvent resets config-saved so the next tick re-emits it."""
+def test_ess_marker_carries_config():
+    """A SimulationStartEvent tick still carries the config block (config now
+    rides every tick) and re-binds sim_id for the new sim."""
     pkg = StatePackager()
     cfg = {"priceDecimals": 2, "volumeDecimals": 4, "simulation_id": "SIM_D"}
     pkg.extract_state(_state(cfg))
@@ -83,4 +91,5 @@ def test_ess_marker_rearms_config_emission():
     restart["notices"] = {0: [{"y": "ESS"}], 1: [{"y": "ESS"}]}
     packet = pkg.extract_state(restart)
     assert "config" in packet
+    assert packet["sim_id"] == "SIM_D"
     assert packet.get("sim_events") == ["ESS"]
