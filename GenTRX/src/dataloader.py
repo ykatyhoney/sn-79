@@ -16,12 +16,14 @@ from __future__ import annotations
 import bisect
 import json
 import logging
+import math
 import random
 from collections import OrderedDict
 from pathlib import Path
 from typing import Iterator
 
 import numpy as np
+import polars as pl
 import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset, DataLoader, Sampler
@@ -159,10 +161,14 @@ class OrderDataset(Dataset):
         seq_len: int = 1024,
         tokenizer: OrderTokenizer | None = None,
         max_cached: int = 8,
+        asset_refs: dict[str, dict] | None = None,
     ) -> None:
         self.seq_len = seq_len
         self.tokenizer = tokenizer or OrderTokenizer()
         self._max_cached = max_cached
+        # Optional per-file cross-asset reference: {str(path): ref}. When set,
+        # each file is tokenized with its own asset_ref (mixed-pair training).
+        self._asset_refs = asset_refs
 
         if not parquet_files:
             raise FileNotFoundError("No parquet files provided")
@@ -222,7 +228,11 @@ class OrderDataset(Dataset):
             for name in table.column_names
         }
         del table
-        encoded = self.tokenizer.encode_columns(cols)
+        ref = (
+            self._asset_refs.get(str(self._files[file_idx]))
+            if self._asset_refs else None
+        )
+        encoded = self.tokenizer.encode_columns(cols, asset_ref=ref)
         del cols
 
         # Evict oldest if cache is full
@@ -293,6 +303,10 @@ class OrderDataset(Dataset):
             batch[k] = torch.as_tensor(
                 arr, dtype=torch.float32 if arr.ndim > 1 else torch.long
             )
+
+        # Optional multi-scale regime conditioning (present iff tokenizer emits it)
+        if "regime" in window:
+            batch["regime"] = torch.as_tensor(window["regime"][:sl].copy(), dtype=torch.float32)
 
         # Labels: positions [1 .. seq_len] (next-step prediction)
         for k in PRED_FIELDS:
@@ -368,7 +382,8 @@ class ChunkSampler(Sampler[int]):
         self._shuffle = shuffle
 
     def __len__(self) -> int:
-        return len(self._dataset)
+        ds = self._dataset
+        return sum(max(0, flen - ds.seq_len) for flen in ds._file_lengths)
 
     def __iter__(self) -> Iterator[int]:
         ds = self._dataset
@@ -379,15 +394,9 @@ class ChunkSampler(Sampler[int]):
         file_ranges: list[list[int]] = []
         for i, flen in enumerate(ds._file_lengths):
             start = ds._cum_offsets[i]
-            # Number of valid windows starting in this file (excluding cross-boundary)
+            # Exclude windows that would span into the next file (a different book).
             n_windows = max(0, flen - seq_len)
             file_ranges.append(list(range(start, start + n_windows)))
-
-        # Handle the cross-boundary windows (last seq_len windows of each file
-        # may span into the next file — they're still valid, just slower)
-        # These are already handled by _get_window, so we include them in the
-        # last file's range. But windows past flen-seq_len are boundary windows.
-        # We assign them to the current file for cache locality.
 
         if self._shuffle:
             # Shuffle file order
@@ -405,6 +414,52 @@ class ChunkSampler(Sampler[int]):
             for windows in file_ranges:
                 indices.extend(windows)
 
+        return iter(indices)
+
+
+class InterleaveSampler(ChunkSampler):
+    """Block-shuffle across files so any prefix (a step-capped run) spans all files,
+    not just the first few — fixes ChunkSampler's file-by-file front-loading while
+    keeping per-block cache locality. With ``recency_alpha`` > 0, blocks from later
+    files (assumed newer; caller orders files chronologically) are drawn earlier, so a
+    budget-limited round over-samples recent data while still covering the whole set.
+    ``recency_alpha`` = 0 reproduces a plain uniform block shuffle.
+    """
+
+    def __init__(self, dataset, shuffle: bool = True, block: int = 1024,
+                 recency_alpha: float = 0.0) -> None:
+        super().__init__(dataset, shuffle)
+        self._block = max(1, block)
+        self._recency_alpha = float(recency_alpha)
+
+    def __iter__(self) -> Iterator[int]:
+        ds = self._dataset
+        seq = ds.seq_len
+        nf = max(1, len(ds._file_lengths) - 1)
+        blocks: list[tuple[int, list[int]]] = []
+        for i, flen in enumerate(ds._file_lengths):
+            start = ds._cum_offsets[i]
+            nw = max(0, flen - seq)
+            if nw == 0:
+                continue
+            w = list(range(start, start + nw))
+            if self._shuffle:
+                random.shuffle(w)
+            for j in range(0, nw, self._block):
+                blocks.append((i, w[j:j + self._block]))
+        if self._shuffle:
+            if self._recency_alpha > 0:
+                # Efraimidis-Spirakis weighted shuffle: key = u^(1/weight), sort desc;
+                # weight rises with file recency so recent blocks tend to the front.
+                def _key(b: tuple[int, list[int]]) -> float:
+                    weight = math.exp(self._recency_alpha * (b[0] / nf))
+                    return random.random() ** (1.0 / weight)
+                blocks.sort(key=_key, reverse=True)
+            else:
+                random.shuffle(blocks)
+        indices: list[int] = []
+        for _, b in blocks:
+            indices.extend(b)
         return iter(indices)
 
 
@@ -453,7 +508,7 @@ def create_dataloaders(
     val_loader = DataLoader(
         val_ds,
         batch_size=batch_size,
-        shuffle=False,
+        sampler=ChunkSampler(val_ds, shuffle=False),
         num_workers=num_workers,
         pin_memory=pin,
     )

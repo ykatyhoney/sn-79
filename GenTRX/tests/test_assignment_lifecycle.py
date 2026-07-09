@@ -6,6 +6,7 @@ PENDING -> DATA_READY -> DELIVERED -> GRADIENT_IN -> SCORED
 These tests use a mocked store so they run without S3.
 """
 
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -42,7 +43,7 @@ def test_get_assignment_creates_on_demand_for_arbitrary_uid(aggregator):
     assert 5 not in aggregator._assignments
 
     # Request an assignment for uid 5
-    aggregator.get_assignment(5)
+    result = aggregator.get_assignment(5)
 
     # An assignment should now exist for uid 5
     assert 5 in aggregator._assignments

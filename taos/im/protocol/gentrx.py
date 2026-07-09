@@ -67,5 +67,9 @@ class GenTRXAssignment(bt.Synapse):
     data_access_key: str = ""
     data_secret_key: str = ""
 
-    # UID of the validator that issued this assignment. 
+    # UID of the validator that issued this assignment.
     validator_uid: int = -1
+
+    # Validator advice for this round (e.g. {"top_k_frac": 0.1}). The miner uses
+    # it to adapt gradient sparsity; empty = use the miner's configured default.
+    advice: dict = {}

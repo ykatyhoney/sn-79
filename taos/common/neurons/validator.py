@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2025 Rayleigh Research <to@rayleigh.re>
+# SPDX-FileCopyrightText: 2026 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
 # The MIT License (MIT)
 # Copyright © 2023 Yuma Rao
@@ -94,6 +94,7 @@ def compute_two_pool_allocation(
         'burn_ratio': burn_ratio,
     }
     return raw_weights, summary
+
 
 from abc import abstractmethod
 

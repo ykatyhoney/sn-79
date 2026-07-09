@@ -302,6 +302,8 @@ class UnifiedAgentResponse:
         leverage: float = 0.0,
         settlement_option=LoanSettlementOption.NONE,
         max_slippage: float | None = None,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
     ) -> None:
         if self._exchange_mode:
             from taos.im.protocol.exchange.instructions import PlaceMarketOrderInstruction
@@ -311,6 +313,7 @@ class UnifiedAgentResponse:
                 max_slippage=max_slippage if max_slippage is not None else 0.01,
                 clientOrderId=clientOrderId, stp=stp,
                 currency=currency if currency is not None else ExchangeOrderCurrency.ALPHA,
+                stop_loss=stop_loss, take_profit=take_profit,
                 # leverage and settlement_option silently dropped
             ))
         else:
@@ -322,6 +325,7 @@ class UnifiedAgentResponse:
                 currency=currency if currency is not None else OrderCurrency.BASE,
                 leverage=leverage, settleFlag=settlement_option,
                 max_slippage=max_slippage,
+                stop_loss=stop_loss, take_profit=take_profit,
             ))
 
     def cancel_order(self, book_id, order_id, quantity=None, delay: int = 0) -> None:

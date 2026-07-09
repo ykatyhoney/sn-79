@@ -747,7 +747,9 @@ def score_uid(validator_data: Dict, uid: int) -> Tuple[float, float]:
     pnl_score = 0.0
 
     if pnl_score_weight > 0:
-        lookback = config['kappa']['lookback']  # simulation nanoseconds
+        # PnL score has its own explicit assessment window (scoring.pnl.lookback),
+        # independent of the kappa window; falls back to kappa.lookback if unset.
+        lookback = pnl_config.get('lookback', config['kappa']['lookback'])  # simulation nanoseconds
         lookback_threshold = simulation_timestamp - lookback
 
         pnl_score = calculate_pnl_score(
@@ -996,6 +998,7 @@ def get_rewards(self: 'Validator') -> Tuple[torch.FloatTensor, torch.FloatTensor
                 },
                 'pnl': {
                     'weight': self.config.scoring.pnl.weight,
+                    'lookback': getattr(self.config.scoring.pnl, 'lookback', self.config.scoring.kappa.lookback),
                     'normalization': {
                         'min_daily_return': self.config.scoring.pnl.normalization.min_daily_return,
                         'max_daily_return': self.config.scoring.pnl.normalization.max_daily_return,
@@ -1051,13 +1054,30 @@ def get_rewards(self: 'Validator') -> Tuple[torch.FloatTensor, torch.FloatTensor
         'gentrx_ema': getattr(self, '_gentrx_ema', {}),
     }
     
+    # [REWARD-PROFILE] Coarse phase split. get_rewards runs on the core-pinned
+    # reward_executor thread but shares the ONE process GIL with the main event
+    # loop, so any in-process (non-loky) time here directly starves overlapping
+    # rounds. score_uids fans kappa out to loky worker processes (off-GIL) but
+    # holds the GIL for the arg marshalling + result collection; distribute
+    # (Pareto) is in-process torch. This line tells us, at mainnet cardinality,
+    # which phase dominates the ~24s so Lever 3 (3a-3c) targets the right one.
+    _prof_t0 = time.perf_counter()
     trading_uid_scores, gentrx_uid_scores = score_uids(validator_data)
+    _prof_score = time.perf_counter()
 
     # Trading rewards run through Pareto sort-multiply.
     trading_rewards_list = [trading_uid_scores[uid] for uid in all_uids]
     distributed_trading = distribute_rewards(
         trading_rewards_list, validator_data['config']
     ).to(self.device)
+    _prof_pareto = time.perf_counter()
+    # INFO (not debug): this is one line per scoring round and must land in the
+    # same INFO log time_check.py reads on the live mainnet validator so the
+    # ~24s reward tail's phase split is actually harvestable there.
+    bt.logging.info(
+        f"[REWARD-PROFILE] score_uids={_prof_score - _prof_t0:.3f}s "
+        f"pareto={_prof_pareto - _prof_score:.3f}s uids={len(all_uids)}"
+    )
 
     # GenTRX rewards skip Pareto. Pool sizing happens in prepare_weights.
     gentrx_rewards = torch.tensor(

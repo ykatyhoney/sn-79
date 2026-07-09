@@ -51,17 +51,18 @@ def dummy_inputs_no_cond():
 
 class TestOrderModel:
     def test_forward_shapes(self, model, dummy_inputs):
+        cfg = model.config
         logits = model(**dummy_inputs)
-        assert logits["order_type"].shape == (B, T, 3)
-        assert logits["price"].shape == (B, T, 100)
-        assert logits["vol_int"].shape == (B, T, 64)
-        assert logits["vol_dec"].shape == (B, T, 8)
-        assert logits["interval"].shape == (B, T, 64)
+        assert logits["order_type"].shape == (B, T, cfg.n_types)
+        assert logits["price"].shape == (B, T, cfg.n_price_bins)
+        assert logits["vol_int"].shape == (B, T, cfg.n_vol_int_bins)
+        assert logits["vol_dec"].shape == (B, T, cfg.n_vol_dec_bins)
+        assert logits["interval"].shape == (B, T, cfg.n_interval_bins)
 
     def test_forward_no_conditioning(self, model, dummy_inputs_no_cond):
         """FiLM should be skipped gracefully when conditioning is absent."""
         logits = model(**dummy_inputs_no_cond)
-        assert logits["order_type"].shape == (B, T, 3)
+        assert logits["order_type"].shape == (B, T, model.config.n_types)
 
     def test_backward(self, model, dummy_inputs):
         logits = model(**dummy_inputs)

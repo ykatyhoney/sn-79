@@ -67,6 +67,39 @@ def _network_label(network: str) -> str:
     return _map.get(str(network).lower(), str(network).lower().replace('/', '_'))
 
 
+def _read_first_and_last_nonempty(path: str, tail_chunk: int = 131072) -> tuple[str, Optional[str]]:
+    """Return (first line incl. newline, last non-empty line) of a file, reading
+    only the head plus a bounded tail.
+
+    Replaces full readlines() scans that only need these two lines: the
+    fundamental CSVs grow unboundedly with sim runtime, and reading them whole
+    made load_fundamental O(file) — ~9s/scoring round after 20h of sim, under
+    both the GIL and _reward_lock. This is O(1) in file size. Reads backwards in
+    tail_chunk steps so a line truncated at a chunk boundary is completed by the
+    next step; decodes strict utf-8 so corrupt bytes raise (caller catches and
+    skips the block, same as the old open('r') path).
+    """
+    with open(path, 'rb') as f:
+        first = f.readline().decode('utf-8')
+        f.seek(0, os.SEEK_END)
+        pos = f.tell()
+        data = b''
+        while pos > 0:
+            step = min(pos, tail_chunk)
+            pos -= step
+            f.seek(pos)
+            data = f.read(step) + data
+            lines = data.split(b'\n')
+            for i in range(len(lines) - 1, -1, -1):
+                if lines[i].strip():
+                    # Complete line only if its start is within the data read so
+                    # far (i > 0 ⇒ a newline precedes it; pos == 0 ⇒ file start).
+                    if i > 0 or pos == 0:
+                        return first, lines[i].decode('utf-8')
+                    break
+    return first, None
+
+
 class SimulationEngine(MarketEngine):
 
     def __init__(self, config: Any, validator: "Validator") -> None:
@@ -82,8 +115,12 @@ class SimulationEngine(MarketEngine):
         self._req_socket = None
         self._res_socket = None
 
-        # UI-submitted orders fetched each tick from the data service
+        # UI-submitted orders: fetched on a background poll task into
+        # _external_buffer, drained into _external_instructions each tick (see
+        # MarketEngine._external_orders_loop / _drain_external_orders).
         self._external_instructions: list[dict] = []
+        self._external_buffer: list[dict] = []
+        self._external_poll_task = None
 
         # Per-book trigger prices snapshot; populated by the optional SL/TP
         # extension when installed (testnet release omits the extension and
@@ -156,6 +193,7 @@ class SimulationEngine(MarketEngine):
             self.engine.stop()
         in cleanup_ipc().
         """
+        self._stop_external_poller()
         for sock in (self._req_socket, self._res_socket):
             try:
                 if sock is not None:
@@ -178,6 +216,7 @@ class SimulationEngine(MarketEngine):
         """
         receive_start = time.time()
         raw_bytes = await self._recv_bytes()
+        _q4_t_recv = time.time()
         # Retry unpack: SHM data may be partially written even after the size
         # poll passes (simulator signals MQ before completing the write), or the
         # buffer may be misframed (stale-MQ / sim-restart size mismatch). A
@@ -194,10 +233,31 @@ class SimulationEngine(MarketEngine):
                     raise
                 await asyncio.sleep(0.005 * (2 ** _attempt))
                 raw_bytes = await self._recv_bytes_shm_only(raw_bytes)
+        _q4_t_unpack = time.time()
         state = self._parse_state(raw_dict)
+        _q4_t_parse = time.time()
         normalized = self._normalize(state)
+        _q4_t_norm = time.time()
         normalized.logDir = raw_dict.get('logDir')
-        self._external_instructions = await self._fetch_external_orders()
+        # External orders are polled on a background task; drain the buffer with
+        # no await so the data-service fetch never sits on the round path.
+        self._ensure_external_poller()
+        self._external_instructions = self._drain_external_orders()
+        # [Q4-PROFILE] splits recv_norm into recv (shm read), unpack
+        # (msgpack.unpackb), parse (_parse_state; pydantic construction, the
+        # suspected model_construct hotspot), norm (_normalize) and ext (fetch
+        # external orders). Tells us whether parse_dict is fat before optimizing.
+        # Emit via bt.logging (loguru): this module's stdlib `logger` is not
+        # routed to the pm2 sink, so logger.info() here was silently dropped.
+        import bittensor as bt
+        bt.logging.info(
+            f"[Q4-PROFILE] recv={_q4_t_recv - receive_start:.3f}s "
+            f"unpack={_q4_t_unpack - _q4_t_recv:.3f}s "
+            f"parse={_q4_t_parse - _q4_t_unpack:.3f}s "
+            f"norm={_q4_t_norm - _q4_t_parse:.3f}s "
+            f"ext={time.time() - _q4_t_norm:.3f}s "
+            f"bytes={len(raw_bytes) / 1048576:.1f}MB"
+        )
         if self._external_instructions:
             logger.info(
                 "SimulationEngine.receive: %d external order(s) fetched",
@@ -735,13 +795,13 @@ class SimulationEngine(MarketEngine):
                     f'{v.simulation.books_per_block * (block + 1) - 1}.csv'
                 )
                 try:
-                    fp_line = None
-                    book_ids = None
-                    for line in open(block_file, 'r').readlines():
-                        if not book_ids:
-                            book_ids = [int(col) for col in line.split(',') if col != "Timestamp\n"]
-                        if line.strip() != '':
-                            fp_line = line
+                    # Only the first line (book ids) and last non-empty line
+                    # (latest price row) matter; tail-read them in O(1) instead
+                    # of readlines() over the whole ever-growing file.
+                    first_line, fp_line = _read_first_and_last_nonempty(block_file)
+                    if first_line == '':
+                        continue
+                    book_ids = [int(col) for col in first_line.split(',') if col != "Timestamp\n"]
                     if fp_line is not None and book_ids:
                         prices = prices | {book_ids[i]: float(price) for i, price in enumerate(fp_line.strip().split(',')[:-1])}
                 except FileNotFoundError:
@@ -1321,7 +1381,23 @@ class SimulationEngine(MarketEngine):
         import mmap as _mmap
 
         loop = asyncio.get_event_loop()
-        msg, _ = await loop.run_in_executor(None, self._req_socket.receive)
+        # [RECV-PROFILE] discriminates the scoring-round recv spike:
+        #   mq     = sim-side: how long the simulator took to produce+signal the
+        #            next state (includes sim checkpoint pauses / bandwidth slowdown)
+        #   resume = validator-side: executor-thread done -> coroutine resumed on
+        #            the event loop (pure GIL/event-loop starvation)
+        #   poll   = SHM write-completion wait (sim write lag + poll-loop GIL churn)
+        #   read   = mmap read of the payload
+        _t0 = time.time()
+        _mq_done = [0.0]
+
+        def _mq_recv():
+            _r = self._req_socket.receive()
+            _mq_done[0] = time.time()
+            return _r
+
+        msg, _ = await loop.run_in_executor(None, _mq_recv)
+        _t_resume = time.time()
         byte_size = int.from_bytes(msg, byteorder="little")
         shm_req = _posix_ipc.SharedMemory("/state")
         packed_data = None
@@ -1375,8 +1451,16 @@ class SimulationEngine(MarketEngine):
                 )
                 _ready = _actual
             byte_size = _ready
+            _t_poll = time.time()
             with _mmap.mmap(shm_req.fd, byte_size, _mmap.MAP_SHARED, _mmap.PROT_READ) as mm:
                 packed_data = mm.read(byte_size)
+            import bittensor as bt
+            bt.logging.info(
+                f"[RECV-PROFILE] mq={_mq_done[0] - _t0:.3f}s "
+                f"resume={_t_resume - _mq_done[0]:.3f}s "
+                f"poll={_t_poll - _t_resume:.3f}s "
+                f"read={time.time() - _t_poll:.3f}s"
+            )
         finally:
             shm_req.close_fd()
         return packed_data

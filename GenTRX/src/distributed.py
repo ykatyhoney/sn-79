@@ -60,10 +60,31 @@ class WindowConfig:
     lr: float = 3e-4
     weight_decay: float = 0.01
     grad_clip: float = 1.0
+    # Gradient accumulation: micro-batches summed per optimizer step. Effective
+    # batch = dataloader batch_size * accum_steps. Lets weak hardware reach a
+    # large effective batch (the overfit fix) without the memory of a real one.
+    # 1 = no accumulation (step every micro-batch).
+    accum_steps: int = 1
     window_id: int = 0
     miner_uid: int = 0
     model_version: int = 0
     label_smooth_sigma: float = 0.0
+    # Wall-clock training budget (seconds). Used by train_incremental to stop
+    # mid-run when the round deadline is near. None = no time limit.
+    budget_s: float | None = None
+
+
+def _train_step(model, batch, optimizer, device, label_smooth_sigma, grad_clip):
+    """One optimizer step. Returns the loss, or None on a non-finite loss."""
+    logits, labels = _forward_batch(model, batch, device)
+    loss, _ = compute_loss(logits, labels, label_smooth_sigma=label_smooth_sigma)
+    if not math.isfinite(loss.item()):
+        return None
+    optimizer.zero_grad()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    optimizer.step()
+    return loss.item()
 
 
 def train_window(
@@ -97,31 +118,45 @@ def train_window(
     model.train()
     loss_trajectory: list[float] = []
     step = 0
+    accum = max(1, config.accum_steps)
     t0 = time.perf_counter()
 
     data_iter = iter(dataloader)
+    optimizer.zero_grad()
+    micro_losses: list[float] = []
+    micro = 0
+    # One "step" = one optimizer update over `accum` micro-batches (effective
+    # batch = loader batch * accum). accum=1 reproduces per-batch stepping.
     while step < config.n_steps:
-        # Cycle through dataloader if needed
         try:
             batch = next(data_iter)
         except StopIteration:
             data_iter = iter(dataloader)
-            batch = next(data_iter)
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                # Empty loader (no usable pages this window) — stop cleanly
+                # rather than crash the miner; the tiny/empty delta is rejected
+                # downstream by held-out scoring.
+                logger.warning("window %d: empty dataloader, stopping", config.window_id)
+                break
 
         logits, labels = _forward_batch(model, batch, device)
         loss, _ = compute_loss(logits, labels, label_smooth_sigma=config.label_smooth_sigma)
-
-        if not math.isfinite(loss.item()):
+        lv = loss.item()
+        if not math.isfinite(lv):
             logger.error("NaN/Inf loss at window step %d — stopping window", step)
             break
-
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-        optimizer.step()
-
-        loss_trajectory.append(loss.item())
-        step += 1
+        (loss / accum).backward()
+        micro_losses.append(lv)
+        micro += 1
+        if micro % accum == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+            optimizer.step()
+            optimizer.zero_grad()
+            loss_trajectory.append(sum(micro_losses) / len(micro_losses))
+            micro_losses = []
+            step += 1
 
     elapsed = time.perf_counter() - t0
     theta_after = snapshot_state(model)
@@ -162,6 +197,130 @@ def train_window(
     return delta
 
 
+def train_incremental(
+    model: OrderModel,
+    dataloaders: list[DataLoader],
+    config: WindowConfig,
+    device: str = "cpu",
+) -> GradientDelta:
+    """Train one epoch per loader, in order, until the wall-clock budget runs out.
+
+    Snapshots θ_before once, trains each loader for a full epoch on a shared
+    optimizer, and stops as soon as `config.budget_s` elapses (checked every
+    step). Loaders should be ordered most-relevant first (recent pages first),
+    so the freshest data is always trained. The budget makes hardware
+    self-limit: a fast GPU clears several loaders, a slow CPU does a partial
+    pass of the first. `config.n_steps` (> 0) is an optional total-step cap;
+    `config.budget_s = None` disables the time limit. Returns one GradientDelta
+    over everything trained.
+    """
+    theta_before = snapshot_state(model)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=config.lr, weight_decay=config.weight_decay
+    )
+    model.train()
+
+    loss_trajectory: list[float] = []
+    step = 0
+    pages = 0
+    budget = config.budget_s
+    cap = config.n_steps if config.n_steps and config.n_steps > 0 else None
+    t0 = time.perf_counter()
+    stop = False
+
+    for loader in dataloaders:
+        if stop:
+            break
+        trained_any = False
+        for batch in loader:
+            if budget is not None and (time.perf_counter() - t0) >= budget:
+                stop = True
+                break
+            if cap is not None and step >= cap:
+                stop = True
+                break
+            loss_val = _train_step(
+                model, batch, optimizer, device,
+                config.label_smooth_sigma, config.grad_clip,
+            )
+            if loss_val is None:
+                logger.error("NaN/Inf loss at step %d — stopping", step)
+                stop = True
+                break
+            loss_trajectory.append(loss_val)
+            step += 1
+            trained_any = True
+        if trained_any:
+            pages += 1
+
+    elapsed = time.perf_counter() - t0
+    theta_after = snapshot_state(model)
+    loss_before = loss_trajectory[0] if loss_trajectory else 0.0
+    loss_after = loss_trajectory[-1] if loss_trajectory else 0.0
+
+    metadata = GradientMetadata(
+        window_id=config.window_id,
+        miner_uid=config.miner_uid,
+        steps_trained=step,
+        loss_before=loss_before,
+        loss_after=loss_after,
+        loss_trajectory=loss_trajectory,
+        model_v_trained=config.model_version,
+    )
+    delta = extract_delta(theta_before, theta_after, metadata)
+    del theta_before, theta_after, optimizer
+
+    logger.info(
+        "Incremental (miner %d): %d/%d pages, %d steps in %.1fs, loss %.4f → %.4f, Δnorm=%.4f",
+        config.miner_uid,
+        pages,
+        len(dataloaders),
+        step,
+        elapsed,
+        loss_before,
+        loss_after,
+        delta.norm,
+    )
+    return delta
+
+
+def apply_version_deltas(model, store, agg_uid, from_v: int, to_v: int, expected_shapes=None) -> int:
+    """Apply canonical version deltas (from_v+1 .. to_v) to `model` in place.
+
+    Returns the highest version reached: to_v on full success, or the last
+    version applied before a delta went missing (e.g. pruned). Mutates the
+    model, so callers that hit a gap should reload a baseline checkpoint and
+    replay from there rather than trust a partial advance.
+    """
+    from GenTRX.src.gradient import deserialize
+
+    reached = from_v
+    for v in range(from_v + 1, to_v + 1):
+        data = store.get_version_delta(agg_uid, v)
+        if data is None:
+            break
+        comp = deserialize(data, expected_shapes=expected_shapes)
+        apply_gradient(model, decompress(comp))
+        reached = v
+    return reached
+
+
+def model_state_hash(model) -> str:
+    """Deterministic sha256 of a model's parameters (sorted key order, CPU bytes).
+
+    Used for the optional drift check: a miner that advanced via deltas can
+    compare against the server-published hash and resync if they diverge.
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    sd = model.state_dict()
+    for k in sorted(sd):
+        h.update(k.encode())
+        h.update(sd[k].detach().to("cpu").contiguous().numpy().tobytes())
+    return h.hexdigest()
+
+
 def evaluate_gradient(
     model: OrderModel,
     gradient: CompressedGradient,
@@ -169,6 +328,7 @@ def evaluate_gradient(
     device: str = "cpu",
     max_batches: int = 50,
     label_smooth_sigma: float = 0.0,
+    loss_before: float | None = None,
 ) -> float:
     """Score a gradient by the loss improvement it produces.
 
@@ -177,12 +337,10 @@ def evaluate_gradient(
     `label_smooth_sigma` must match what the miner trained under, or the
     before/after comparison is across two different losses.
 
-    Defends against the case where ``decompress(gradient) + apply_gradient``
-    silently leaves NaN/Inf in the model parameters: the post-apply pass
-    walks ``model.parameters()`` and if any tensor has a non-finite entry
-    we treat loss_after as :data:`_MAX_EVAL_LOSS`, rollback, and return
-    a heavily-negative score (so the gradient is rejected downstream)
-    without ever running val_loader against a corrupt model.
+    `loss_before` may be supplied to skip the pre-apply eval: under the shared
+    held-out window every miner is scored against the same base model on the
+    same val loader, so the baseline is identical and can be computed once per
+    round (single-pass scoring).
 
     Returns:
         score = loss_before - loss_after (positive = improvement)
@@ -190,7 +348,8 @@ def evaluate_gradient(
     # Snapshot current state for rollback
     original_state = {k: v.clone() for k, v in model.state_dict().items()}
 
-    loss_before = _eval_loss(model, val_loader, device, max_batches, label_smooth_sigma)
+    if loss_before is None:
+        loss_before = _eval_loss(model, val_loader, device, max_batches, label_smooth_sigma)
 
     # Apply gradient
     delta = decompress(gradient)

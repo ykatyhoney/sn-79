@@ -10,6 +10,8 @@ import pyarrow as pa
 BID = 0
 ASK = 1
 CANCEL = 2
+EXEC_BUY = 3
+EXEC_SELL = 4
 
 # LOB depth: number of price levels tracked per side
 LOB_DEPTH = 10
@@ -25,12 +27,12 @@ DEFAULT_VOLUME_DECIMALS = 4
 def order_stream_schema() -> pa.Schema:
     """Parquet schema for order stream files.
 
-    All data sources (Kraken, simulation, live collection) produce this schema.
+    All data sources (exchange feeds, simulation, live collection) produce this schema.
     The dataloader and tokenizer consume it.
     """
     fields = [
         pa.field("timestamp", pa.timestamp("ns")),
-        pa.field("order_type", pa.int8()),  # 0=Bid, 1=Ask, 2=Cancel
+        pa.field("order_type", pa.int8()),  # 0=Bid 1=Ask 2=Cancel 3=ExecBuy 4=ExecSell
         pa.field("rel_price", pa.int64()),  # relative to mid, integer ticks
         pa.field("volume_int", pa.int32()),  # integer part of qty
         pa.field("volume_dec", pa.float32()),  # fractional part [0.0, 1.0)

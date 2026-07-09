@@ -8,6 +8,7 @@ of either is "unknown lineage" and the default is preserve.
 Run: pytest GenTRX/tests/test_restart_resilience.py -v
 """
 
+import pytest
 
 
 def _make_aggregator(tmp_path, validator_store=None):
@@ -159,6 +160,7 @@ def test_no_wipe_when_no_prior_identity(tmp_path):
 
 def test_wipe_on_staged_sim_id_mismatch(tmp_path):
     agg = _make_aggregator(tmp_path)
+    agg._no_startup_cleanup = False  # opt into startup cleanup to test the wipe path
     agg._restored_sim_id = "OLD_SIM"
 
     agg._process_tick(_tick(1000, sim_id="NEW_SIM"))
@@ -166,6 +168,19 @@ def test_wipe_on_staged_sim_id_mismatch(tmp_path):
     assert agg._sim_id == "NEW_SIM"
     assert agg._sim_epoch == 1
     assert agg._data_cleanup_pending is True
+
+
+def test_startup_mismatch_preserves_by_default(tmp_path):
+    """Default (--no-startup-cleanup): a positive sim_id mismatch at STARTUP
+    (first bind, _sim_id is None) preserves data — only a rollover detected
+    while running wipes. Pins the data-preservation default."""
+    agg = _make_aggregator(tmp_path)  # no_startup_cleanup defaults True
+    agg._restored_sim_id = "OLD_SIM"
+
+    agg._process_tick(_tick(1000, sim_id="NEW_SIM"))
+
+    assert agg._sim_id == "NEW_SIM"
+    assert agg._data_cleanup_pending is False  # preserved, not wiped
 
 
 def test_no_wipe_when_staged_sim_id_matches(tmp_path):
@@ -184,6 +199,7 @@ def test_wipe_on_bucket_marker_mismatch(tmp_path):
     store = _FakeStore()
     store.marker = "OLD_BUCKET_SIM"
     agg = _make_aggregator(tmp_path, validator_store=store)
+    agg._no_startup_cleanup = False  # opt into startup cleanup to test the wipe path
     agg._bucket_sim_id = store.marker
 
     agg._process_tick(_tick(1000, sim_id="NEW_SIM"))

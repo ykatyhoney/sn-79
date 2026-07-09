@@ -14,6 +14,13 @@ import bittensor as bt
 from pathlib import Path
 from threading import Thread
 import traceback
+
+# Ensure GenTRX service logs are visible (uses standard Python logging)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
 import posix_ipc
 import mmap
 import msgpack

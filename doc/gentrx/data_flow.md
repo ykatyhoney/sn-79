@@ -112,7 +112,7 @@ Key format: `gentrx/<network>/<mode>/gradients/<uid>/{round_id:08d}.grad`. UID i
 
 **Writer**: Miner (after training) **Reader**: Gradient server (via chain-committed read credentials) **Committed on-chain**: Read credentials committed by the miner at startup via Commitments pallet.
 
-**One gradient per round.** Each `(miner, round_id)` is read by the gradient server exactly once, scored, and locked in. A miner who PUTs the same key again before the round drains overwrites the bytes in their bucket, but those bytes are never re-read — the second submission is dead weight. The miner's contract is "post your best gradient, once." The first successful read is the version that goes through scoring and aggregation.
+**One gradient per round.** Each `(miner, round_id)` is read by the gradient server exactly once, scored, and locked in. A miner who PUTs the same key again before the round drains overwrites the bytes in their bucket, but those bytes are never re-read; the second submission is dead weight. The miner's contract is "post your best gradient, once." The first successful read is the version that goes through scoring and aggregation.
 
 ---
 
@@ -144,7 +144,7 @@ flowchart LR
     CHAIN -. discoverable by miners .-> SIB_BUCKET
 ```
 
-Each round, every validator aggregates its accepted miner gradients locally and publishes `proposals/<validator-uid>/{round_id:08d}.grad` to its own bucket. Uid-0's gradient server fetches proposals from every chain-committed validator bucket, evaluates each against validation data, and applies the single best-scoring delta. Sibling validators sync from uid-0's checkpoint each round to stay in lock-step.
+Each round, every validator aggregates its accepted miner gradients locally and publishes `proposals/<validator-uid>/{round_id:08d}.grad` to its own bucket. Uid-0's gradient server fetches proposals from every chain-committed validator bucket, evaluates each against validation data, and applies the best-scoring delta. It then publishes that applied delta as the canonical per-version `deltas/<uid>/v*.grad`, which miners and sibling validators apply to advance their own model. A full checkpoint is uploaded only every `--checkpoint-interval` versions as a cold-start baseline.
 
 ---
 
@@ -184,7 +184,7 @@ Event types:
 
 ### Training Parquet
 
-Written by gradient server after replaying events through `MatchingEngine`. One file per book per `_parquet_interval_ns` of sim time (default 5 min).
+Written by gradient server after replaying events through `MatchingEngine`. One fixed-row page per book, flushed once the book reaches `max_pending_rows_per_book` rows (default 30 000). A sim-time interval tail-flushes a stalled book's partial page.
 
 **Filename**: `{ddHHMMSS_start}-{ddHHMMSS_end}.parquet` (sim time range)
 
@@ -215,7 +215,7 @@ Standard PyTorch checkpoint saved via `torch.save()`.
     "model_state_dict": OrderedDict(...),
     "optimizer_state_dict": OrderedDict(...),
     "model_config": {
-        "n_types": 3, "n_price_bins": 100, "n_vol_int_bins": 64,
+        "n_types": 5, "n_price_bins": 100, "n_vol_int_bins": 64,
         "n_vol_dec_bins": 8, "n_interval_bins": 64,
         "d_model": 288, "n_layers": 8, "n_heads": 8, "d_ff": 1152,
         "max_seq_len": 2048, "dropout": 0.1, "lob_dim": 20,
@@ -283,7 +283,7 @@ Scores stay validator-local, served over loopback HTTP via `GET /gentrx/scores` 
 }
 ```
 
-`score_own` = improvement on the miner's assigned data. `score_held` = improvement on held-out validation books (primary quality gate). `overfitting` = true when `score_own > score_held × OVERFIT_RATIO` (default 3.0). `score` = `score_held × 0.1` when overfitting, otherwise `score_held`.
+`score_own` = improvement on the miner's assigned data. `score_held` = improvement on held-out validation books (the reward). `score` = `score_held` (or `score_own` as fallback when no held-out set exists); held-out improvement is what miners are paid on. `overfitting` = a diagnostic flag, true when `score_own > score_held × OVERFIT_RATIO` (default 3.0); it is logged but not applied to the score. Only gradients that enter aggregation are rewarded; a version-mismatched submission is scored but not paid.
 
 ### Assignment (JSON, served via HTTP)
 
@@ -322,11 +322,11 @@ Committed by both miners and validators via the Bittensor Commitments pallet. 12
 ```
 
 > **On committed credentials being public by design.** These R2 `access_key_id` /
-> `secret_access_key` pairs are **read-only** and scoped to a single gradient bucket — no
-> write, admin, or cross-resource access. They are published on-chain by every participant
+> `secret_access_key` pairs are **read-only** and scoped to a single gradient bucket (no
+> write, admin, or cross-resource access). They are published on-chain by every participant
 > via the Commitments pallet, so they are public by construction. The benchmark agent config
 > (`taos/im/config/benchmark_agents.testnet.json`) carries the same read-only pair inline on
-> purpose; a committed literal there is intentional, not a leak. Secret scanners will flag it —
+> purpose; a committed literal there is intentional, not a leak. Secret scanners will flag it;
 > that finding is expected and may be dismissed. Do not rotate or move these to env injection
 > without also updating the on-chain commitment, or discovery breaks.
 
@@ -373,12 +373,12 @@ sequenceDiagram
     and
         M->>SV: GET data/<validator-uid>/{book}/*.parquet
     end
-    M->>M: train_window → top-k compress
+    M->>M: train_incremental (pages, budget) → top-k compress
     M->>SM: PUT gradients/<miner-uid>/{round_id}.grad
 
     Note over V,G: 4 - Score (NO model update yet)<br/>round closed by POST /gentrx/round<br/>or heartbeat-loss fallback
     G->>SM: GET gradients/<miner-uid>/{round_id}.grad × N
-    G->>G: evaluate_gradient against pre-update model<br/>score_own + score_held<br/>overfit penalty if own > 3·held
+    G->>G: evaluate_gradient against pre-update model<br/>score_held is the reward (score_own fallback)<br/>overfitting flag logged (diagnostic only)
     V->>G: GET /gentrx/scores?since_round=N
     G-->>V: round scores (for logging and validator weight setting)
 
@@ -524,7 +524,7 @@ stateDiagram-v2
 
 | State | Meaning | Entered from |
 |---|---|---|
-| `PENDING` | Books + window assigned; data keys not yet resolved. | Proxy / on-demand creation only. |
+| `PENDING` | Books assigned; page files not yet flushed/resolved. | Proxy / on-demand creation only. |
 | `DATA_READY` | Data keys resolved; next `GET /gentrx/assignment` will deliver. | Proxy path only. |
 | `DELIVERED` | Sent to the miner; `_delivered_at` clock is running. | Production: direct from `POST /gentrx/round`. Proxy: after `GET /gentrx/assignment`. |
 | `GRADIENT_IN` | Miner gradient fetched from their bucket, cached in memory. | `_collect_round_gradients()` succeeded. |

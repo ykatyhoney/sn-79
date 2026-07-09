@@ -8,7 +8,6 @@ import bittensor as bt
 from taos.common.agents import launch
 from taos.im.agents import GenTRXAgent
 from taos.im.protocol.models import OrderDirection, STP, LoanSettlementOption, OrderCurrency
-
 import random
 
 """

@@ -182,6 +182,44 @@ def test_running_totals_stay_consistent_through_prune():
     _assert_running_totals_match_history(s)
 
 
+def test_prune_tail_drop_removes_expired_head_keeps_retained():
+    """The prune deletes the expired HEAD in place and stops at the first
+    retained ts (O(expired), not a full-dict rebuild). Pre-seed a mix of
+    out-of-lookback head timestamps followed by in-lookback ones, fire a prune,
+    and assert only the head is dropped, the tail survives, and the running
+    totals equal a fresh sum over the remaining history."""
+    from taos.im.validator.trade import bootstrap_pnl_totals
+
+    s = _make_self()
+    # lookback = 10800s. At the prune tick below (ts=20000s) the threshold is
+    # 20000-10800 = 9200s: 1000/1100/1200 are the expired head; 15000/15100 stay.
+    s.realized_pnl_history = defaultdict(dict, {
+        1: {
+            1000 * S: {0: 10.0, 1: -3.0},
+            1100 * S: {0: 5.0},
+            1200 * S: {1: 2.0},
+            15000 * S: {0: 7.5},
+            15100 * S: {0: -1.5, 1: 4.0},
+        },
+    })
+    bootstrap_pnl_totals(s)
+    _assert_running_totals_match_history(s)  # seeded totals cover the full history
+
+    # No new trades for uid 1 -> isolates the prune's effect. First call fires
+    # the prune (_last_prune_timestamp is None).
+    update_trade_volumes(s, _state(20000 * S, {}))
+
+    # Expired head dropped; retained tail preserved in order. (The current ts,
+    # 20000, is seeded as an empty dict by the update path — a no-op for totals.)
+    keys = list(s.realized_pnl_history[1].keys())
+    assert 1000 * S not in keys and 1100 * S not in keys and 1200 * S not in keys
+    assert keys[:2] == [15000 * S, 15100 * S]
+    _assert_running_totals_match_history(s)
+    assert s.agent_pnl_total[1] == pytest.approx(7.5 - 1.5 + 4.0, abs=1e-9)
+    assert s.agent_pnl_by_book[1][0] == pytest.approx(7.5 - 1.5, abs=1e-9)
+    assert s.agent_pnl_by_book[1][1] == pytest.approx(4.0, abs=1e-9)
+
+
 def test_bootstrap_pnl_totals_matches_history():
     """bootstrap_pnl_totals (startup / sim-restart rebuild path) must reproduce
     exactly what a fresh sum over history yields."""

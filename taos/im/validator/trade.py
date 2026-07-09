@@ -452,49 +452,60 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
     if should_prune:
         lookback_time = self.config.scoring.kappa.lookback
         lookback_threshold = timestamp - lookback_time
+        # Both realized_pnl_history[uid] and roundtrip_volumes[uid][book] are
+        # keyed by simulation timestamp inserted monotonically — exactly one
+        # append per round (lines below), value-updates to an existing ts leave
+        # dict insertion order unchanged, and msgpack save/restore preserves it.
+        # So expired entries (ts < threshold) are always a contiguous HEAD; we
+        # delete that head in place and break at the first retained ts, making
+        # each prune O(expired) instead of O(total). The old form did two full
+        # scans + a whole-dict rebuild per uid (~3M ops/prune at mainnet
+        # cardinality) every 60s while holding _reward_lock on the round path.
         for uid_item in self.realized_pnl_history:
             pnl_hist = self.realized_pnl_history[uid_item]
             if not pnl_hist:
                 continue
-            # Sum pnl in timestamps that will be pruned so we can subtract
-            # the equivalent amount from the running totals — otherwise the
-            # push builder's agent_pnl_book would include already-pruned data.
-            # Batch the subtraction per (uid, book_id): the naive form did two
-            # dict writes per (ts, book_id) tuple (~3M/prune at mainnet
-            # cardinality), and prune fires every 60s under _reward_lock.
+            # Sum pnl in the expired head so we can subtract the equivalent from
+            # the running totals — otherwise the push builder's agent_pnl_book
+            # would include already-pruned data. Batch the subtraction per
+            # (uid, book_id).
             book_deltas = {}
             uid_total_delta = 0.0
-            for ts, books in pnl_hist.items():
+            expired_ts = []
+            for ts in pnl_hist:
                 if ts >= lookback_threshold:
-                    continue
-                for book_id, pnl in books.items():
+                    break
+                for book_id, pnl in pnl_hist[ts].items():
                     book_deltas[book_id] = book_deltas.get(book_id, 0.0) - pnl
                     uid_total_delta -= pnl
+                expired_ts.append(ts)
             if book_deltas:
                 per_book = self.agent_pnl_by_book[uid_item]
                 for book_id, delta in book_deltas.items():
                     per_book[book_id] = per_book.get(book_id, 0.0) + delta
                 self.agent_pnl_total[uid_item] = self.agent_pnl_total.get(uid_item, 0.0) + uid_total_delta
-            self.realized_pnl_history[uid_item] = {
-                ts: books
-                for ts, books in pnl_hist.items()
-                if ts >= lookback_threshold
-            }
+            for ts in expired_ts:
+                del pnl_hist[ts]
         for uid_item in self.roundtrip_volumes:
             roundtrip_volumes_uid = self.roundtrip_volumes[uid_item]
 
             for book_id, rt_volumes in roundtrip_volumes_uid.items():
                 if not rt_volumes:
                     continue
-                old_count = len(rt_volumes)
-                pruned = {t: v for t, v in rt_volumes.items() if t >= volume_prune_threshold}
-                if len(pruned) < old_count:
-                    pruned_rt_volume = sum(v for t, v in rt_volumes.items() if t < volume_prune_threshold)
+                pruned_rt_volume = 0.0
+                expired_ts = []
+                for t in rt_volumes:
+                    if t >= volume_prune_threshold:
+                        break
+                    pruned_rt_volume += rt_volumes[t]
+                    expired_ts.append(t)
+                if expired_ts:
                     if pruned_rt_volume > 0:
                         current = self.roundtrip_volume_sums[uid_item][book_id]
                         self.roundtrip_volume_sums[uid_item][book_id] = max(0.0, current - pruned_rt_volume)
                         uids_to_round.add(uid_item)
-                    roundtrip_volumes_uid[book_id] = pruned
+                    for t in expired_ts:
+                        del rt_volumes[t]
 
     for uid_item, timestamps in realized_pnl_updates.items():
         if uid_item not in self.realized_pnl_history:

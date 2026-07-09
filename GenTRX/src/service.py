@@ -175,8 +175,6 @@ class GenTRXService:
     # Assignment creation defaults (same as old gradient_server values)
     DEFAULT_BOOKS_PER_MINER = 3
     DEFAULT_WINDOW_NS = 300_000_000_000  # 5 min
-    DEFAULT_BETA_ALPHA = 1.0
-    DEFAULT_BETA_BETA = 3.0
 
     DEFAULT_TX_QUEUE_SIZE = 256
     DEFAULT_TX_MAX_ATTEMPTS = 3
@@ -234,7 +232,18 @@ class GenTRXService:
         self._books_per_miner = books_per_miner or self.DEFAULT_BOOKS_PER_MINER
         self._window_ns = window_ns or self.DEFAULT_WINDOW_NS
         self._val_fraction = val_fraction
-        self._val_books: set[str] | None = None  # lazy init from first data-status
+        self._val_books: set[str] | None = None  # current round's held-out split
+        # Page-based assignment: pick one existing page per book (recency-biased,
+        # with a stale-revisit tail so untouched pages still get covered) instead
+        # of beta-sampling a time window and hoping parquets overlap it.
+        self._page_last_round: dict[str, int] = {}
+        self._stale_revisit_frac = 0.2
+        self._recency_window = 4
+        # IID assignment (flavor B): each miner gets a random SAMPLE of train
+        # books (overlap allowed), not a disjoint slice — so gradients estimate
+        # the same objective and are fairly comparable on the shared held-out
+        # window. Flip to True for flavor A (every miner the identical sample).
+        self._iid_shared_books = False
 
         # log_path kept as a no-op for API compatibility. GenTRX records now
         # flow through bt.logging via the `gtx_log` shim — no separate
@@ -287,18 +296,11 @@ class GenTRXService:
             target=self._tx_worker, name="GenTRX-tx", daemon=True,
         )
         self._tx_thread.start()
-        # Note: the background _pack_worker / _pack_queue that existed in
-        # 0.5.x was removed for 0.4.6 alignment. See push_state() docstring.
         atexit.register(self._drain_on_exit)
         # SIGTERM (systemd, bare kill) bypasses atexit; SIGINT (pm2 default) does not.
-        # Capture (don't discard) any previously-installed SIGTERM handler — e.g.
-        # the validator's graceful-cleanup handler — so _handle_sigterm can chain
-        # to it after draining, instead of hard-exiting via SIG_DFL and skipping
-        # the validator's IPC + executor teardown (which risks orphaned IPC).
-        self._prev_sigterm = None
         if threading.current_thread() is threading.main_thread():
             try:
-                self._prev_sigterm = signal.signal(signal.SIGTERM, self._handle_sigterm)
+                signal.signal(signal.SIGTERM, self._handle_sigterm)
             except (ValueError, OSError) as exc:
                 gtx_log.debug("SIGTERM handler not installed: %s", exc)
 
@@ -353,6 +355,7 @@ class GenTRXService:
         interval = getattr(gentrx_cfg, "interval", 30)
         log_path = getattr(gentrx_cfg, "log_path", "data/gentrx/gentrx_service.log")
         blocks_per_round = getattr(gentrx_cfg, "blocks_per_round", 0) or 0
+        books_per_miner = getattr(gentrx_cfg, "books_per_miner", 0) or 0
         default_spool = f"data/gentrx/tx_spool_v{validator_uid}.bin"
         tx_spool_path = getattr(gentrx_cfg, "tx_spool_path", default_spool)
         tx_spool_max_bytes = int(getattr(gentrx_cfg, "tx_spool_max_bytes", 0) or 0)
@@ -367,6 +370,7 @@ class GenTRXService:
             miner_uids_fn=miner_uids_fn,
             log_path=log_path,
             blocks_per_round=blocks_per_round,
+            books_per_miner=books_per_miner,
             get_block_fn=get_block_fn,
             validator_uid=validator_uid,
             tx_spool_path=tx_spool_path,
@@ -599,110 +603,159 @@ class GenTRXService:
             return None
 
     def _create_assignments(self, data_status: dict, round_id: int | None = None) -> dict[int, dict]:
-        """Create assignments for all miners from available data.
+        """Create assignments for all miners by PAGE (IID, shared held-out window).
 
-        Uses the same beta-distribution time sampling as the old gradient
-        server logic, but driven by the validator.
+        Each miner gets a random IID sample of train books; for each book we
+        pick one existing fixed-row page from the data-status registry —
+        recency-biased with a stale-revisit tail. This cannot sample into an
+        empty time gap (the failure of the old beta-window approach) and handles
+        quiet books naturally. All miners share one [ts_start, ts_end] window
+        (the union span of chosen pages) so held-out forward scoring uses the
+        same baseline for everyone.
         """
         books = data_status.get("books", {})
         if not books:
             return {}
 
-        max_ts = data_status.get("max_ts", 0)
-        if max_ts < self._window_ns:
-            gtx_log.debug("not enough data yet (max_ts=%d < window=%d)", max_ts, self._window_ns)
-            return {}
-
         model_version = data_status.get("version", 0)
-        all_book_ids = sorted(books.keys(), key=lambda b: int(b))
 
-        # Lazy init val books (deterministic split)
-        if self._val_books is None:
-            n_val = max(1, int(len(all_book_ids) * self._val_fraction))
-            rng = random.Random(42)
-            self._val_books = set(rng.sample(all_book_ids, min(n_val, len(all_book_ids))))
+        # Tolerant sort: numeric ids by value first, any non-numeric id last
+        # (lexical). A bare int(b) here raised ValueError on a malformed book
+        # key and, since the caller swallows exceptions, silently skipped the
+        # round every tick the bad key persisted (GenTRX training would stall
+        # indefinitely with only a warning).
+        def _book_sort_key(b):
+            s = str(b)
+            return (0, int(s)) if s.lstrip("-").isdigit() else (1, s)
+
+        all_book_ids = sorted(books.keys(), key=_book_sort_key)
+
+        # Bound the stale-revisit bookkeeping: drop entries for pages no longer
+        # present in the data-status registry. Without this, _page_last_round
+        # grows without limit as sim time advances and new parquets appear.
+        live_pages = set()
+        for _bid, _meta in books.items():
+            for _item in _meta.get("parquets", []):
+                _fname = _item[0] if isinstance(_item, (list, tuple)) else _item
+                live_pages.add(f"{_bid}/{_fname}")
+        for _stale in [k for k in self._page_last_round if k not in live_pages]:
+            self._page_last_round.pop(_stale, None)
+
+        # Seed every per-round RNG (val split, per-miner book sample, page pick)
+        # and the "round" label on the round being ASSIGNED, not the last
+        # successfully-pushed round. self._current_round only advances after a
+        # push; in block mode new_round can jump by >1 (missed blocks), so keying
+        # seeds on _current_round would make two validators with different push
+        # histories derive a different train/val split for the same round_id.
+        rid = round_id if round_id is not None else self._current_round
+
+        # Val split rotates per round, disjoint from that round's train (every book
+        # trains over time, none permanently excluded). Pushed to the server so it
+        # holds out exactly what training excluded.
+        n_val = max(1, int(len(all_book_ids) * self._val_fraction))
+        val_rng = random.Random(
+            hashlib.sha256(f"{rid}:val".encode()).hexdigest()
+        )
+        self._val_books = set(
+            val_rng.sample(all_book_ids, min(n_val, len(all_book_ids)))
+        )
 
         train_books = [b for b in all_book_ids if b not in self._val_books]
         if not train_books:
-            train_books = list(all_book_ids)
+            # Every book landed in the val split (<=1 book, or val_fraction too
+            # high). Falling back to training on val books would let miners train
+            # AND be scored on the same book — the exact contamination the
+            # held-out design removes. Skip the round instead.
+            gtx_log.info(
+                "no train books after val split (books=%d, val=%d) — skipping round",
+                len(all_book_ids),
+                len(self._val_books),
+            )
+            return {}
 
-        # Shuffle books deterministically per round
-        book_rng = random.Random(
-            hashlib.sha256(f"{self._current_round}:books".encode()).hexdigest()
-        )
-        shuffled = list(train_books)
-        book_rng.shuffle(shuffled)
-
-        max_start = max_ts - self._window_ns
         miner_uids = self._miner_uids
         if not miner_uids:
             return {}
 
-        # Clamp sample range to the actually-available data window. Without
-        # this, a sim-transition cleanup that wipes parquets below some
-        # sim-time leaves the validator picking ts_start in [0, max_start] —
-        # most beta samples land in the wiped zone, no parquets overlap, and
-        # every miner gets data=[] until sim-time grows large enough that
-        # 0.75 * max_start crosses the cleanup floor (~12 sim-hr at 5-min
-        # windows). On a fresh run min_data_ts ≈ 0 and this is a no-op.
-        min_data_ts = max_start  # fallback: collapse to top of range
-        for _book_info in books.values():
-            for _item in _book_info.get("parquets", []):
-                if isinstance(_item, (list, tuple)) and len(_item) == 3:
-                    _f_start = _item[1]
-                    if _f_start < min_data_ts:
-                        min_data_ts = _f_start
-        sample_floor = min(min_data_ts, max_start)
-        sample_range = max(0, max_start - sample_floor)
+        def _norm_pages(book_id):
+            """[(fname, f_start, f_end), ...] for a book, legacy strings tolerated."""
+            out = []
+            for item in books.get(book_id, {}).get("parquets", []):
+                if isinstance(item, (list, tuple)) and len(item) == 3:
+                    out.append((item[0], item[1], item[2]))
+                else:
+                    out.append((item, 0, 0))
+            return out
 
         # Resolve data bucket credentials from gradient server's validator store
         # (embedded in the assignment so miners don't need pre-configuration)
-        # These come from the data-status response or from env vars
         import os
         data_endpoint = os.environ.get("GENTRX_VALIDATOR_S3_ENDPOINT_URL", "")
         data_bucket = os.environ.get("GENTRX_VALIDATOR_S3_BUCKET", "")
         data_access = os.environ.get("GENTRX_VALIDATOR_S3_READ_ACCESS_KEY", "")
         data_secret = os.environ.get("GENTRX_VALIDATOR_S3_READ_SECRET_KEY", "")
 
-        assignments = {}
+        # IID (flavor B): each miner gets a random overlapping SAMPLE of train
+        # books, so gradients estimate the same objective; fairness comes from the
+        # shared held-out window below. _iid_shared_books toggles flavor A.
+        per_miner: dict[int, tuple[list, list, list]] = {}
+        spans_all: list[tuple[int, int]] = []
+        k = min(self._books_per_miner, len(train_books))
         for miner_uid in miner_uids:
-            miner_rng = random.Random(
-                hashlib.sha256(f"{self._current_round}:{miner_uid}:time".encode()).hexdigest()
+            book_seed = (
+                f"{rid}:books"
+                if self._iid_shared_books
+                else f"{rid}:{miner_uid}:books"
             )
-            beta_sample = 1.0 - miner_rng.betavariate(
-                self.DEFAULT_BETA_ALPHA, self.DEFAULT_BETA_BETA
+            book_rng = random.Random(hashlib.sha256(book_seed.encode()).hexdigest())
+            assigned_books = book_rng.sample(train_books, k)
+
+            page_rng = random.Random(
+                hashlib.sha256(f"{rid}:{miner_uid}:page".encode()).hexdigest()
             )
-            ts_start = sample_floor + int(beta_sample * sample_range)
-            ts_end = ts_start + self._window_ns
-
-            start = (miner_uid * self._books_per_miner) % len(shuffled)
-            assigned_books = [
-                shuffled[(start + i) % len(shuffled)]
-                for i in range(self._books_per_miner)
-            ]
-
-            # Resolve data keys — only parquets that overlap [ts_start, ts_end].
-            # data-status returns [[fname, f_start, f_end], ...]; filter here so
-            # each miner's synapse carries only the handful of files it needs
-            # rather than every parquet ever written (hundreds of strings).
-            data_keys = []
+            data_keys, spans = [], []
             for book_id in assigned_books:
-                book_info = books.get(book_id, {})
-                for item in book_info.get("parquets", []):
-                    if isinstance(item, (list, tuple)) and len(item) == 3:
-                        fname, f_start, f_end = item
-                        if f_start >= ts_end or f_end <= ts_start:
-                            continue
-                    else:
-                        fname = item  # legacy string format
-                    data_keys.append(f"data/{self._validator_uid}/{book_id}/intervals/{fname}")
+                pages = _norm_pages(book_id)
+                if not pages:
+                    continue
+                if page_rng.random() < self._stale_revisit_frac:
+                    # Least-recently-assigned page; never-assigned (-1) win.
+                    idx = min(
+                        range(len(pages)),
+                        key=lambda i: self._page_last_round.get(
+                            f"{book_id}/{pages[i][0]}", -1
+                        ),
+                    )
+                else:
+                    lo = max(0, len(pages) - self._recency_window)
+                    idx = page_rng.randrange(lo, len(pages))
+                fname, f_start, f_end = pages[idx]
+                data_keys.append(f"data/{self._validator_uid}/{book_id}/intervals/{fname}")
+                spans.append((f_start, f_end))
+                self._page_last_round[f"{book_id}/{fname}"] = rid
 
+            if not data_keys:
+                continue
+            per_miner[miner_uid] = (assigned_books, data_keys, spans)
+            spans_all.extend(spans)
+
+        if not per_miner:
+            return {}
+
+        # One shared [start, end] for all miners this round: forward-only held
+        # scoring after a shared `end` gives every miner the same baseline (single
+        # pass), and `end` = max trained page end so it never overlaps training.
+        shared_start = min(s for s, _ in spans_all)
+        shared_end = max(e for _, e in spans_all)
+
+        assignments = {}
+        for miner_uid, (assigned_books, data_keys, _spans) in per_miner.items():
             assignments[miner_uid] = {
-                "round": round_id if round_id is not None else self._current_round,
+                "round": rid,
                 "model_version": model_version,
                 "books": assigned_books,
-                "ts_start": ts_start,
-                "ts_end": ts_end,
+                "ts_start": shared_start,
+                "ts_end": shared_end,
                 "data": data_keys,
                 "data_source": "s3",
                 "data_endpoint": data_endpoint,
@@ -722,6 +775,10 @@ class GenTRXService:
                 "round": round_id,
                 "assignments": {str(uid): a for uid, a in assignments.items()},
             }
+            if self._val_books is not None:
+                # The held-out split for this round: the server scores against
+                # exactly the books training excluded (no independent re-derive).
+                body["val_books"] = sorted(self._val_books)
             if self._last_known_block is not None:
                 body["block"] = self._last_known_block
             payload = _json.dumps(body).encode()

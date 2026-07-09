@@ -7,7 +7,12 @@ SL/TP service and/or GenTRX gradient server).
 """
 import multiprocessing
 
-def get_core_allocation(sltp_cores_count: int = 0, grad_server_cores: int = 0):
+def get_core_allocation(
+    sltp_cores_count: int = 0,
+    grad_server_cores: int = 0,
+    sim_cores_count: int = 0,
+    os_headroom: int = 0,
+):
     """
     Allocate CPU cores across validator components using percentage-based allocation.
 
@@ -16,13 +21,25 @@ def get_core_allocation(sltp_cores_count: int = 0, grad_server_cores: int = 0):
     distributes the remainder across the validator, query, reward, reporting, and IPC
     sub-processes.
 
+    The C++ simulator runs as a separate process; give it a dedicated `sim_cores_count`
+    slice (sized to the simulation blockCount) so its worker threads never contend with
+    the backgrounded reward pool / save-pack for the same cores. Those cores come from
+    the percentage-allocation rounding gap first, and any shortfall is taken ONLY from
+    reward (a backgrounded burst that overlaps the now-isolated sim, so trimming it does
+    not affect round cadence). `os_headroom` cores are additionally left unpinned as an
+    OS/IRQ lane. Both are best-effort: if the box is too small the sim slice is reduced
+    (sim has priority over headroom) and 'sim' may be absent — the caller then skips pinning.
+
     Args:
         sltp_cores_count: Cores to reserve for the SL/TP service (last N). 0 = no reservation.
         grad_server_cores: Cores to reserve for the GenTRX gradient server. 0 = no reservation.
+        sim_cores_count: Cores to dedicate to the C++ simulator (= blockCount). 0 = float (legacy).
+        os_headroom: Cores to leave unpinned as an OS/IRQ lane. 0 = none.
 
     Returns:
         dict: Mapping of component name to list of core indices. Keys include 'validator',
-            'query', 'reward', 'reporting', 'ipc', and optionally 'sltp' and 'gradient_server'.
+            'query', 'reward', 'reporting', 'ipc', and optionally 'sltp', 'gradient_server',
+            and 'sim' (present only when a simulator slice could be carved out).
 
     Raises:
         Exception: If fewer than 8 cores remain after all reservations.
@@ -81,6 +98,17 @@ def get_core_allocation(sltp_cores_count: int = 0, grad_server_cores: int = 0):
         reporting_count = max(1, int(reporting_count * scale))
         ipc_count = max(2, int(ipc_count * scale))
 
+    # Reserve cores for the C++ simulator (sized to blockCount) plus an unpinned
+    # OS/IRQ headroom lane. These come from the percentage-allocation rounding gap
+    # first; any shortfall is taken ONLY from reward — a backgrounded burst whose
+    # wall-clock overlaps the now-isolated sim, so trimming it does not affect round
+    # cadence. validator/query/reporting/ipc (round critical path) are never trimmed.
+    if sim_cores_count > 0:
+        _base_sum = validator_count + query_count + reward_count + reporting_count + ipc_count
+        _gap = available_cores - _base_sum
+        _deficit = max(0, sim_cores_count + os_headroom - _gap)
+        reward_count = max(4, reward_count - _deficit)
+
     offset = 0
 
     validator_cores = list(range(offset, offset + validator_count))
@@ -96,6 +124,15 @@ def get_core_allocation(sltp_cores_count: int = 0, grad_server_cores: int = 0):
     offset = min(available_cores, offset + reporting_count)
 
     ipc_cores = list(range(offset, min(available_cores, offset + ipc_count)))
+    offset = min(available_cores, offset + ipc_count)
+
+    # Simulator slice: the cores after the subsystems, leaving os_headroom unpinned
+    # when room allows (sim has priority over headroom if the box is tight).
+    sim_cores: list[int] = []
+    if sim_cores_count > 0 and offset < available_cores:
+        _room = available_cores - offset
+        _sim_alloc = sim_cores_count if _room >= sim_cores_count + os_headroom else min(sim_cores_count, _room)
+        sim_cores = list(range(offset, offset + _sim_alloc))
 
     result = {
         'validator': validator_cores,
@@ -108,4 +145,6 @@ def get_core_allocation(sltp_cores_count: int = 0, grad_server_cores: int = 0):
         result['sltp'] = sltp_cores
     if grad_cores:
         result['gradient_server'] = grad_cores
+    if sim_cores:
+        result['sim'] = sim_cores
     return result

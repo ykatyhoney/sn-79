@@ -14,7 +14,8 @@ from taos import __spec_version__ as TAOS_SPEC_VERSION
 
 # Bump on any change that makes prior checkpoints incompatible to resume.
 # Unstamped (pre-versioning) checkpoints read as regime 0, below this.
-TRAIN_REGIME_VERSION = 2
+# 3: equal order-type loss weights + IID/held-out scoring regime (0.5.3).
+TRAIN_REGIME_VERSION = 3
 
 
 def checkpoint_stamp(label_smooth_sigma: float) -> dict:

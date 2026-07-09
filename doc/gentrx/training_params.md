@@ -37,14 +37,13 @@ Boundary behaviour:
 
 | Param | Value | Notes |
 |---|---|---|
-| Order type class weights | `[bid=2.0, ask=4.0, cancel=0.5]` | Bid/ask carry trading signal, cancel is the easiest and most common prediction. |
+| Order type class weights | `[1.0, 1.0, 1.0, 1.0, 1.0]` (equal) | Five order-type classes: the three book events plus signed executions (a filled trade emits exec_buy or exec_sell). Weights are equal across classes. |
 | Field loss weights | `order_type=2.0, price=1.5, interval=0.3, vol_int=0.5, vol_dec=0.5` | order_type and price carry the most actionable signal; interval is bin-quantised so its gradient is noisy and gets a smaller weight. |
 | Label smoothing | none (0.05-0.1 reasonable) | Discourages overconfident predictions, helps generalisation. |
 
 **Why these weights:**
 
-- `cancel=0.5`: cancels are ~48% of the data and the easiest field to predict (mid-price + depth conditioning is enough). Higher cancel weight causes the model to flood predictions with cancels and drown out bid / ask signal.
-- `bid=2.0`, `ask=4.0`: ask is upweighted because asks are only ~14% of the data and need the extra gradient to compete with bids. Together with the field-level `order_type=2.0` the model sees strong gradient on direction, which is the most useful signal for trading.
+- Order-type classes are weighted **equally**. Upweighting the rare directional and execution classes over the easy cancel-guess forced usability at the cost of generalisation, so the common cancel prediction is tolerated rather than penalised.
 - `price=1.5`: price has 100 bins and the most complex distribution; extra signal helps.
 - `interval=0.3`: interval is the noisiest field per gradient unit spent, partly because the bin scheme above quantises the distribution coarsely. The lower weight keeps it from dominating the loss while the model is still learning the easier fields.
 
@@ -66,24 +65,30 @@ Offline training of a seed checkpoint, separate from the live distributed loop. 
 
 ## Distributed training (agent-side)
 
-Training agents are triggered by an assignment arriving via dendrite. The assignment names the books, time window, and the exact `model_version` to train against. Parquets come from the validator bucket (credentials carried in the assignment payload). The agent downloads the named checkpoint from the validator's bucket (discovered via chain) when it is newer than the local one.
+Training agents are triggered by an assignment arriving via dendrite. The assignment names the books, the exact page files, and the `model_version` to train against. Pages come from the validator bucket (credentials carried in the assignment payload). The agent downloads the named checkpoint from the validator's bucket (discovered via chain) when it is newer than the local one.
+
+Training is **budget-driven**: the agent trains its assigned pages one at a time, recent first, and stops when the round budget runs out. A GPU clears several pages, a CPU trains a partial pass of the first. There is no fixed step count to tune.
 
 | Param | Default | Notes |
 |---|---|---|
-| `gtx_train_steps` | 500 on cuda, 100 on cpu | Steps per training window. CPU default is 5× lower because CPU is roughly 50× slower per step; full 500 steps would push the cycle past the gradient-server's window. |
+| `gtx_round_budget_s` | 240 | Wall-clock training budget per round, in seconds. Keep below the round wallclock minus checkpoint/page download and gradient upload headroom. |
+| `gtx_train_steps` | 0 | Optional fixed total-step cap per window. 0 means budget-governed (the default). Set a positive value only to pin step count for experiments. |
 | `gtx_train_batch_size` | 16 on cuda, 4 on cpu | Bounded by device memory (attention is quadratic in seq×batch). Localnet / proxy launchers override to 8 for smaller GPUs. |
-| `gtx_train_seq_len` | 256 | Shorter than pretrain; per-window speed matters more than long context. |
+| `gtx_train_seq_len` | 512 | Matches the seed checkpoint's context and the gradient server's scoring loaders, so the model is trained and scored at the same context length. |
 | `gtx_train_lr` | 1e-4 | Same as pretrain |
-| `gtx_top_k_frac` | 0.05 | 5% retention, ~20× compression |
+| `gtx_top_k_frac` | 0.10 | 10% retention, ~10× compression |
 | `gtx_device` | `auto` | Device override. `auto` picks cuda if available else cpu. Set to `cpu` to force CPU even on GPU hosts (debugging, shared-host scenarios, memory analysis). The defaults above adjust based on the resolved device. |
 
-**Key trade-off.** `gtx_train_steps` controls how much each miner overfits per window. Fewer steps per window with more frequent aggregation generalise better; more steps per window extract more from each round's data at the risk of overfitting before the next aggregation.
+**Key trade-off.** A larger `gtx_round_budget_s` lets a fast miner cover more pages per round, one pass over each; extra budget means more pages, not repeated passes over the same page. The held-out validation score the gradient server computes caps overfitting: a gradient that overfits its pages lowers the held-out score, so the budget self-limits in practice.
 
 ## Gradient server (aggregation)
 
 | Param | Default | Notes |
 |---|---|---|
-| `--window-ns` | `300000000000` (5 min) | Sim-time window per assignment. See [Training window and sim grace period](#training-window-and-sim-grace-period) below. |
+| `--max-pending-rows-per-book` | `30000` | Page size: a book flushes a parquet once it reaches this many rows. This is the primary flush trigger, so active books emit uniform fixed-row pages. |
+| `--books-per-miner` | 3 | Page files assigned per miner per round (one page per book). Miners train them incrementally, so weak hardware trains fewer. Each miner gets a random overlapping sample of books over a shared held-out window; the shared held-out set (not identical data) is what makes gradients comparable across miners. |
+| `--val-fraction` | 0.10 | Size of the held-out scoring split. The validator picks the split each round, rotating which books are held out and keeping them disjoint from that round's training books, then pushes it to the server. So no book is trained and scored in the same round (no contamination), while every book is covered over time. This value is the server-side fallback size when no split is pushed. |
+| `--parquet-interval-ns` | `300000000000` (5 min) | Sim-time fallback that tail-flushes a stalled book's partial page. Not the primary trigger. |
 | `--min-score` | -0.1 | Stricter (e.g. -0.05 to 0.0) means fewer accepted gradients but safer. |
 | `--rollback` | true | Always keep. Protects against regression. |
 | `--max-val-batches` | 10 | More batches means more accurate scoring but slower. Range 10-30 is reasonable; raise if per-round score noise matters more than latency. |
@@ -93,19 +98,17 @@ Training agents are triggered by an assignment arriving via dendrite. The assign
 
 `--interval` (default 30 s) is a proxy / timer-mode knob and is ignored in block-synced production deployments; round closure is driven by `POST /gentrx/round` from the validator.
 
-### Training window and sim grace period
+### Page size and sim grace period
 
 The sim does not emit state immediately at startup. `simulation_0.xml` sets `gracePeriod="600000000000"` nanoseconds (10 minutes), during which the exchange accepts connections but publishes no state. First state messages arrive at `t = 10 minutes` of sim time.
 
-The training window is a separate knob: `--window-ns` on the gradient server (default `300000000000` ns, 5 minutes). Each assignment covers one window of sim time, and the gradient server cannot create assignments until at least one window of data has accumulated.
-
-In practice, the first training round lands at roughly `t = grace_period + window_ns`, so about 15 minutes of sim time under defaults. Operators watching startup should expect no aggregation events before that point. The gradient server logs `Not enough data yet` at debug level while it waits.
+Data is then accumulated into fixed-row pages: a book flushes a parquet once it reaches `--max-pending-rows-per-book` rows (default 30 000). The gradient server cannot assign a book until its first page has flushed, so the first training round lands once an active book fills a page, which depends on the order rate rather than a fixed window. A quiet book that never fills a page is tail-flushed on the `--parquet-interval-ns` sim-time fallback.
 
 | Setting | Default | Where |
 |---|---|---|
 | Sim grace period | 10 min (`600000000000` ns) | `MultiBookExchangeAgent.gracePeriod` in the simulation XML |
-| Training window | 5 min (`300000000000` ns) | `--window-ns` on the gradient server |
-| First round lands at | ~15 min of sim time | Derived: `gracePeriod + window_ns` |
+| Page size | 30 000 rows | `--max-pending-rows-per-book` on the gradient server |
+| Tail-flush fallback | 5 min (`300000000000` ns) | `--parquet-interval-ns` on the gradient server |
 
 Combined with **field-level weights** (order_type=2.0), the model gets 4x more gradient signal from "is the next order a bid or ask?" compared to "what's the volume decimal?"
 

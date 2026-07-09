@@ -96,7 +96,7 @@ def _symmetric_log_edges(n_bins: int, hi: float) -> np.ndarray:
 
 @dataclass
 class TokenizerConfig:
-    n_types: int = 3
+    n_types: int = 5
     price: BinConfig = field(
         default_factory=lambda: BinConfig(100, -500, 500, symmetric_log=True)
     )
@@ -112,6 +112,19 @@ class TokenizerConfig:
     # Conditioning embeddings
     max_mid_delta: int = 2000
     time_bin_seconds: int = 5
+    # Multi-scale regime context: rolling realized-vol / order-flow imbalance /
+    # momentum over this many events (0 = disabled). Derived from mid_price +
+    # order_type, fed as model conditioning (gives momentum/mean-reversion memory).
+    regime_window: int = 0
+
+    # Cross-asset normalization (asset_norm). When normalize=True and asset_ref is set,
+    # encode bins NORMALIZED values on the SAME 5 heads (no model change): price head
+    # bins p_norm (bps-of-mid / price_scale_bps); vol_int/vol_dec bin int/dec of
+    # qty/median_qty (ratio-to-median ~O(1), same range across assets). Set price /
+    # vol_int bin RANGES to the shared normalized ranges when using this. Decode
+    # (inference) inverts via asset_norm + the row's mid. int+dec stays parquet storage.
+    normalize: bool = False
+    asset_ref: dict | None = None  # {median_qty, price_scale_bps, pair_decimals}
 
     @classmethod
     def from_dict(cls, d: dict) -> "TokenizerConfig":
@@ -170,22 +183,26 @@ class OrderTokenizer:
         }
         return self.encode_columns(cols)
 
-    def encode_columns(self, cols: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    def encode_columns(
+        self, cols: dict[str, np.ndarray], asset_ref: dict | None = None
+    ) -> dict[str, np.ndarray]:
         """Encode pre-materialised numpy columns into per-field bin arrays.
 
         Equivalent output to ``encode(df)`` but reads from a dict of numpy
         arrays — letting callers source the columns via pyarrow (system
         malloc, no caching pool) instead of polars (mimalloc, retains pool).
+
+        ``asset_ref`` overrides the config's reference for this call (per-file
+        cross-asset normalization); falls back to ``config.asset_ref``.
         """
         c = self.config
+        ref = asset_ref if asset_ref is not None else c.asset_ref
 
         # Per-field bins
         order_types = cols["order_type"].astype(np.int32)
-        price_bins = c.price.digitize(
-            cols["rel_price"].astype(np.float64)
-        ).astype(np.int32)
+        rel_price = cols["rel_price"].astype(np.float64)
 
-        # Volume split — handle both old (single "volume") and new (int+dec) schemas
+        # Volume raw — handle both old (single "volume") and new (int+dec) schemas
         if "volume_int" in cols:
             vol_int_raw = cols["volume_int"].astype(np.float64)
             vol_dec_raw = cols["volume_dec"].astype(np.float64)
@@ -199,8 +216,19 @@ class OrderTokenizer:
                 "Parquet must have 'volume_int'+'volume_dec' or 'volume' column"
             )
 
-        vol_int_bins = c.vol_int.digitize(vol_int_raw).astype(np.int32)
-        vol_dec_bins = c.vol_dec.digitize(vol_dec_raw).astype(np.int32)
+        if c.normalize and ref is not None:
+            # Cross-asset: bin NORMALIZED values on the same heads (no model change).
+            from GenTRX.src.asset_norm import price_to_norm
+            mid = cols["mid_price"].astype(np.float64)
+            price_bins = c.price.digitize(price_to_norm(rel_price, mid, ref)).astype(np.int32)
+            qty_norm = (vol_int_raw + vol_dec_raw) / max(float(ref["median_qty"]), 1e-12)
+            vi = np.floor(qty_norm)
+            vol_int_bins = c.vol_int.digitize(vi).astype(np.int32)
+            vol_dec_bins = c.vol_dec.digitize(qty_norm - vi).astype(np.int32)
+        else:
+            price_bins = c.price.digitize(rel_price).astype(np.int32)
+            vol_int_bins = c.vol_int.digitize(vol_int_raw).astype(np.int32)
+            vol_dec_bins = c.vol_dec.digitize(vol_dec_raw).astype(np.int32)
         interval_bins = c.interval.digitize(
             cols["interval_ns"].astype(np.float64)
         ).astype(np.int32)
@@ -216,7 +244,7 @@ class OrderTokenizer:
         time_of_day = self._compute_time_of_day_cols(cols)
         mid_deltas = self._compute_mid_delta_cols(cols)
 
-        return {
+        out = {
             "order_types": order_types,
             "price_bins": price_bins,
             "vol_int_bins": vol_int_bins,
@@ -226,6 +254,34 @@ class OrderTokenizer:
             "time_of_day": time_of_day,
             "mid_deltas": mid_deltas,
         }
+        if c.regime_window > 0:
+            out["regime"] = self._compute_regime_cols(cols, c.regime_window)
+        return out
+
+    def _compute_regime_cols(self, cols: dict[str, np.ndarray], w: int) -> np.ndarray:
+        """Rolling (causal, expanding then window-w) regime features:
+        realized vol, order-flow imbalance, momentum — from mid_price + order_type."""
+        mid = cols["mid_price"].astype(np.float64)
+        ot = cols["order_type"]
+        sign = np.where(ot == 0, 1.0, np.where(ot == 1, -1.0, 0.0))
+        dmid = np.empty_like(mid)
+        dmid[0] = 0.0
+        dmid[1:] = np.diff(mid)
+        n = len(mid)
+
+        def roll_mean(x: np.ndarray) -> np.ndarray:
+            cs = np.concatenate([[0.0], np.cumsum(x)])
+            idx = np.arange(n)
+            lo = np.maximum(0, idx - w + 1)
+            return (cs[idx + 1] - cs[lo]) / (idx - lo + 1)
+
+        vol = np.sqrt(roll_mean(dmid * dmid))
+        imb = roll_mean(sign)
+        if n > w:
+            mom = mid - np.concatenate([np.full(w, mid[0]), mid[:-w]])
+        else:
+            mom = mid - mid[0]
+        return np.column_stack([vol, imb, mom]).astype(np.float32)
 
     def _compute_time_of_day(self, df: pl.DataFrame) -> np.ndarray:
         c = self.config

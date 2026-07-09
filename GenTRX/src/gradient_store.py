@@ -172,6 +172,13 @@ _SCORES_PREFIX = "scores/"               # not written in production (HTTP-only 
 _PROPOSAL_KEY = "proposals/{uid}/{block:08d}.grad"
 _PROPOSALS_PREFIX = "proposals/"
 _PROPOSAL_PRUNE_PREFIX = "proposals/{uid}/"
+# Version-keyed canonical delta a miner applies to advance v(n-1) → v(n).
+# Keyed by model version (not round), since version only bumps on accepted rounds.
+_DELTA_KEY = "deltas/{uid}/v{version:05d}.grad"
+_DELTA_PREFIX = "deltas/{uid}/"
+# Head pointer: current model version, written every version. latest.json keeps
+# pointing at the latest baseline checkpoint (uploaded every K versions).
+_HEAD_KEY = "checkpoints/{uid}/head.json"
 _DATA_PREFIX = "data/{uid}/{book_id}/intervals/"
 _DATA_BOOKS_PREFIX = "data/{uid}/"
 _DATA_KEY = "data/{uid}/{book_id}/intervals/{filename}"
@@ -480,6 +487,73 @@ class GradientStore:
             return resp["Body"].read()
         except Exception:
             return None
+
+    # ------------------------------------------------------------------
+    # Canonical version deltas (miner model-advance) + head pointer
+    # ------------------------------------------------------------------
+
+    def put_version_delta(self, validator_uid: int | str, version: int, data: bytes) -> str:
+        """Upload the canonical delta that advanced the model to `version`."""
+        key = self._key(_DELTA_KEY, uid=validator_uid, version=version)
+        self._put_with_retry(key, data)
+        logger.debug("Uploaded version delta v%d (%.1f KB)", version, len(data) / 1024)
+        return key
+
+    def get_version_delta(self, validator_uid: int | str, version: int) -> bytes | None:
+        """Download the canonical delta for `version`. None if absent (e.g. pruned)."""
+        client = self._get_sync_client()
+        try:
+            key = self._key(_DELTA_KEY, uid=validator_uid, version=version)
+            resp = client.get_object(Bucket=self.bucket, Key=key)
+            return resp["Body"].read()
+        except Exception:
+            return None
+
+    def prune_version_deltas(self, validator_uid: int | str, keep: int) -> int:
+        """Keep the newest `keep` version deltas under <uid>; delete older. Returns deleted count."""
+        if keep <= 0:
+            return 0
+        client = self._get_sync_client()
+        prefix = self._key(_DELTA_PREFIX, uid=validator_uid)
+        versions: list[tuple[int, str]] = []
+        paginator = client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                stem = obj["Key"].rsplit("/", 1)[-1]
+                try:
+                    versions.append((int(stem[1:-5]), obj["Key"]))  # strip "v" and ".grad"
+                except (ValueError, IndexError):
+                    pass
+        versions.sort()
+        stale = versions[:-keep] if len(versions) > keep else []
+        for _, key in stale:
+            try:
+                client.delete_object(Bucket=self.bucket, Key=key)
+            except Exception as exc:
+                logger.debug("Failed to delete stale delta %s: %s", key, exc)
+        return len(stale)
+
+    def put_head_version(self, validator_uid: int | str, version: int, meta: dict | None = None) -> None:
+        """Write the head-pointer (current model version), updated every version."""
+        import json
+
+        key = self._key(_HEAD_KEY, uid=validator_uid)
+        self._put_with_retry(key, json.dumps({"version": version, **(meta or {})}).encode())
+
+    def get_head_version(self, validator_uid: int | str) -> int:
+        """Read the head-pointer version. 0 if absent."""
+        return int(self.get_head_meta(validator_uid).get("version", 0))
+
+    def get_head_meta(self, validator_uid: int | str) -> dict:
+        """Read the head-pointer JSON (version + optional state_hash). {} if absent."""
+        import json
+
+        client = self._get_sync_client()
+        try:
+            resp = client.get_object(Bucket=self.bucket, Key=self._key(_HEAD_KEY, uid=validator_uid))
+            return json.loads(resp["Body"].read())
+        except Exception:
+            return {}
 
     # ------------------------------------------------------------------
     # Training data (parquets)

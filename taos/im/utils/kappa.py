@@ -93,9 +93,18 @@ def kappa_3(uid, realized_pnl_values, tau, lookback, norm_min, norm_max,
         if uid in deregistered_uids or not realized_pnl_values:
             return None
         timestamps = sorted(realized_pnl_values.keys())
+        # Explicit assessment window: restrict to the last `lookback` ns of
+        # observations instead of relying on the upstream prune to bound the
+        # history. Data-relative to the newest observation, so it is deterministic
+        # in the input (the fingerprint cache stays valid) and removes between-prune
+        # drift, making the kappa window exact.
+        if lookback and lookback > 0:
+            cutoff = timestamps[-1] - lookback
+            if timestamps[0] < cutoff:
+                timestamps = [ts for ts in timestamps if ts >= cutoff]
         if timestamps[-1] - timestamps[0] < min_lookback:
             return None
-        
+
         num_values = len(timestamps)
         book_ids = list(range(book_count))
         num_books = len(book_ids)
@@ -251,7 +260,7 @@ def kappa_3(uid, realized_pnl_values, tau, lookback, norm_min, norm_max,
 
 def kappa_3_batch(realized_pnl_values, tau, lookback, norm_min, norm_max,
                   min_lookback, min_realized_observations, grace_period, deregistered_uids, book_count,
-                  cache=None):
+                  cache=None, build_cache_updates=True):
     """
     Process a batch of UIDs for Kappa-3 calculation with realized P&L only.
     
@@ -282,8 +291,13 @@ def kappa_3_batch(realized_pnl_values, tau, lookback, norm_min, norm_max,
             deregistered_uids, book_count, cache=cache
         )
         results[uid] = kappa_values
-        fingerprint = _get_pnl_fingerprint(realized_pnl_value)
-        cache_updates[uid] = (fingerprint, kappa_values)        
+        # Only build cache_updates when the cache is active. With the cache off
+        # (the mainnet default) these get pickled by the worker, unpickled in the
+        # parent's collect, then discarded — a redundant copy of kappa_values that
+        # roughly doubled the collect payload (the scoring-round tail's dominant
+        # GIL hold), plus a wasted full-history _get_pnl_fingerprint scan.
+        if build_cache_updates:
+            cache_updates[uid] = (_get_pnl_fingerprint(realized_pnl_value), kappa_values)
     return results, cache_updates
 
 def _init_worker_affinity(cores):
@@ -317,6 +331,30 @@ def _get_worker_initializer(cores):
     if key not in _worker_init_cache:
         _worker_init_cache[key] = partial(_init_worker_affinity, cores)
     return _worker_init_cache[key]
+
+def _kappa_cache_enabled():
+    """The per-UID PnL fingerprint cache is DISABLED by default.
+
+    At mainnet history size it recomputed a ~6s/scoring-round full-history
+    fingerprint for EVERY UID on the main reward thread just to skip re-pickling
+    unchanged UIDs to loky — but pickling is ~0.06s and the hit rate is ~30%
+    (miners trade most rounds), so it cost far more than it saved. With it off,
+    all UIDs go straight to loky, which is correctness-neutral (same kappa,
+    freshly recomputed — the cold-cache path that already ran every restart).
+
+    Re-enable only for comparison/rollback: env KAPPA_CACHE=1, or a `.kappa_cache`
+    repo-root sentinel (checked live, no relaunch; the sentinel wins over the env).
+    """
+    try:
+        _s = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", ".kappa_cache"
+        )
+        if os.path.exists(_s):
+            return True
+    except Exception:
+        pass
+    return os.environ.get("KAPPA_CACHE", "0") == "1"
+
 
 def batch_kappa_3(realized_pnl_values, tau, batches, lookback, norm_min, norm_max,
                   min_lookback, min_realized_observations, grace_period, deregistered_uids, 
@@ -353,8 +391,13 @@ def batch_kappa_3(realized_pnl_values, tau, batches, lookback, norm_min, norm_ma
     # into a batch dict and shipped to a loky worker, which then paid the
     # cache-check cost per worker — orders of magnitude more overhead than
     # a same-thread dict lookup.
+    import time as _time
+    _t0 = _time.perf_counter()
+    _n_in = sum(len(b) for b in batches)
+
     cache_hits: dict = {}
-    if cache is not None:
+    _cache_on = cache is not None and _kappa_cache_enabled()
+    if _cache_on:
         remaining_batches = []
         for batch in batches:
             remaining_uids = []
@@ -371,8 +414,22 @@ def batch_kappa_3(realized_pnl_values, tau, batches, lookback, norm_min, norm_ma
                 remaining_batches.append(remaining_uids)
         batches = remaining_batches
 
+    # [REWARD-PROFILE kappa] fast-path is a main-thread, GIL-held loop over every
+    # UID (fingerprint each round) — measure it: it's the reward path's biggest
+    # candidate for starving the event loop, not the loky marshalling (which the
+    # fingerprint cache already reduces to just the changed UIDs).
+    _t_fast = _time.perf_counter()
+    _n_remaining = sum(len(b) for b in batches)
+
     # All UIDs cache-hit — no pool needed at all.
     if not batches:
+        import bittensor as _bt
+        _bt.logging.info(
+            f"[REWARD-PROFILE kappa] cache={'on' if _cache_on else 'off'} "
+            f"uids_in={_n_in} hits={len(cache_hits)} "
+            f"to_loky=0 batches=0 | fastpath={_t_fast - _t0:.3f}s "
+            f"submit=0.000s collect=0.000s"
+        )
         return cache_hits, {}
 
     initializer = _get_worker_initializer(cores)
@@ -407,11 +464,12 @@ def batch_kappa_3(realized_pnl_values, tau, batches, lookback, norm_min, norm_ma
             {uid: realized_pnl_values.get(uid, {}) for uid in batch},
             tau, lookback, norm_min, norm_max, min_lookback, min_realized_observations,
             grace_period, deregistered_uids, book_count,
-            cache=cache
+            cache=cache, build_cache_updates=_cache_on
         )
         for batch in batches
     ]
     
+    _t_submit = _time.perf_counter()
     result = dict(cache_hits)  # merge fast-path hits with pool results
     cache_updates = {}
 
@@ -421,4 +479,13 @@ def batch_kappa_3(realized_pnl_values, tau, batches, lookback, norm_min, norm_ma
             result[int(k)] = v
         cache_updates.update(batch_cache_updates)
 
+    _t_collect = _time.perf_counter()
+    import bittensor as _bt
+    _bt.logging.info(
+        f"[REWARD-PROFILE kappa] cache={'on' if _cache_on else 'off'} "
+        f"uids_in={_n_in} hits={len(cache_hits)} "
+        f"to_loky={_n_remaining} batches={len(batches)} | "
+        f"fastpath={_t_fast - _t0:.3f}s submit={_t_submit - _t_fast:.3f}s "
+        f"collect={_t_collect - _t_submit:.3f}s"
+    )
     return result, cache_updates

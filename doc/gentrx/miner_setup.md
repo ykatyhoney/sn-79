@@ -74,7 +74,7 @@ If you prefer to manage each step individually, the five steps below describe th
    - **Write token**: "Object Read & Write" on this bucket. Stays on your miner host. Used to upload gradients. Do not share the write token.
    - **Read token**: "Object Read" on this bucket. Goes on-chain so validators can pull your gradients. Public-by-design.
 
-   Each token entry in the R2 dashboard exposes three fields: a **Token Value** (long bearer string for the Cloudflare API — ignore it), an **Access Key ID**, and a **Secret Access Key**. The wizard and `bin/setup_miner_bucket.py` use the latter two; bearer tokens are not part of the chain commitment.
+   Each token entry in the R2 dashboard exposes three fields: a **Token Value** (long bearer string for the Cloudflare API, ignore it), an **Access Key ID**, and a **Secret Access Key**. The wizard and `bin/setup_miner_bucket.py` use the latter two; bearer tokens are not part of the chain commitment.
 
 ### Storj
 
@@ -225,7 +225,7 @@ If `[GTX] assignment received` never appears after ~20 min, jump to [Troubleshoo
 
 ### Confirm uploads
 
-Confirm gradients are landing in your bucket. Easiest path is the **Cloudflare R2 dashboard**. Open your bucket and watch the `gentrx/<network>/<mode>/gradients/NNNNNNNN.grad` files (8-digit zero-padded round IDs, under the network/mode prefix you launched with — e.g. `gentrx/mainnet/simulation/gradients/`) appear ~once per round. Hippius operators have an equivalent dashboard at the Hippius web UI.
+Confirm gradients are landing in your bucket. Easiest path is the **Cloudflare R2 dashboard**. Open your bucket and watch the `gentrx/<network>/<mode>/gradients/NNNNNNNN.grad` files (8-digit zero-padded round IDs, under the network/mode prefix you launched with, e.g. `gentrx/mainnet/simulation/gradients/`) appear ~once per round. Hippius operators have an equivalent dashboard at the Hippius web UI.
 
 If you'd rather stay in the terminal, the project's existing boto3 dependency does the same listing without any extra install:
 
@@ -264,7 +264,7 @@ Your bucket is hot storage. The miner prunes `gradients/` to the newest `gtx_kee
 
 ### One gradient per round
 
-The gradient server reads each `(miner, round)` key exactly once. The first successful read is what gets scored, and the score is final for that round. If you `PUT` again under the same key before the round drains, the bucket bytes change but the server has already moved on — the resubmission is wasted. Treat each round as a single shot: post your best gradient, then stop touching that key until the next round.
+The gradient server reads each `(miner, round)` key exactly once. The first successful read is what gets scored, and the score is final for that round. If you `PUT` again under the same key before the round drains, the bucket bytes change but the server has already moved on, so the resubmission is wasted. Treat each round as a single shot: post your best gradient, then stop touching that key until the next round.
 
 This also means there is no advantage to uploading early then revising late. Score the gradient once locally, decide it is your best, then upload.
 
@@ -312,6 +312,8 @@ GENTRX_PARAMS="$GENTRX_PARAMS gtx_training_url=http://127.0.0.1:8200"
 # add gtx_training_api_key=$GENTRX_MINER_API_KEY when cross-machine
 ```
 
+**Multiple UIDs on one service.** An operator running several trading agents can point them all at one `miner_training_server`, which trains for every UID against a single in-memory base model on one GPU. Each agent tags its forwarded assignment with its own UID, and the service uploads a distinct gradient to each UID's own bucket path. Start the service with `--uids` listing the co-served UIDs so their budgets are reserved up front; the round budget (`--round-budget-s`) is split evenly across them, so each UID trains for `budget / n` seconds. This is supported but not the encouraged setup: co-located UIDs share GPU time, so each trains less than a dedicated box would.
+
 Service CLI, cross-machine TLS (cloudflared / ngrok / private network), payload schema, failure modes, operator-responsibility split: [`integration.md` § Path 2](integration.md#path-2-http-api-to-miner_training_server).
 
 ### Bring your own trading agent (HTTP API)
@@ -356,13 +358,15 @@ Same five steps; training-only path, no order placement.
 | Param | Default | Description |
 |---|---|---|
 | `gtx_training_enabled` | `true` | Training is **on by default**. Set to `false` to opt out. |
-| `gtx_train_steps` | `500` (cuda), `100` (cpu) | Iterations per training window. CPU default is 5× lower because CPU is ~50× slower per step; full 500 would push the cycle past the gradient-server's window. |
+| `gtx_round_budget_s` | `240` | Wall-clock training budget per round (seconds). The agent trains its assigned pages incrementally (recent first) and stops when the budget is up, so a GPU clears several pages and a CPU does a partial pass. |
+| `gtx_train_steps` | `0` | Optional fixed total-step cap per window. `0` means budget-governed (the default). Set positive only to pin step count for experiments. |
 | `gtx_train_batch_size` | `16` (cuda), `4` (cpu) | Sequences per batch. Attention is quadratic in seq×batch, so smaller batch cuts CPU memory + per-step cost. Drop further to `8` on tight VRAM (localnet launchers use `8`). |
 | `gtx_train_seq_len` | `256` | Tokens per sequence (also min observations for inference). |
 | `gtx_train_lr` | `1e-4` | Learning rate per training window. |
 | `gtx_top_k_frac` | `0.05` | Gradient sparsification (5% retention ≈ 20× compression). |
-| `gtx_device` | `auto` | Device override. `auto` picks cuda if available else cpu. Set to `cpu` to force CPU on a GPU host (debugging / shared-host / memory analysis). Drives the `gtx_train_steps` and `gtx_train_batch_size` defaults above. |
-| `gtx_keep_gradients` | `50` | Hot-bucket retention. `gradients/<own-uid>/{round_id:08d}.grad` older than the newest N are deleted after every upload. `0` disables - recommend pairing with cold-storage mirror. |
+| `gtx_verify_drift` | `false` | After advancing the model by applying per-version deltas, compare against the server's published hash and resync on mismatch. Only useful when the validator runs with `--publish-state-hash`. |
+| `gtx_device` | `auto` | Device override. `auto` picks cuda if available else cpu. Set to `cpu` to force CPU on a GPU host (debugging / shared-host / memory analysis). Drives the `gtx_train_batch_size` default above. |
+| `gtx_keep_gradients` | `50` | Hot-bucket retention. `gradients/<uid>/{round_id:08d}.grad` older than the newest N are deleted after each round, per served UID. `0` disables - recommend pairing with cold-storage mirror. |
 | `gtx_aggregator_uid` | `0` | UID of the canonical-checkpoint aggregator. Mainnet leaves this default; localnet uses `1`. |
 | `gtx_mode` | `simulation` | Bucket-prefix shard. Combined with the connected subtensor network (finney → `mainnet`, else `testnet`) to produce `gentrx/<network>/<mode>/`. Leave at `simulation` unless instructed otherwise; `exchange` reserves the prefix for future exchange-data training. |
 | `gtx_training_url` | (unset → inline) | When set, agent forwards assignments to this URL (e.g. `http://127.0.0.1:8200`) instead of training in-process. See [Choosing your trading mode](#choosing-your-trading-mode). |
