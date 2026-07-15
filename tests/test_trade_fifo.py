@@ -64,3 +64,34 @@ def test_buy_exceeding_short_closes_then_opens_long():
     assert rt == 3.0                       # only the 3 covered counts as round-trip
     longs = list(s.open_positions[0][0]["longs"])
     assert len(longs) == 1 and longs[0][1] == 5.0   # 5 remaining opens a long
+
+
+def test_sell_closing_multiple_longs_ending_partial_prorates_fee():
+    """A single sell that fully closes one long and partially closes the next must
+    allocate the fill fee proportionally across BOTH portions. The partial branch
+    used to charge the full fee again, double-counting the fee already taken by the
+    fully-closed lot and understating realized P&L."""
+    s = _self()
+    match_trade_fifo(s, 0, 0, is_buy=True, quantity=6.0, price=100.0, fee=0.0, timestamp=1)  # long 6
+    match_trade_fifo(s, 0, 0, is_buy=True, quantity=6.0, price=100.0, fee=0.0, timestamp=2)  # long 6
+    pnl, rt = match_trade_fifo(s, 0, 0, is_buy=False, quantity=10.0, price=110.0, fee=1.0, timestamp=3)
+    # gross (110-100)*10 = 100; total close fee = the fill's 1.0 (0.6 on the 6 fully
+    # closed + 0.4 on the 4 partially closed), open fees 0 → 99.0.
+    assert round(pnl, 10) == 99.0
+    assert rt == 10.0
+    residual = list(s.open_positions[0][0]["longs"])
+    assert len(residual) == 1 and residual[0][1] == 2.0  # 2 qty remains on lot B
+
+
+def test_buy_covering_multiple_shorts_ending_partial_prorates_fee():
+    """Short-cover mirror of the above: full close of one short + partial close of the
+    next must prorate the fill fee, not re-charge it in full on the partial lot."""
+    s = _self()
+    match_trade_fifo(s, 0, 0, is_buy=False, quantity=6.0, price=100.0, fee=0.0, timestamp=1)  # short 6
+    match_trade_fifo(s, 0, 0, is_buy=False, quantity=6.0, price=100.0, fee=0.0, timestamp=2)  # short 6
+    pnl, rt = match_trade_fifo(s, 0, 0, is_buy=True, quantity=10.0, price=90.0, fee=1.0, timestamp=3)
+    # gross (100-90)*10 = 100; total close fee = the fill's 1.0 → 99.0.
+    assert round(pnl, 10) == 99.0
+    assert rt == 10.0
+    residual = list(s.open_positions[0][0]["shorts"])
+    assert len(residual) == 1 and residual[0][1] == 2.0  # 2 qty remains on short B

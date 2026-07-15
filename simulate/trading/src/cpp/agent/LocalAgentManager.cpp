@@ -5,6 +5,7 @@
 #include "LocalAgentManager.hpp"
 
 #include <taosim/agent/ALGOTraderAgent.hpp>
+#include <taosim/agent/ArbitrageTraderAgent.hpp>
 #include <taosim/agent/FuturesTraderAgent.hpp>
 #include <taosim/agent/HighFrequencyTraderAgent.hpp>
 #include <taosim/agent/NoiseTraderAgent.hpp>
@@ -46,6 +47,9 @@ void LocalAgentManager::createAgentsInstanced(
         }
         else if (name == "ALGOTraderAgent") {
             createAgentInstanced <taosim::agent::ALGOTraderAgent>(child);
+        }
+        else if (name == "ArbitrageTraderAgent") {
+            createAgentInstanced<taosim::agent::ArbitrageTraderAgent>(child);
         }
         else if (name == "FuturesTraderAgent") {
             createAgentInstanced<taosim::agent::FuturesTraderAgent>(child);

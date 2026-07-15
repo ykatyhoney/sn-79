@@ -205,6 +205,14 @@ def cleanup_executors(self: Validator):
             bt.logging.warning(f"Error stopping metagraph sync worker: {ex}")
         self._mg_worker = None
 
+    if getattr(self, '_scoring_shadow', None) is not None:
+        try:
+            bt.logging.info("Stopping scoring shadow...")
+            self._scoring_shadow.stop()
+        except Exception as ex:
+            bt.logging.warning(f"Error stopping scoring shadow: {ex}")
+        self._scoring_shadow = None
+
     if hasattr(self, 'reward_executor') and self.reward_executor is not None:
         try:
             bt.logging.info("Shutting down reward_executor...")

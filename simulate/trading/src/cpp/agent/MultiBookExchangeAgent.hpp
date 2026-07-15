@@ -104,12 +104,14 @@ private:
     void handleLocalRetrieveL2(const Message::Ptr&  msg);
     void handleLocalMarketOrderSubscription(const Message::Ptr&  msg);
     void handleLocalLimitOrderSubscription(const Message::Ptr&  msg);
+    void handleMinerLimitOrderSubscription(const Message::Ptr&  msg);
     void handleLocalTradeSubscription(const Message::Ptr&  msg);
     void handleLocalTradeByOrderSubscription(const Message::Ptr&  msg);
     void handleLocalUnknownMessage(const Message::Ptr&  msg);
 
-    void notifyMarketOrderSubscribers(const MarketOrder::Ptr& marketOrder);
-    void notifyLimitOrderSubscribers(const LimitOrder::Ptr& limitOrder);
+    void notifyMarketOrderSubscribers(const MarketOrder::Ptr& marketOrder, BookId bookId, AgentId agentId);
+    void notifyLimitOrderSubscribers(
+        const LimitOrder::Ptr& limitOrder, BookId bookId, AgentId agentId, bool isRemote);
     void notifyTradeSubscribers(const TradeWithLogContext::Ptr& tradeWithCtx);
     void notifyTradeSubscribersByOrderID(const TradeWithLogContext::Ptr& tradeWithCtx, OrderID orderId);
 
@@ -140,6 +142,10 @@ private:
     uint64_t m_marginCallCounter{};
     taosim::util::SubscriptionRegistry<LocalAgentId> m_localMarketOrderSubscribers;
     taosim::util::SubscriptionRegistry<LocalAgentId> m_localLimitOrderSubscribers;
+    // Miner-only scope: dispatched EVENT_ORDER_LIMIT only for remote (distributed/miner)
+    // orders, so cost-sensitive consumers (e.g. ArbitrageTraderAgent) are never woken by
+    // the background-order flood.
+    taosim::util::SubscriptionRegistry<LocalAgentId> m_minerLimitOrderSubscribers;
     taosim::util::SubscriptionRegistry<LocalAgentId> m_localTradeSubscribers;
     std::map<OrderID, taosim::util::SubscriptionRegistry<LocalAgentId>> m_localTradeByOrderSubscribers;
     std::shared_ptr<OrderID> m_orderIdCounter;

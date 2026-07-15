@@ -243,6 +243,7 @@ void PlaceOrderLimitPayload::jsonSerialize(
         json.AddMember("currency", rapidjson::Value{std::to_underlying(currency)}, allocator);
         taosim::json::setOptionalMember(json, "clientOrderId", clientOrderId);
         json.AddMember("postOnly", rapidjson::Value{postOnly}, allocator);
+        json.AddMember("allowPartial", rapidjson::Value{allowPartial}, allocator);
         json.AddMember(
             "timeInForce",
             rapidjson::Value{magic_enum::enum_name(timeInForce).data(), allocator},
@@ -282,7 +283,7 @@ PlaceOrderLimitPayload::Ptr PlaceOrderLimitPayload::fromJson(const rapidjson::Va
         return std::make_optional(taosim::json::getDecimal(json[k]));
     };
 
-    return MessagePayload::create<PlaceOrderLimitPayload>(
+    auto payload = MessagePayload::create<PlaceOrderLimitPayload>(
         OrderDirection{json["direction"].GetUint()},
         taosim::json::getDecimal(json["volume"]),
         taosim::json::getDecimal(json["price"]),
@@ -317,6 +318,10 @@ PlaceOrderLimitPayload::Ptr PlaceOrderLimitPayload::fromJson(const rapidjson::Va
         getOptDec("takeProfit"),
         getOptDec("placeholder")
         );
+    payload->allowPartial = json.HasMember("allowPartial") && !json["allowPartial"].IsNull()
+        ? json["allowPartial"].GetBool()
+        : true;
+    return payload;
 }
 
 //-------------------------------------------------------------------------
@@ -827,7 +832,10 @@ void EventOrderMarketPayload::jsonSerialize(
 {
     auto serialize = [this](rapidjson::Document& json) {
         json.SetObject();
+        auto& allocator = json.GetAllocator();
         order.jsonSerialize(json, "order");
+        json.AddMember("bookId", rapidjson::Value{bookId}, allocator);
+        json.AddMember("agentId", rapidjson::Value{agentId}, allocator);
     };
     taosim::json::serializeHelper(json, key, serialize);
 }
@@ -836,13 +844,16 @@ void EventOrderMarketPayload::jsonSerialize(
 
 EventOrderMarketPayload::Ptr EventOrderMarketPayload::fromJson(const rapidjson::Value& json)
 {
-    return MessagePayload::create<EventOrderMarketPayload>(
+    auto payload = MessagePayload::create<EventOrderMarketPayload>(
         MarketOrder{
             json["orderId"].GetUint(),
             json["timestamp"].GetUint64(),
             // Currency{json["currency"].GetUint()},
             taosim::json::getDecimal(json["volume"]),
             OrderDirection{json["direction"].GetUint()}});
+    if (json.HasMember("bookId")) payload->bookId = json["bookId"].GetUint();
+    if (json.HasMember("agentId")) payload->agentId = json["agentId"].GetInt();
+    return payload;
 }
 
 //-------------------------------------------------------------------------
@@ -852,7 +863,10 @@ void EventOrderLimitPayload::jsonSerialize(
 {
     auto serialize = [this](rapidjson::Document& json) {
         json.SetObject();
+        auto& allocator = json.GetAllocator();
         order.jsonSerialize(json, "order");
+        json.AddMember("bookId", rapidjson::Value{bookId}, allocator);
+        json.AddMember("agentId", rapidjson::Value{agentId}, allocator);
     };
     taosim::json::serializeHelper(json, key, serialize);
 }
@@ -861,7 +875,7 @@ void EventOrderLimitPayload::jsonSerialize(
 
 EventOrderLimitPayload::Ptr EventOrderLimitPayload::fromJson(const rapidjson::Value& json)
 {
-    return MessagePayload::create<EventOrderLimitPayload>(
+    auto payload = MessagePayload::create<EventOrderLimitPayload>(
         LimitOrder{
             json["orderId"].GetUint(),
             json["timestamp"].GetUint64(),
@@ -869,6 +883,9 @@ EventOrderLimitPayload::Ptr EventOrderLimitPayload::fromJson(const rapidjson::Va
             taosim::json::getDecimal(json["volume"]),
             OrderDirection{json["direction"].GetUint()},
             taosim::json::getDecimal(json["price"])});
+    if (json.HasMember("bookId")) payload->bookId = json["bookId"].GetUint();
+    if (json.HasMember("agentId")) payload->agentId = json["agentId"].GetInt();
+    return payload;
 }
 
 //-------------------------------------------------------------------------

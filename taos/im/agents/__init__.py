@@ -329,23 +329,26 @@ class UnifiedAgentResponse:
             ))
 
     def cancel_order(self, book_id, order_id, quantity=None, delay: int = 0) -> None:
-        self.cancel_orders(book_id, [order_id], delay=delay)
+        # quantity=None → full cancel; a value → partial cancel of that many BASE units.
+        self.cancel_orders(book_id, [order_id], volume=quantity, delay=delay)
 
-    def cancel_orders(self, book_id, order_ids, delay: int = 0) -> None:
+    def cancel_orders(self, book_id, order_ids, volume=None, delay: int = 0) -> None:
+        # volume applies to every order id (None = full cancel); pass a list to vary per order.
+        vols = volume if isinstance(volume, (list, tuple)) else [volume] * len(order_ids)
         if self._exchange_mode:
             from taos.im.protocol.exchange.instructions import (
                 CancelOrdersInstruction, CancelOrderInstruction)
             self.instructions.append(CancelOrdersInstruction(
                 agentId=self.agent_id, delay=delay, bookId=book_id,
-                cancellations=[CancelOrderInstruction(orderId=oid, volume=None)
-                               for oid in order_ids],
+                cancellations=[CancelOrderInstruction(orderId=oid, volume=v)
+                               for oid, v in zip(order_ids, vols)],
             ))
         else:
             from taos.im.protocol.instructions import (
                 CancelOrdersInstruction as _Sim, CancelOrderInstruction as _SimC)
             self.instructions.append(_Sim(
                 agentId=self.agent_id, delay=delay, bookId=book_id,
-                cancellations=[_SimC(orderId=oid, volume=None) for oid in order_ids],
+                cancellations=[_SimC(orderId=oid, volume=v) for oid, v in zip(order_ids, vols)],
             ))
 
     def close_position(self, book_id, order_id, quantity=None, delay: int = 0) -> None:

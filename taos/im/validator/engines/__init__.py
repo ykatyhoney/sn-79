@@ -42,7 +42,8 @@ class NormalizedTradeEvent:
     maker_fee: float
     taker_fee: float
     timestamp:           int     = field(default_factory=lambda: int(time.time_ns()))
-    order_id:            Optional[str] = field(default=None)
+    order_id:            Optional[str] = field(default=None)   # truncated display id
+    order_uuid:          Optional[str] = field(default=None)   # full exchange-API UUID ('xo' on notices)
     close_reason:        Optional[str] = field(default=None)   # 'SL' | 'TP' | None
     linked_order_id:     Optional[int] = field(default=None)   # originating LOB order id
 

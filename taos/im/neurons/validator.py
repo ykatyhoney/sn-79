@@ -258,6 +258,39 @@ if __name__ != "__mp_main__":
             if hasattr(signal, 'SIGHUP'):
                 signal.signal(signal.SIGHUP, signal_handler)
 
+        def _reap_orphaned_services(self):
+            """Kill service subprocesses orphaned by a previous validator instance.
+
+            pm2's kill timeout (~1.6s default) SIGKILLs the validator long before
+            its graceful cleanup reaches the child services, so query/report/seed
+            processes survive with PPID=1 — and the orphaned query service poaches
+            the PERSISTENT posix MQs, producing the recurring 'Query service
+            notification timeout' failure. PPID==1 + our service script in the
+            cmdline is provably orphaned (a live validator's children carry its
+            pid as PPID), so the kill is safe even with multiple validators on
+            one box. Runs once at boot, before any IPC is opened.
+            """
+            import psutil
+            _patterns = (
+                'validator/query.py', 'validator/report.py', 'validator/seed.py',
+            )
+            reaped = 0
+            for proc in psutil.process_iter(['pid', 'ppid', 'cmdline']):
+                try:
+                    if proc.info['ppid'] != 1:
+                        continue
+                    cmd = ' '.join(proc.info.get('cmdline') or [])
+                    if any(p in cmd for p in _patterns):
+                        bt.logging.warning(
+                            f"Reaping orphaned service (pid {proc.info['pid']}): {cmd[:120]}"
+                        )
+                        proc.kill()
+                        reaped += 1
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            if reaped:
+                bt.logging.warning(f"Reaped {reaped} orphaned service process(es) from a previous instance")
+
         def _start_query_service(self):
             """
             Launches the validator's query service and initializes POSIX IPC resources.
@@ -751,12 +784,12 @@ if __name__ != "__mp_main__":
             # (resync_metagraph swaps it in; falls back to in-process sync when
             # the worker is unavailable). Pinned to the unallocated OS-headroom
             # cores. METAGRAPH_WORKER=0 disables (legacy in-process sync).
+            _allocated = {c for v in core_allocation.values() for c in v}
+            _leftover = sorted(set(range(os.cpu_count() or 1)) - _allocated)
             self._mg_worker = None
             if os.environ.get("METAGRAPH_WORKER", "1") != "0" and not self.config.mock:
                 try:
                     from taos.im.validator.metagraph_worker import MetagraphSyncWorker
-                    _allocated = {c for v in core_allocation.values() for c in v}
-                    _leftover = sorted(set(range(os.cpu_count() or 1)) - _allocated)
                     self._mg_worker = MetagraphSyncWorker(
                         self.subtensor.chain_endpoint, self.config.netuid, cores=_leftover
                     )
@@ -767,6 +800,41 @@ if __name__ != "__mp_main__":
                 except Exception as e:
                     self._mg_worker = None
                     bt.logging.warning(f"Metagraph sync worker unavailable, syncing in-process: {e}")
+
+            # Shadow scoring service (Q3 Stage A): replicates the history
+            # accounting in a subprocess from teed state bytes and reports
+            # parity digests — groundwork (and proof) for moving reward/save/
+            # report prep off the main process. Default OFF; observation only.
+            self._scoring_shadow = None
+            self._shadow_applied_ts = 0
+            self._scoring_proc_cutover = False
+            self._scoring_proc_n = 0
+            if getattr(self.config, 'engine', 'simulation') != 'exchange' and not self.config.mock:
+                try:
+                    from taos.im.validator.scoring_shadow import (
+                        ScoringShadow, compute_parity_components, cutover_enabled, shadow_enabled,
+                    )
+                    self._scoring_proc_cutover = cutover_enabled()
+                    if self._scoring_proc_cutover or shadow_enabled():
+                        self._shadow_digest_fn = compute_parity_components
+                        from taos.im.validator.scoring_shadow import pnl_len_vector as _plv
+                        self._shadow_pnl_vec_fn = _plv
+                        # Cutover: the child scores authoritatively — give it the
+                        # reward core slice (main's loky only runs on fallback/
+                        # verify, which tolerates sharing). Shadow-only: leftover.
+                        _shadow_cores = self.reward_cores if self._scoring_proc_cutover else _leftover
+                        self._scoring_shadow = ScoringShadow(cores=_shadow_cores)
+                        self._scoring_shadow.start()
+                        bt.logging.info(
+                            f"Scoring service started (mode: "
+                            f"{'CUTOVER' if self._scoring_proc_cutover else 'shadow'}, "
+                            f"cores: {_shadow_cores or 'unpinned'}, "
+                            f"parity every {self._scoring_shadow.parity_ns/1e9:.0f} sim-s)"
+                        )
+                except Exception as e:
+                    self._scoring_shadow = None
+                    self._scoring_proc_cutover = False
+                    bt.logging.warning(f"Scoring service unavailable: {e}")
 
             self.maintaining = False
             self.compressing = False
@@ -898,6 +966,7 @@ if __name__ != "__mp_main__":
             self.repo = Repo(self.repo_path)
             self.update_repo()
 
+            self._reap_orphaned_services()
             self.query_process = None
             self.query_notify_read = -1
             self.query_notify_write = -1
@@ -1292,13 +1361,53 @@ if __name__ != "__mp_main__":
 
         def process_resets(self, state: NormalizedState) -> None:
             """
-            Processes reset notices delivered by the simulator.
-            Collects UIDs needing reset via the engine, then applies them.
+            Collects reset notices delivered by the simulator and stashes them on
+            the state. APPLICATION happens in _reward, immediately AFTER that
+            round's update_trade_volumes — the same position the scoring service
+            applies them (it derives the same set from the teed state), so the
+            reset transition is deterministic on both sides. Applying here (before
+            the queued volume update) left main one round ahead of the service on
+            the reset uid's history — the recurring n_pnl parity mismatch.
             """
             pending = set()
             self.engine.collect_resets(state, pending)
-            self.engine.apply_resets(pending)
+            state._pending_resets = pending
 
+
+        def _sync_metagraph_with_retry(self, attempts: int = 5):
+            """In-process metagraph sync with bounded retry/backoff.
+
+            The initial boot sync (super().__init__ -> sync) runs BEFORE the
+            metagraph worker exists, so it always takes this in-process path. A
+            transient chain-RPC hiccup here (e.g. a websocket keepalive-ping
+            timeout) otherwise propagates straight out of __init__ and pm2's
+            short kill-timeout SIGKILLs the half-booted validator, leaving it
+            stopped. Retry with exponential backoff, refreshing the subtensor
+            connection between tries so a dead websocket doesn't doom every
+            attempt. Re-raises only if the chain is unreachable for the whole
+            window (preserving the original fail-hard as a last resort)."""
+            attempts = max(1, int(os.environ.get("METAGRAPH_SYNC_RETRIES", str(attempts))))
+            delay = 2.0
+            for attempt in range(1, attempts + 1):
+                try:
+                    self.metagraph.sync(subtensor=self.subtensor)
+                    if attempt > 1:
+                        bt.logging.success(f"Metagraph sync succeeded on attempt {attempt}/{attempts}")
+                    return
+                except Exception as ex:
+                    if attempt >= attempts:
+                        bt.logging.error(f"Metagraph sync failed after {attempts} attempts: {ex}")
+                        raise
+                    bt.logging.warning(
+                        f"Metagraph sync attempt {attempt}/{attempts} failed ({ex}); "
+                        f"refreshing subtensor and retrying in {delay:.0f}s"
+                    )
+                    try:
+                        self.subtensor = bt.Subtensor(self.config.subtensor.chain_endpoint)
+                    except Exception as re:
+                        bt.logging.warning(f"Subtensor refresh failed (will retry with existing): {re}")
+                    time.sleep(delay)
+                    delay = min(delay * 2, 30.0)
 
         def resync_metagraph(self):
             """Resyncs the metagraph and updates hotkeys and scores."""
@@ -1326,7 +1435,7 @@ if __name__ != "__mp_main__":
             else:
                 previous_metagraph = copy.deepcopy(self.metagraph)
                 bt.logging.debug("Syncing metagraph...")
-                self.metagraph.sync(subtensor=self.subtensor)
+                self._sync_metagraph_with_retry()
             if previous_metagraph.axons == self.metagraph.axons and len(self.hotkeys) == len(self.metagraph.hotkeys):
                 bt.logging.debug("No axon changes!")
                 # Re-register benchmark buckets even when the metagraph is unchanged,
@@ -1544,10 +1653,16 @@ if __name__ != "__mp_main__":
             """
             if os.environ.get("SIM_CORE_PIN", "1") == "0":
                 return 0
+            # Observe / exchange mode has no simulation config → nothing to pin.
+            # Bail silently instead of warning (config.simulation is None there).
+            sim_cfg = getattr(self.config, "simulation", None)
+            xml_path = getattr(sim_cfg, "xml_config", None) if sim_cfg else None
+            if not xml_path:
+                return 0
             try:
                 import xml.etree.ElementTree as ET
 
-                root = ET.parse(self.config.simulation.xml_config).getroot()
+                root = ET.parse(xml_path).getroot()
                 return int(root.attrib["blockCount"])
             except Exception as ex:
                 bt.logging.warning(f"_read_block_count: could not read blockCount ({ex}); sim will not be pinned")
@@ -2100,20 +2215,129 @@ if __name__ != "__mp_main__":
                         # and against the MVTRX push builder via the two-step
                         # atomic-snapshot pattern in _build_sim_push_payload.
                         self._update_trade_volumes(state)
+                        _pending_resets = getattr(state, '_pending_resets', None)
+                        if _pending_resets:
+                            self.engine.apply_resets(_pending_resets)
+                        _shadow = self._scoring_shadow
+                        if _shadow is not None:
+                            # Applied-ts + one-time INIT (under the held _reward_lock,
+                            # structures frozen) + own parity digest at the same
+                            # deterministic timestamps the shadow uses.
+                            self._shadow_applied_ts = timestamp
+                            if not _shadow.initialized:
+                                await asyncio.get_event_loop().run_in_executor(
+                                    None, lambda: _shadow.send_init(self).result()
+                                )
+                            elif timestamp % _shadow.parity_ns == 0:
+                                _shadow.record_main_digest(timestamp, (self._shadow_digest_fn(self), self._shadow_pnl_vec_fn(self)))
                         if timestamp % self.config.scoring.interval != 0:
                             bt.logging.info(f"Agent Scores Data Updated for {duration} ({time.time()-start:.4f}s)")
                             return
                         bt.logging.info("Starting reward calculation...")
                         calc_start = time.time()
-
                         loop = asyncio.get_event_loop()
-                        trading_rewards, gentrx_rewards, updated_data, all_uids = await loop.run_in_executor(
-                            self.reward_executor,
-                            get_rewards,
-                            self
+
+                        # ── Cutover: the scoring service computes; main adopts ──
+                        # Falls back to the in-process get_rewards on ANY failure
+                        # (dead child, timeout, uid-count drift). Every
+                        # SCORING_PROC_VERIFY_EVERY-th interval main ALSO computes
+                        # and cross-checks (prefer main + re-INIT child on mismatch).
+                        adopted = None
+                        if _shadow is not None and self._scoring_proc_cutover:
+                            _eager = _shadow.eager_inputs_for(timestamp)
+                            if _eager is not None:
+                                # inputs were shipped at tee time — the child is
+                                # already computing (or done); collect only.
+                                _sim_ts = _eager['simulation_timestamp']
+                                _deregs = _eager['deregistered_uids']
+                                _gtx_scores = _eager['gentrx_scores']
+                                _gtx_ema = _eager['gentrx_ema']
+                            else:
+                                _sim_ts = self.simulation_timestamp
+                                _deregs = list(self.deregistered_uids)
+                                _gtx_scores = (
+                                    self._gentrx.get_scores()
+                                    if hasattr(self, '_gentrx') and self._gentrx is not None else {}
+                                )
+                                _gtx_ema = getattr(self, '_gentrx_ema', {})
+                            adopted = await loop.run_in_executor(
+                                None,
+                                lambda: _shadow.request_scores(
+                                    timestamp, _sim_ts, _deregs, _gtx_scores, _gtx_ema,
+                                    timeout=float(os.environ.get("SCORING_PROC_TIMEOUT", "45")),
+                                    eager=_eager is not None,
+                                ),
+                            )
+                            if adopted is not None and len(adopted['trading']) != self.effective_max_uids:
+                                bt.logging.warning(
+                                    f"[SCORING-PROC] uid-count drift (child {len(adopted['trading'])} "
+                                    f"vs {self.effective_max_uids}) — falling back + re-INIT"
+                                )
+                                _shadow.request_reinit()
+                                adopted = None
+                            if adopted is None and _shadow.initialized:
+                                bt.logging.warning("[SCORING-PROC] child scoring unavailable — in-process fallback")
+
+                        self._scoring_proc_n += 1
+                        _verify_every = max(1, int(os.environ.get("SCORING_PROC_VERIFY_EVERY", "10")))
+                        _verify = adopted is not None and (self._scoring_proc_n % _verify_every == 0)
+
+                        if adopted is None or _verify:
+                            # Verify must compute with EXACTLY the inputs the child
+                            # was given — simulation_timestamp advances during the
+                            # adoption wait and shifts decay windows, producing
+                            # false MISMATCHes (and spurious 15s re-INITs) against
+                            # a live-read compute.
+                            _pin = {
+                                'simulation_timestamp': _sim_ts,
+                                'deregistered_uids': _deregs,
+                                'gentrx_scores': _gtx_scores,
+                                'gentrx_ema': _gtx_ema,
+                            } if _verify else None
+                            trading_rewards, gentrx_rewards, updated_data, all_uids = await loop.run_in_executor(
+                                self.reward_executor,
+                                lambda: get_rewards(self, pinned_inputs=_pin)
+                            )
+                            if _verify:
+                                _mine = [float(x) for x in trading_rewards.tolist()]
+                                if _mine == adopted['trading']:
+                                    bt.logging.info(
+                                        f"[SCORING-PROC] VERIFY ts={timestamp} MATCH (n={len(_mine)})"
+                                    )
+                                else:
+                                    _diffs = sum(1 for a, b in zip(_mine, adopted['trading']) if a != b)
+                                    bt.logging.error(
+                                        f"[SCORING-PROC] VERIFY ts={timestamp} MISMATCH "
+                                        f"(diff_uids={_diffs}) — preferring main + re-INIT child"
+                                    )
+                                    _shadow.request_reinit()
+                                # verify path keeps main's outputs (already bound)
+                        else:
+                            trading_rewards = torch.tensor(
+                                adopted['trading'], dtype=torch.float32, device=self.device
+                            )
+                            gentrx_rewards = torch.tensor(
+                                adopted['gentrx'], dtype=torch.float32, device=self.device
+                            )
+                            updated_data = adopted['factors']
+                            all_uids = list(range(len(adopted['trading'])))
+                            self._gentrx_ema = adopted['gentrx_ema']
+
+                        bt.logging.info(
+                            f"Reward calculation completed ({time.time()-calc_start:.4f}s"
+                            f"{', adopted from scoring service' if adopted is not None and not _verify else ''})"
                         )
 
-                        bt.logging.info(f"Reward calculation completed ({time.time()-calc_start:.4f}s)")
+                        if _shadow is not None and not self._scoring_proc_cutover and _shadow.initialized:
+                            # Shadow-only mode: release the child's held boundary
+                            # with the exact inputs this reward used + record
+                            # main's trading scores for the [SHADOW-SCORES] compare.
+                            _shadow.on_main_scored(
+                                timestamp,
+                                updated_data['sim_ts_used'],
+                                updated_data['deregs_used'],
+                                [float(x) for x in trading_rewards.tolist()],
+                            )
 
                         self.kappa_values = updated_data['kappa_values']
                         self.activity_factors = updated_data['activity_factors']
@@ -2175,6 +2399,32 @@ if __name__ != "__mp_main__":
             _sim_fills: list = []
             _sim_rejects: list = []
             _seen_trade_ids: set = set()
+            # External-order UUID threading (exchange-API orders): RDPOL/RDPOM
+            # placement events echo the clientOrderId minted in
+            # _fetch_external_orders; capture engine-orderId → UUID (ET fills
+            # reference engine ids) and stamp the UUID on the placement notice
+            # ('xo') so the data service can flip its order store to OPEN.
+            # NB 'o' on RDPOL/RDPOM is the ENGINE orderId (protocol alias) —
+            # never overload it; the UUID always travels as 'xo'.
+            _cloid_map = getattr(self.engine, '_ext_cloid_to_uuid', None) or {}
+            _engoid_map = getattr(self.engine, '_ext_engineoid_to_uuid', None)
+            if _cloid_map and _engoid_map is not None:
+                for _uid_str, _evs in (getattr(state, 'notices', {}) or {}).items():
+                    for _ev in (_evs or []):
+                        if not isinstance(_ev, dict):
+                            continue
+                        if (_ev.get("y") or _ev.get("type")) not in ("RDPOL", "RDPOM"):
+                            continue
+                        try:
+                            _uuid = _cloid_map.get(int(_ev.get("c") or 0))
+                            if not _uuid:
+                                continue
+                            _ev["xo"] = _uuid
+                            _eng_oid = _ev.get("o")
+                            if _eng_oid is not None:
+                                _engoid_map[int(_eng_oid)] = _uuid
+                        except (TypeError, ValueError):
+                            continue
             for _uid_str, _evs in (getattr(state, 'notices', {}) or {}).items():
                 for _ev in (_evs or []):
                     if not isinstance(_ev, dict):
@@ -2206,6 +2456,14 @@ if __name__ != "__mp_main__":
                             _oid  = _ti if _is_taker else _mi
                             _fill_cr  = _cr if _is_taker else None
                             _fill_toi = _toi if (_is_taker and _cr) else None
+                            # Exchange-API order UUID for this side's engine
+                            # order id, when the order came in via the REST rail.
+                            _xo = None
+                            if _engoid_map and _oid is not None:
+                                try:
+                                    _xo = _engoid_map.get(int(_oid))
+                                except (TypeError, ValueError):
+                                    _xo = None
                             _sim_fills.append({
                                 "uid":              int(_agent_uid),
                                 "netuid":           int(_book_id) if _book_id is not None else 0,
@@ -2223,6 +2481,7 @@ if __name__ != "__mp_main__":
                                 "maker_uid":        int(_maker) if _maker is not None else None,
                                 "is_partial":       False,
                                 "timestamp":        state.timestamp,
+                                "xo":               _xo,
                             })
                     elif _ev_type in ("ERDPOL", "ERDPOM"):
                         _agent_uid = _ev.get("a") if _ev.get("a") is not None else _ev.get("agentId")
@@ -2309,6 +2568,7 @@ if __name__ != "__mp_main__":
                         if _sc is not None else {})
             _kappa_raw   = {}
             _kappa_score = {}
+            _kappa_penalty = {}
             _kappa_books = {}
             _kappa_books_w = {}
             for _kuid, _kv in _snap_kv.items():
@@ -2317,6 +2577,8 @@ if __name__ != "__mp_main__":
                         _kappa_raw[str(_kuid)] = float(_kv['total'])
                     if _kv.get('normalized_total') is not None:
                         _kappa_score[str(_kuid)] = float(_kv['normalized_total'])
+                    if _kv.get('penalty') is not None:
+                        _kappa_penalty[str(_kuid)] = float(_kv['penalty'])
                     _bks = {str(bid): float(v) for bid, v in (_kv.get('books') or {}).items() if v is not None}
                     if _bks:
                         _kappa_books[str(_kuid)] = _bks
@@ -2338,6 +2600,11 @@ if __name__ != "__mp_main__":
             return {
                 "mode":                "simulation",
                 "simulation_id":       getattr(self.simulation, 'simulation_id', None),
+                # data-service uses this to attribute lifecycle events per
+                # validator; NOT adding payload "network" here (the ingest
+                # INGEST_NETWORK filter would reject a mismatch — the service
+                # stamps its own network on events).
+                "validator_hotkey":    self.wallet.hotkey.ss58_address if getattr(self, 'wallet', None) else None,
                 "timestamp":           state.timestamp,
                 "block":               state.block,
                 "books":               state.books or {},
@@ -2364,6 +2631,7 @@ if __name__ != "__mp_main__":
                 "agent_scores":        _sc_dict,
                 "agent_kappa":         _kappa_raw,
                 "agent_kappa_score":   _kappa_score,
+                "agent_kappa_penalty": _kappa_penalty,
                 "agent_kappa_books":   _kappa_books,
                 "agent_kappa_books_w": _kappa_books_w,
                 "agent_volume":        _vs,
@@ -2650,6 +2918,19 @@ if __name__ != "__mp_main__":
                 _ingest_block = getattr(state, 'block', self.current_block)
                 _ingest_books = len(getattr(state, 'books', {}) or {})
                 bt.logging.info(f"Scheduling ingest push: block={_ingest_block} books={_ingest_books} url={_ingest_url}")
+                # Exchange constraints for the data service (/exchangeInfo filters +
+                # order-API LOT_SIZE/PRICE_FILTER enforcement). The C++ engine owns
+                # these (exchange_0.xml); the env overrides exist for hosts whose
+                # engine XML differs from the defaults. Cached after first build.
+                _exch_constraints = getattr(self, '_exchange_constraints_cache', None)
+                if _exch_constraints is None:
+                    _exch_constraints = {
+                        "min_order_size":  float(os.environ.get("EXCHANGE_MIN_ORDER_SIZE", "0.0001") or 0.0001),
+                        "price_decimals":  int(os.environ.get("EXCHANGE_PRICE_DECIMALS", "4") or 4),
+                        "volume_decimals": int(os.environ.get("EXCHANGE_VOLUME_DECIMALS", "4") or 4),
+                        "max_open_orders": int(os.environ.get("EXCHANGE_MAX_OPEN_ORDERS", "100") or 100),
+                    }
+                    self._exchange_constraints_cache = _exch_constraints
                 _sltp_changed = getattr(getattr(self, 'engine', None), '_sltp_changed', False)
                 _live_triggers = dict(getattr(getattr(self, 'engine', None), '_live_triggers', {}))
                 if hasattr(self.engine, '_sltp_changed'):
@@ -2688,6 +2969,7 @@ if __name__ != "__mp_main__":
                     "validator_uid":       self.uid,
                     "benchmark_agents":    [{"uid": _ba["uid"], "coldkey": _ba.get("coldkey", ""), "hotkey": _ba.get("hotkey", ""), "name": _ba.get("name", "")} for _ba in getattr(self, 'benchmark_agents', [])],
                     "sltp_triggers":       _live_triggers,
+                    "exchange_constraints": _exch_constraints,
                 }, url=_ingest_url))
                 # Yield once so the HTTP POST starts sending while the remaining
                 # synchronous work (maintain/reward/save scheduling) runs.
@@ -2924,6 +3206,23 @@ if __name__ != "__mp_main__":
                     try:
                         raw_message, normalized_state, receive_start = await self.engine.receive()
                         if normalized_state is not None:
+                            if self._scoring_shadow is not None and isinstance(raw_message, (bytes, bytearray)):
+                                self._scoring_shadow.tee(raw_message, normalized_state.timestamp)
+                                if self._scoring_proc_cutover and \
+                                        normalized_state.timestamp % self.config.scoring.interval == 0:
+                                    # Eager scoring: ship the boundary's inputs NOW so
+                                    # the child computes during the lock-queue delay
+                                    # instead of after _reward finally asks. sim_ts is
+                                    # the boundary's own timestamp — deterministic and
+                                    # main-defined (verify pins to the same values).
+                                    self._scoring_shadow.tee_score_inputs(
+                                        normalized_state.timestamp,
+                                        normalized_state.timestamp,
+                                        list(self.deregistered_uids),
+                                        (self._gentrx.get_scores()
+                                         if hasattr(self, '_gentrx') and self._gentrx is not None else {}),
+                                        getattr(self, '_gentrx_ema', {}),
+                                    )
                             response = await self.handle_state(normalized_state, receive_start)
                     except Exception as ex:
                         # Terminal teardown error: once the executors are gone,

@@ -205,6 +205,10 @@ struct PlaceOrderLimitPayload : public MessagePayload
     Currency currency{Currency::BASE};
     std::optional<ClientOrderID> clientOrderId;
     bool postOnly{};
+    // Agent-settable. When false, a marketable limit too large to fill entirely
+    // within its limit rests whole (all-or-nothing) instead of filling the
+    // marketable portion and resting the remainder. Defaults true.
+    bool allowPartial{true};
     taosim::TimeInForce timeInForce{taosim::TimeInForce::GTC};
     std::optional<Timestamp> expiryPeriod;
     STPFlag stpFlag{STPFlag::CO};
@@ -297,6 +301,7 @@ struct PlaceOrderLimitPayload : public MessagePayload
         currency,
         clientOrderId,
         postOnly,
+        allowPartial,
         timeInForce,
         expiryPeriod,
         MSGPACK_NVP("stp", stpFlag),
@@ -723,17 +728,24 @@ struct EventOrderMarketPayload : public MessagePayload
     using Ptr = std::shared_ptr<EventOrderMarketPayload>;
 
     MarketOrder order;
+    // Origin of the order. Defaulted for backward compatibility; populated at dispatch
+    // so subscribers can tell which book and which agent (incl. remote/miner) placed it.
+    BookId bookId{};
+    AgentId agentId{};
 
     EventOrderMarketPayload() noexcept = default;
 
     EventOrderMarketPayload(const MarketOrder& order) noexcept : order{order} {}
+
+    EventOrderMarketPayload(const MarketOrder& order, BookId bookId, AgentId agentId) noexcept
+        : order{order}, bookId{bookId}, agentId{agentId} {}
 
     virtual void jsonSerialize(
         rapidjson::Document& json, const std::string& key = {}) const override;
 
     [[nodiscard]] static Ptr fromJson(const rapidjson::Value& json);
 
-    MSGPACK_DEFINE_MAP(order);
+    MSGPACK_DEFINE_MAP(order, bookId, agentId);
 };
 
 //-------------------------------------------------------------------------
@@ -743,17 +755,24 @@ struct EventOrderLimitPayload : public MessagePayload
     using Ptr = std::shared_ptr<EventOrderLimitPayload>;
 
     LimitOrder order;
+    // Origin of the order. Defaulted for backward compatibility; populated at dispatch
+    // so subscribers can tell which book and which agent (incl. remote/miner) placed it.
+    BookId bookId{};
+    AgentId agentId{};
 
     EventOrderLimitPayload() noexcept = default;
 
     EventOrderLimitPayload(const LimitOrder& order) noexcept : order{order} {}
+
+    EventOrderLimitPayload(const LimitOrder& order, BookId bookId, AgentId agentId) noexcept
+        : order{order}, bookId{bookId}, agentId{agentId} {}
 
     virtual void jsonSerialize(
         rapidjson::Document& json, const std::string& key = {}) const override;
 
     [[nodiscard]] static Ptr fromJson(const rapidjson::Value& json);
 
-    MSGPACK_DEFINE_MAP(order);
+    MSGPACK_DEFINE_MAP(order, bookId, agentId);
 };
 
 //-------------------------------------------------------------------------

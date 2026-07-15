@@ -27,7 +27,7 @@ from abc import ABC, abstractmethod
 from threading import Thread, Lock
 
 # Sync calls set weights and also resyncs the metagraph.
-from taos.common.config import check_config, add_args, config
+from taos.common.config import check_config, add_args, config, prune_config
 from taos.common.utils.misc import ttl_get_block
 from taos.common.utils.pagerduty import triggerPagerDutyIncident, resolvePagerDutyIncident
 from taos import __spec_version__ as spec_version
@@ -69,6 +69,10 @@ class BaseNeuron(ABC):
         base_config = copy.deepcopy(config or BaseNeuron.config())
         self.config = self.config()
         self.config.merge(base_config)
+        # merge() rebuilds nested sections as fresh Config() instances, which
+        # re-inject bittensor's default-config shadows — prune again before
+        # the config is checked and logged.
+        prune_config(self.config, type(self))
         self.check_config(self.config)
 
         # Apply parsed log level — bt.logging starts in Default/WARNING state

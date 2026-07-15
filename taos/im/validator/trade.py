@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 import traceback
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import TYPE_CHECKING
 
 import bittensor as bt
@@ -108,7 +108,9 @@ def match_trade_fifo(self: Validator, uid: int, book_id: int, is_buy: bool, quan
                 old_qty_inv = 1.0 / old_qty
 
                 price_pnl = (old_price - price) * remaining_qty
-                close_fee = fee  # Entire trade closes positions
+                # Prorate the fill fee to the portion that closes here; earlier
+                # fully-closed lots in this same fill already took their share.
+                close_fee = fee * remaining_qty * quantity_inv
                 open_fee = old_fee * remaining_qty * old_qty_inv
                 realized_pnl += price_pnl - open_fee - close_fee
                 roundtrip_volume += remaining_qty
@@ -141,7 +143,9 @@ def match_trade_fifo(self: Validator, uid: int, book_id: int, is_buy: bool, quan
                 old_qty_inv = 1.0 / old_qty
 
                 price_pnl = (price - old_price) * remaining_qty
-                close_fee = fee  # Entire trade closes positions
+                # Prorate the fill fee to the portion that closes here; earlier
+                # fully-closed lots in this same fill already took their share.
+                close_fee = fee * remaining_qty * quantity_inv
                 open_fee = old_fee * remaining_qty * old_qty_inv
                 realized_pnl += price_pnl - open_fee - close_fee
                 roundtrip_volume += remaining_qty
@@ -582,3 +586,235 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
         bt.logging.debug(f"[UPDATE_VOLUMES] Total: {total_time:.4f}s (pruned, {uid_count} UIDs)")
     else:
         bt.logging.debug(f"[UPDATE_VOLUMES] Total: {total_time:.4f}s ({uid_count} UIDs)")
+
+
+def shift_simulation_histories(
+    self, old_ts: int, new_ts: int, *,
+    book_count: int, volume_decimals: int, lookback: int,
+    volume_assessment_period: int, miner_wealth, effective_max_uids: int,
+    log=None,
+):
+    """Shift every history structure from the old simulation's time base to the
+    new one on a simulation restart, pruning entries that fall outside the
+    volume-assessment / kappa-lookback windows and adjusting the running sums.
+
+    Extracted verbatim from SimulationEngine.on_start so main AND the shadow
+    scoring service run the SAME transition (the shadow receives a
+    ("sim_start", (old_ts, new_ts)) frame and calls this on its own container).
+    Deterministic in (structures, old_ts, new_ts, knobs) — no wall clock.
+    """
+    _log = log or (lambda m: None)
+    new_threshold = new_ts - lookback
+    new_volume_threshold = new_ts - volume_assessment_period
+
+    pruned_total = defaultdict(lambda: defaultdict(float))
+    pruned_maker = defaultdict(lambda: defaultdict(float))
+    pruned_taker = defaultdict(lambda: defaultdict(float))
+    pruned_self = defaultdict(lambda: defaultdict(float))
+    pruned_roundtrip = defaultdict(lambda: defaultdict(float))
+
+    _log("Shifting trade volume timestamps...")
+    shifted_trade_volumes = {}
+    for uid in range(effective_max_uids):
+        if uid in self.trade_volumes:
+            shifted_trade_volumes[uid] = {}
+            for bookId in range(book_count):
+                if bookId in self.trade_volumes[uid]:
+                    shifted_trade_volumes[uid][bookId] = {}
+                    for role in ['total', 'maker', 'taker', 'self']:
+                        if role in self.trade_volumes[uid][bookId]:
+                            shifted_times = {}
+                            for prev_time, volume in self.trade_volumes[uid][bookId][role].items():
+                                new_time = new_ts - (old_ts - prev_time)
+                                if new_time >= new_volume_threshold:
+                                    shifted_times[new_time] = volume
+                                else:
+                                    if role == 'total':
+                                        pruned_total[uid][bookId] += volume
+                                    elif role == 'maker':
+                                        pruned_maker[uid][bookId] += volume
+                                    elif role == 'taker':
+                                        pruned_taker[uid][bookId] += volume
+                                    elif role == 'self':
+                                        pruned_self[uid][bookId] += volume
+                            if shifted_times:
+                                shifted_trade_volumes[uid][bookId][role] = shifted_times
+
+    self.trade_volumes = {
+        uid: {
+            bookId: {
+                role: shifted_trade_volumes.get(uid, {}).get(bookId, {}).get(role, {})
+                for role in ['total', 'maker', 'taker', 'self']
+            }
+            for bookId in range(book_count)
+        }
+        for uid in range(effective_max_uids)
+    }
+
+    _log("Adjusting volume sums for pruned data...")
+    for pruned, sums in (
+        (pruned_total, self.volume_sums),
+        (pruned_maker, self.maker_volume_sums),
+        (pruned_taker, self.taker_volume_sums),
+        (pruned_self, self.self_volume_sums),
+    ):
+        for uid in pruned:
+            for bookId in pruned[uid]:
+                sums[uid][bookId] = max(0.0, sums[uid][bookId] - pruned[uid][bookId])
+                sums[uid][bookId] = round(sums[uid][bookId], volume_decimals)
+
+    _log("Shifting inventory history timestamps...")
+    shifted_inventory = {}
+    for uid in range(effective_max_uids):
+        if uid in self.inventory_history and self.inventory_history[uid]:
+            hist = self.inventory_history[uid]
+            if len(hist) > 3:
+                timestamps_to_keep = sorted(hist.keys())[-3:]
+                hist = {ts: hist[ts] for ts in timestamps_to_keep}
+            shifted_inventory[uid] = {}
+            for prev_time, values in hist.items():
+                shifted_inventory[uid][new_ts - (old_ts - prev_time)] = values
+    self.inventory_history = {
+        uid: shifted_inventory.get(uid, {}) for uid in range(effective_max_uids)
+    }
+
+    _log("Shifting realized P&L history timestamps...")
+    shifted_pnl_history = {}
+    self._last_prune_timestamp = None
+    for uid in range(effective_max_uids):
+        if uid in self.realized_pnl_history and self.realized_pnl_history[uid]:
+            hist = self.realized_pnl_history[uid]
+            shifted_pnl_history[uid] = {}
+            for prev_time, books in hist.items():
+                new_time = new_ts - (old_ts - prev_time)
+                if new_time >= new_threshold:
+                    shifted_pnl_history[uid][new_time] = books
+    self.realized_pnl_history = defaultdict(lambda: defaultdict(dict))
+    for uid, timestamps_data in shifted_pnl_history.items():
+        for ts, books in timestamps_data.items():
+            for book_id, pnl in books.items():
+                self.realized_pnl_history[uid][ts][book_id] = pnl
+    bootstrap_pnl_totals(self)
+    _log(f"Shifted realized P&L history: {len(shifted_pnl_history)} UIDs with data")
+
+    _log("Shifting round-trip volume timestamps...")
+    shifted_rt_volumes = {}
+    for uid in range(effective_max_uids):
+        if uid in self.roundtrip_volumes:
+            shifted_rt_volumes[uid] = {}
+            for bookId in range(book_count):
+                if bookId in self.roundtrip_volumes[uid]:
+                    shifted_times = {}
+                    for prev_time, volume in self.roundtrip_volumes[uid][bookId].items():
+                        new_time = new_ts - (old_ts - prev_time)
+                        if new_time >= new_volume_threshold:
+                            shifted_times[new_time] = volume
+                        else:
+                            pruned_roundtrip[uid][bookId] += volume
+                    if shifted_times:
+                        shifted_rt_volumes[uid][bookId] = shifted_times
+    self.roundtrip_volumes = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
+    for uid, books in shifted_rt_volumes.items():
+        for book_id, volumes in books.items():
+            for ts, volume in volumes.items():
+                self.roundtrip_volumes[uid][book_id][ts] = volume
+    _log(f"Shifted round-trip volumes: {len(shifted_rt_volumes)} UIDs with data")
+
+    for uid in pruned_roundtrip:
+        for bookId in pruned_roundtrip[uid]:
+            self.roundtrip_volume_sums[uid][bookId] = max(
+                0.0, self.roundtrip_volume_sums[uid][bookId] - pruned_roundtrip[uid][bookId]
+            )
+            self.roundtrip_volume_sums[uid][bookId] = round(
+                self.roundtrip_volume_sums[uid][bookId], volume_decimals
+            )
+
+    _log("Clearing open positions...")
+    self.open_positions = defaultdict(lambda: defaultdict(lambda: {
+        'longs': deque(), 'shorts': deque()
+    }))
+    self.initial_balances = {
+        uid: {
+            bookId: {'BASE': None, 'QUOTE': None, 'WEALTH': miner_wealth}
+            for bookId in range(book_count)
+        } for uid in range(effective_max_uids)
+    }
+    self.recent_trades = {bookId: [] for bookId in range(book_count)}
+    self.recent_miner_trades = {
+        uid: {bookId: [] for bookId in range(book_count)}
+        for uid in range(effective_max_uids)
+    }
+
+
+def reset_agent_histories(self, uid: int, book_ids: list) -> None:
+    """Zero one UID's history/scoring structures (deregistration reset).
+
+    Extracted from SimulationEngine.apply_resets so main AND the shadow scoring
+    service run the SAME zeroing (the shadow receives a ("resets", uids) frame).
+    Main-only bookkeeping (miner_stats, deregistered_uids, publish flags,
+    unnormalized_scores) stays in apply_resets.
+    """
+    self.kappa_values[uid] = {
+        'books': {bookId: None for bookId in book_ids},
+        'books_weighted': {bookId: 0.0 for bookId in book_ids},
+        'total': None, 'average': None, 'median': None,
+        'normalized_average': 0.0, 'normalized_median': 0.0,
+        'normalized_total': 0.0,
+        'activity_weighted_normalized_median': 0.0,
+        'penalty': 0.0, 'score': 0.0,
+    }
+    self.activity_factors[uid] = {bookId: 0.0 for bookId in book_ids}
+    self.pnl_factors[uid] = {bookId: 1.0 for bookId in book_ids}
+    self.inventory_history[uid] = {}
+    self.trade_volumes[uid] = {
+        bookId: {'total': {}, 'maker': {}, 'taker': {}, 'self': {}}
+        for bookId in book_ids
+    }
+    for book_id in book_ids:
+        self.volume_sums[uid][book_id] = 0.0
+        self.maker_volume_sums[uid][book_id] = 0.0
+        self.taker_volume_sums[uid][book_id] = 0.0
+        self.self_volume_sums[uid][book_id] = 0.0
+    self.roundtrip_volumes[uid] = defaultdict(lambda: defaultdict(float))
+    for book_id in book_ids:
+        self.roundtrip_volume_sums[uid][book_id] = 0.0
+    self.realized_pnl_history[uid] = {}
+    if hasattr(self, 'agent_pnl_by_book'):
+        self.agent_pnl_by_book.pop(uid, None)
+        self.agent_pnl_total.pop(uid, None)
+    self.open_positions[uid] = defaultdict(lambda: {
+        'longs': deque(), 'shorts': deque()
+    })
+    self.initial_balances[uid] = {
+        bookId: {'BASE': None, 'QUOTE': None, 'WEALTH': None}
+        for bookId in book_ids
+    }
+    self.recent_miner_trades[uid] = {bookId: [] for bookId in book_ids}
+
+
+_RESET_NOTICE_TYPES = frozenset({
+    'RDRA', 'RESPONSE_DISTRIBUTED_RESET_AGENT',
+    'ERDRA', 'ERROR_RESPONSE_DISTRIBUTED_RESET_AGENT',
+})
+
+
+def collect_reset_uids(state, validator_uid: int):
+    """Scan the validator's own notices in `state` for agent-reset results.
+
+    Returns (pending_uids, failed_resets). Shared by main's collect_resets and
+    the scoring service: BOTH sides derive resets from the same teed state and
+    apply them at the same position (right after that round's volume update),
+    which makes the reset transition deterministic by construction — a reset
+    delivered via a separate control frame raced the round stream and left the
+    two sides one round apart on the reset uid's history.
+    """
+    pending, failed = set(), []
+    notices = state.notices.get(validator_uid, []) if isinstance(state.notices, dict) else []
+    for notice in notices:
+        if notice.get('y') in _RESET_NOTICE_TYPES:
+            for reset in notice.get('r', []):
+                if reset.get('u'):
+                    pending.add(reset['a'])
+                else:
+                    failed.append(reset)
+    return pending, failed

@@ -952,9 +952,126 @@ def distribute_rewards(rewards: list, config: Dict) -> torch.FloatTensor:
     distributed_rewards = distribution * sorted_rewards
     return torch.gather(distributed_rewards, 0, sorted_indices.argsort())
 
-def get_rewards(self: 'Validator') -> Tuple[torch.FloatTensor, torch.FloatTensor, Dict]:
+
+def apply_reward_floor(rewards: list, config: Dict) -> list:
+    """Soft floor on trading scores: below a percentile of active miners, scores are
+    smoothly tapered toward zero so a fleet of merely-adequate UIDs stops earning and
+    the payout concentrates on genuine performers (which the existing deregistration
+    then culls). A taper — not a cliff — so borderline honest miners are cushioned
+    rather than knocked flat.
+
+    Gated by `rewarding.floor.enabled`; a no-op (returns input unchanged) when off,
+    so default behaviour is untouched. Ownership-agnostic: it acts on the score
+    distribution only, no IP/coldkey/counterparty rules.
+
+    factor(r) ramps linearly from 0 at `lo = thr*(1-softness)` to 1 at `thr`, where
+    `thr` is the `percentile`-th percentile of positive scores; softness in (0, 1]
+    sets the taper width (→0 approaches a hard cliff, 1 tapers from zero up to thr).
+    """
+    floor_cfg = (config.get('rewarding') or {}).get('floor') or {}
+    if not floor_cfg.get('enabled'):
+        return rewards
+    arr = np.asarray(rewards, dtype=np.float64)
+    active = arr[arr > 0]
+    if active.size < 2:
+        return rewards
+    pct = float(floor_cfg.get('percentile', 50.0))
+    softness = min(max(float(floor_cfg.get('softness', 0.5)), 1e-6), 1.0)
+    thr = float(np.percentile(active, pct))
+    if thr <= 0:
+        return rewards
+    lo = thr * (1.0 - softness)
+    factor = np.clip((arr - lo) / (thr - lo), 0.0, 1.0) if thr > lo else (arr >= thr).astype(float)
+    return (arr * factor).tolist()
+
+
+def build_scoring_config(self: 'Validator') -> Dict:
+    """Plain-dict scoring/rewarding config exactly as score_uids consumes it.
+
+    Single source of truth shared by get_rewards and the shadow scoring service
+    (scoring_shadow ships this dict to the child), so the two sides can never
+    drift on config shape.
+    """
+    return {
+        'scoring': {
+            'kappa': {
+                'weight': self.config.scoring.kappa.weight,
+                'normalization_min': self.config.scoring.kappa.normalization_min,
+                'normalization_max': self.config.scoring.kappa.normalization_max,
+                'min_lookback': self.config.scoring.kappa.min_lookback,
+                'lookback': self.config.scoring.kappa.lookback,
+                'min_realized_observations': self.config.scoring.kappa.min_realized_observations,
+                'parallel_workers': self.config.scoring.kappa.parallel_workers,
+                'reward_cores': self.reward_cores,
+                'tau': self.config.scoring.kappa.tau,
+                'pnl_impact': self.config.scoring.kappa.pnl.impact
+            },
+            'pnl': {
+                'weight': self.config.scoring.pnl.weight,
+                'lookback': getattr(self.config.scoring.pnl, 'lookback', self.config.scoring.kappa.lookback),
+                'normalization': {
+                    'min_daily_return': self.config.scoring.pnl.normalization.min_daily_return,
+                    'max_daily_return': self.config.scoring.pnl.normalization.max_daily_return,
+                }
+            },
+            'gentrx': {
+                'simulation_share': getattr(getattr(self.config.scoring, 'gentrx', None), 'simulation_share', 0.0) or 0.0,
+                'ema_alpha': getattr(getattr(self.config.scoring, 'gentrx', None), 'ema_alpha', 0.1) or 0.1,
+            },
+            'activity': {
+                'capital_turnover_cap': self.config.scoring.activity.capital_turnover_cap,
+                'trade_volume_sampling_interval': self.config.scoring.activity.trade_volume_sampling_interval,
+                'trade_volume_assessment_period': self.config.scoring.activity.trade_volume_assessment_period,
+                'decay_grace_period': self.config.scoring.activity.decay_grace_period,
+                'impact' : self.config.scoring.activity.impact,
+                'decay_rate': self.config.scoring.activity.decay_rate
+            },
+            'max_inactive_books_ratio': self.config.scoring.max_inactive_books,
+            'interval': self.config.scoring.interval,
+        },
+        'rewarding': {
+            'seed': self.config.rewarding.seed,
+            'pareto': {
+                'shape': self.config.rewarding.pareto.shape,
+                'scale': self.config.rewarding.pareto.scale,
+            },
+            'floor': {
+                'enabled': bool(getattr(getattr(self.config.rewarding, 'floor', None), 'enabled', False)),
+                'percentile': float(getattr(getattr(self.config.rewarding, 'floor', None), 'percentile', 50.0)),
+                'softness': float(getattr(getattr(self.config.rewarding, 'floor', None), 'softness', 0.5)),
+            },
+        },
+    }
+
+
+def build_simulation_config_dict(self: 'Validator') -> Dict:
+    """Plain-dict simulation knobs as score_uid consumes them (shared with the
+    shadow scoring service — see build_scoring_config)."""
+    return {
+        'miner_wealth': (
+            getattr(getattr(self.config, 'exchange', None), 'volume_cap', 50000.0)
+            / max(self.config.scoring.activity.capital_turnover_cap, 1e-9)
+            if self.simulation.miner_wealth == 0.0
+            else self.simulation.miner_wealth
+        ),
+        'publish_interval': self.simulation.publish_interval,
+        'volumeDecimals': self.simulation.volumeDecimals,
+        'grace_period': self.simulation.grace_period,
+        'book_count': self.simulation.book_count,
+    }
+
+
+def get_rewards(self: 'Validator', pinned_inputs: Dict = None) -> Tuple[torch.FloatTensor, torch.FloatTensor, Dict]:
     """
     Calculate per-round trading and gentrx rewards for all UIDs.
+
+    pinned_inputs (optional): {'simulation_timestamp', 'deregistered_uids',
+    'gentrx_scores', 'gentrx_ema'} — overrides the live reads. Used by the
+    scoring-service VERIFY path so main computes with EXACTLY the inputs the
+    child was given: simulation_timestamp advances 1-2 rounds during the
+    adoption wait, shifting activity-decay windows and producing false
+    MISMATCHes on edge uids (then spurious, expensive re-INITs) when compared
+    against a live-read compute. Default None = live reads (legacy behavior).
 
     Two-pool architecture:
     - Trading rewards: kappa+pnl combine, then Pareto sort-multiply
@@ -975,6 +1092,7 @@ def get_rewards(self: 'Validator') -> Tuple[torch.FloatTensor, torch.FloatTensor
     realized_pnl_history = self.realized_pnl_history
     all_uids = list(range(self.effective_max_uids))
 
+    _pin = pinned_inputs or {}
     validator_data = {
         'kappa_values': self.kappa_values,
         'kappa_cache': self.kappa_cache,
@@ -982,76 +1100,21 @@ def get_rewards(self: 'Validator') -> Tuple[torch.FloatTensor, torch.FloatTensor
         'pnl_factors': self.pnl_factors,
         'roundtrip_volumes': roundtrip_volumes,
         'realized_pnl_history': realized_pnl_history,
-        'config': {
-            'scoring': {
-                'kappa': {
-                    'weight': self.config.scoring.kappa.weight,
-                    'normalization_min': self.config.scoring.kappa.normalization_min,
-                    'normalization_max': self.config.scoring.kappa.normalization_max,
-                    'min_lookback': self.config.scoring.kappa.min_lookback,
-                    'lookback': self.config.scoring.kappa.lookback,
-                    'min_realized_observations': self.config.scoring.kappa.min_realized_observations,
-                    'parallel_workers': self.config.scoring.kappa.parallel_workers,
-                    'reward_cores': self.reward_cores,
-                    'tau': self.config.scoring.kappa.tau,
-                    'pnl_impact': self.config.scoring.kappa.pnl.impact
-                },
-                'pnl': {
-                    'weight': self.config.scoring.pnl.weight,
-                    'lookback': getattr(self.config.scoring.pnl, 'lookback', self.config.scoring.kappa.lookback),
-                    'normalization': {
-                        'min_daily_return': self.config.scoring.pnl.normalization.min_daily_return,
-                        'max_daily_return': self.config.scoring.pnl.normalization.max_daily_return,
-                    }
-                },
-                'gentrx': {
-                    'simulation_share': getattr(getattr(self.config.scoring, 'gentrx', None), 'simulation_share', 0.0) or 0.0,
-                    'ema_alpha': getattr(getattr(self.config.scoring, 'gentrx', None), 'ema_alpha', 0.1) or 0.1,
-                },
-                'activity': {
-                    'capital_turnover_cap': self.config.scoring.activity.capital_turnover_cap,
-                    'trade_volume_sampling_interval': self.config.scoring.activity.trade_volume_sampling_interval,
-                    'trade_volume_assessment_period': self.config.scoring.activity.trade_volume_assessment_period,
-                    'decay_grace_period': self.config.scoring.activity.decay_grace_period,
-                    'impact' : self.config.scoring.activity.impact,
-                    'decay_rate': self.config.scoring.activity.decay_rate
-                },
-                'max_inactive_books_ratio': self.config.scoring.max_inactive_books,
-                'interval': self.config.scoring.interval,
-            },
-            'rewarding': {
-                'seed': self.config.rewarding.seed,
-                'pareto': {
-                    'shape': self.config.rewarding.pareto.shape,
-                    'scale': self.config.rewarding.pareto.scale,
-                }
-            },
-        },
-        'simulation_config': {
-            'miner_wealth': (
-                getattr(getattr(self.config, 'exchange', None), 'volume_cap', 50000.0)
-                / max(self.config.scoring.activity.capital_turnover_cap, 1e-9)
-                if self.simulation.miner_wealth == 0.0
-                else self.simulation.miner_wealth
-            ),
-            'publish_interval': self.simulation.publish_interval,
-            'volumeDecimals': self.simulation.volumeDecimals,
-            'grace_period': self.simulation.grace_period,
-            'book_count': self.simulation.book_count,
-        },
-        'simulation_timestamp': self.simulation_timestamp,
+        'config': build_scoring_config(self),
+        'simulation_config': build_simulation_config_dict(self),
+        'simulation_timestamp': _pin.get('simulation_timestamp', self.simulation_timestamp),
         'uids': all_uids,
-        'deregistered_uids': self.deregistered_uids,
+        'deregistered_uids': _pin.get('deregistered_uids', self.deregistered_uids),
         'device': self.device,
         # GenTRX gradient-training scores (empty dict when GenTRX disabled).
         # Shape: {uid: {"score": float, "accepted": bool, "books": [...]}}
-        'gentrx_scores': (
+        'gentrx_scores': _pin.get('gentrx_scores') if 'gentrx_scores' in _pin else (
             self._gentrx.get_scores()
             if hasattr(self, '_gentrx') and self._gentrx is not None
             else {}
         ),
         # EMA state for GenTRX score smoothing — persists across rounds on self.
-        'gentrx_ema': getattr(self, '_gentrx_ema', {}),
+        'gentrx_ema': _pin.get('gentrx_ema', getattr(self, '_gentrx_ema', {})),
     }
     
     # [REWARD-PROFILE] Coarse phase split. get_rewards runs on the core-pinned
@@ -1065,8 +1128,11 @@ def get_rewards(self: 'Validator') -> Tuple[torch.FloatTensor, torch.FloatTensor
     trading_uid_scores, gentrx_uid_scores = score_uids(validator_data)
     _prof_score = time.perf_counter()
 
-    # Trading rewards run through Pareto sort-multiply.
+    # Trading rewards run through Pareto sort-multiply. Optional soft floor (off by
+    # default) tapers below-median scores toward zero before the Pareto step so a
+    # fleet of merely-adequate UIDs stops earning; a no-op unless rewarding.floor is on.
     trading_rewards_list = [trading_uid_scores[uid] for uid in all_uids]
+    trading_rewards_list = apply_reward_floor(trading_rewards_list, validator_data['config'])
     distributed_trading = distribute_rewards(
         trading_rewards_list, validator_data['config']
     ).to(self.device)
@@ -1092,7 +1158,12 @@ def get_rewards(self: 'Validator') -> Tuple[torch.FloatTensor, torch.FloatTensor
     updated_data = {
         'kappa_values': validator_data['kappa_values'],
         'activity_factors': validator_data['activity_factors'],
-        'pnl_factors': validator_data['pnl_factors']
+        'pnl_factors': validator_data['pnl_factors'],
+        # The exact live inputs this run consumed (simulation_timestamp can
+        # advance mid-reward under lock queueing) — the shadow scoring service
+        # replays with these so score parity compares like against like.
+        'sim_ts_used': validator_data['simulation_timestamp'],
+        'deregs_used': list(validator_data['deregistered_uids']),
     }
 
     return distributed_trading, gentrx_rewards, updated_data, all_uids

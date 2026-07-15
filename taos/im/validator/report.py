@@ -172,7 +172,7 @@ class ReportingService:
 
         self.metrics_server_thread = threading.Thread(target=run_server, daemon=True)
         self.metrics_server_thread.start()
-        bt.logging.success(f"Prometheus metrics server started on port {self.config.prometheus_port}")
+        bt.logging.success(f"Prometheus metrics server started on port {self.config.prometheus.port}")
     
     def _init_prometheus(self):
         """

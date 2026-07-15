@@ -60,6 +60,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Fresh-episode clock floor (ns). A SIMULATION_START whose clock is at/below
+# max(grace_period, this) is a genuine new episode → re-derive simulation_id
+# from the new logDir. Above it, the start is a mid-run resume/reconnect and the
+# locked simulation_id is preserved, so the data service does not treat the
+# still-running run as new and prune its history. Floored well above the
+# per-run start (clock ~0) yet far below any multi-hour run.
+_FRESH_EPISODE_FLOOR_NS = 30 * 60 * 1_000_000_000  # 30 sim-minutes
+
 
 def _network_label(network: str) -> str:
     """Map subtensor network name to a filesystem-safe label."""
@@ -412,9 +420,29 @@ class SimulationEngine(MarketEngine):
                 )
                 continue
 
+            # Thread the exchange-API order UUID through the C++ round trip via
+            # clientOrderId (UInt32, echoed back in RDPOL/RDPOM and ET events).
+            # The data service uses the UUID ('xo' on notices/fills) to drive its
+            # durable order-status store. Counter starts high so it can never
+            # collide with miner-assigned clientOrderIds.
+            ext_oid = order.get('_order_id')
+            if ext_oid and 'payload' in translated and translated.get('type') != 'CANCEL_ORDERS':
+                cloid = self._next_ext_cloid()
+                translated['payload']['clientOrderId'] = cloid
+                self._ext_cloid_to_uuid[cloid] = str(ext_oid)
+
             valid.append(translated)
 
         return valid
+
+    def _next_ext_cloid(self) -> int:
+        """Monotonic UInt32 clientOrderId for external (exchange-API) orders."""
+        if not hasattr(self, '_ext_cloid_to_uuid'):
+            self._ext_cloid_to_uuid: dict[int, str] = {}
+            self._ext_engineoid_to_uuid: dict[int, str] = {}
+        counter = getattr(self, '_ext_cloid_counter', 0) + 1
+        self._ext_cloid_counter = counter
+        return 3_000_000_000 + (counter % 1_000_000_000)
 
     # ─────────────────────────────────────────────────────────────────────────
     # execute() — no-op
@@ -460,6 +488,12 @@ class SimulationEngine(MarketEngine):
 
     def on_start(self, timestamp, event) -> None:
         v = self.validator
+        # Capture the locked simulation_id BEFORE _load_config() rebuilds
+        # v.simulation from XML (which resets simulation_id + logDir to None).
+        # Needed to preserve it across a mid-run resume (see the reset logic below).
+        _prev_sim_id = (
+            getattr(v.simulation, "simulation_id", None) if getattr(v, "simulation", None) else None
+        )
         self._load_config()
         volume_decimals = v.simulation.volumeDecimals
 
@@ -468,183 +502,27 @@ class SimulationEngine(MarketEngine):
         old_simulation_timestamp = v.simulation_timestamp  # End time of old simulation
         new_simulation_timestamp = timestamp  # Start time of new simulation (0)
 
-        lookback_period = v.config.scoring.kappa.lookback
-        volume_assessment_period = v.config.scoring.activity.trade_volume_assessment_period
+        # Tell the shadow scoring service to run the SAME shift on its own
+        # structures. FIFO with the state tee: all old-sim frames precede this,
+        # all new-sim frames follow it.
+        _shadow = getattr(v, '_scoring_shadow', None)
+        if _shadow is not None:
+            _shadow.emit_sim_start(old_simulation_timestamp, new_simulation_timestamp)
 
-        new_threshold = new_simulation_timestamp - lookback_period
-        new_volume_threshold = new_simulation_timestamp - volume_assessment_period
-
-        pruned_total = defaultdict(lambda: defaultdict(float))
-        pruned_maker = defaultdict(lambda: defaultdict(float))
-        pruned_taker = defaultdict(lambda: defaultdict(float))
-        pruned_self = defaultdict(lambda: defaultdict(float))
-        pruned_roundtrip = defaultdict(lambda: defaultdict(float))
-
-        # Shift trade volume timestamps
-        logger.info("Shifting trade volume timestamps...")
-        shifted_trade_volumes = {}
-        for uid in range(v.effective_max_uids):
-            if uid in v.trade_volumes:
-                shifted_trade_volumes[uid] = {}
-                for bookId in range(v.simulation.book_count):
-                    if bookId in v.trade_volumes[uid]:
-                        shifted_trade_volumes[uid][bookId] = {}
-                        for role in ['total', 'maker', 'taker', 'self']:
-                            if role in v.trade_volumes[uid][bookId]:
-                                shifted_times = {}
-                                for prev_time, volume in v.trade_volumes[uid][bookId][role].items():
-                                    time_from_old_end = old_simulation_timestamp - prev_time
-                                    new_time = new_simulation_timestamp - time_from_old_end
-                                    if new_time >= new_volume_threshold:
-                                        shifted_times[new_time] = volume
-                                    else:
-                                        if role == 'total':
-                                            pruned_total[uid][bookId] += volume
-                                        elif role == 'maker':
-                                            pruned_maker[uid][bookId] += volume
-                                        elif role == 'taker':
-                                            pruned_taker[uid][bookId] += volume
-                                        elif role == 'self':
-                                            pruned_self[uid][bookId] += volume
-
-                                if shifted_times:
-                                    shifted_trade_volumes[uid][bookId][role] = shifted_times
-
-        v.trade_volumes = {
-            uid: {
-                bookId: {
-                    role: shifted_trade_volumes.get(uid, {}).get(bookId, {}).get(role, {})
-                    for role in ['total', 'maker', 'taker', 'self']
-                }
-                for bookId in range(v.simulation.book_count)
-            }
-            for uid in range(v.effective_max_uids)
-        }
-
-        logger.info("Adjusting volume sums for pruned data...")
-        for uid in pruned_total:
-            for bookId in pruned_total[uid]:
-                v.volume_sums[uid][bookId] = max(
-                    0.0,
-                    v.volume_sums[uid][bookId] - pruned_total[uid][bookId]
-                )
-                v.volume_sums[uid][bookId] = round(v.volume_sums[uid][bookId], volume_decimals)
-
-        for uid in pruned_maker:
-            for bookId in pruned_maker[uid]:
-                v.maker_volume_sums[uid][bookId] = max(
-                    0.0,
-                    v.maker_volume_sums[uid][bookId] - pruned_maker[uid][bookId]
-                )
-                v.maker_volume_sums[uid][bookId] = round(v.maker_volume_sums[uid][bookId], volume_decimals)
-
-        for uid in pruned_taker:
-            for bookId in pruned_taker[uid]:
-                v.taker_volume_sums[uid][bookId] = max(
-                    0.0,
-                    v.taker_volume_sums[uid][bookId] - pruned_taker[uid][bookId]
-                )
-                v.taker_volume_sums[uid][bookId] = round(v.taker_volume_sums[uid][bookId], volume_decimals)
-
-        for uid in pruned_self:
-            for bookId in pruned_self[uid]:
-                v.self_volume_sums[uid][bookId] = max(
-                    0.0,
-                    v.self_volume_sums[uid][bookId] - pruned_self[uid][bookId]
-                )
-                v.self_volume_sums[uid][bookId] = round(v.self_volume_sums[uid][bookId], volume_decimals)
-
-        logger.info("Adjusted volume sums after pruning old data")
-
-        logger.info("Shifting inventory history timestamps...")
-        shifted_inventory = {}
-        for uid in range(v.effective_max_uids):
-            if uid in v.inventory_history and v.inventory_history[uid]:
-                hist = v.inventory_history[uid]
-                if len(hist) > 3:
-                    timestamps_to_keep = sorted(hist.keys())[-3:]
-                    hist = {ts: hist[ts] for ts in timestamps_to_keep}
-
-                shifted_inventory[uid] = {}
-                for prev_time, values in hist.items():
-                    time_from_old_end = old_simulation_timestamp - prev_time
-                    new_time = new_simulation_timestamp - time_from_old_end
-                    shifted_inventory[uid][new_time] = values
-
-        v.inventory_history = {
-            uid: shifted_inventory.get(uid, {})
-            for uid in range(v.effective_max_uids)
-        }
-
-        logger.info("Shifting realized P&L history timestamps...")
-        shifted_pnl_history = {}
-        v._last_prune_timestamp = None
-        for uid in range(v.effective_max_uids):
-            if uid in v.realized_pnl_history and v.realized_pnl_history[uid]:
-                hist = v.realized_pnl_history[uid]
-                shifted_pnl_history[uid] = {}
-                for prev_time, books in hist.items():
-                    time_from_old_end = old_simulation_timestamp - prev_time
-                    new_time = new_simulation_timestamp - time_from_old_end
-                    if new_time >= new_threshold:
-                        shifted_pnl_history[uid][new_time] = books
-
-        v.realized_pnl_history = defaultdict(lambda: defaultdict(dict))
-        for uid, timestamps_data in shifted_pnl_history.items():
-            for ts, books in timestamps_data.items():
-                for book_id, pnl in books.items():
-                    v.realized_pnl_history[uid][ts][book_id] = pnl
-
-        # realized_pnl_history was fully rebuilt above; the MVTRX push running
-        # totals (agent_pnl_by_book / agent_pnl_total) must be re-bootstrapped
-        # from it to stay consistent with what trade.py will observe going
-        # forward.
-        from taos.im.validator.trade import bootstrap_pnl_totals
-        bootstrap_pnl_totals(v)
-
-        logger.info(f"Shifted realized P&L history: {len(shifted_pnl_history)} UIDs with data")
-
-        logger.info("Shifting round-trip volume timestamps...")
-        shifted_rt_volumes = {}
-        for uid in range(v.effective_max_uids):
-            if uid in v.roundtrip_volumes:
-                shifted_rt_volumes[uid] = {}
-                for bookId in range(v.simulation.book_count):
-                    if bookId in v.roundtrip_volumes[uid]:
-                        shifted_times = {}
-                        for prev_time, volume in v.roundtrip_volumes[uid][bookId].items():
-                            time_from_old_end = old_simulation_timestamp - prev_time
-                            new_time = new_simulation_timestamp - time_from_old_end
-
-                            if new_time >= new_volume_threshold:
-                                shifted_times[new_time] = volume
-                            else:
-                                pruned_roundtrip[uid][bookId] += volume
-
-                        if shifted_times:
-                            shifted_rt_volumes[uid][bookId] = shifted_times
-
-        v.roundtrip_volumes = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
-        for uid, books in shifted_rt_volumes.items():
-            for book_id, volumes in books.items():
-                for ts, volume in volumes.items():
-                    v.roundtrip_volumes[uid][book_id][ts] = volume
-
-        logger.info(f"Shifted round-trip volumes: {len(shifted_rt_volumes)} UIDs with data")
-
-        logger.info("Adjusting round-trip volume sums for pruned data...")
-        for uid in pruned_roundtrip:
-            for bookId in pruned_roundtrip[uid]:
-                v.roundtrip_volume_sums[uid][bookId] = max(
-                    0.0,
-                    v.roundtrip_volume_sums[uid][bookId] - pruned_roundtrip[uid][bookId]
-                )
-                v.roundtrip_volume_sums[uid][bookId] = round(
-                    v.roundtrip_volume_sums[uid][bookId],
-                    volume_decimals
-                )
-
-        logger.info(f"Adjusted round-trip volume sums: {len(v.roundtrip_volume_sums)} total entries")
+        # The full history shift lives in trade.shift_simulation_histories —
+        # shared verbatim with the shadow scoring service so both sides make the
+        # identical transition.
+        from taos.im.validator.trade import shift_simulation_histories
+        shift_simulation_histories(
+            v, old_simulation_timestamp, new_simulation_timestamp,
+            book_count=v.simulation.book_count,
+            volume_decimals=volume_decimals,
+            lookback=v.config.scoring.kappa.lookback,
+            volume_assessment_period=v.config.scoring.activity.trade_volume_assessment_period,
+            miner_wealth=v.simulation.miner_wealth,
+            effective_max_uids=v.effective_max_uids,
+            log=logger.info,
+        )
 
         v.start_time = time.time()
         v.simulation_timestamp = timestamp
@@ -655,13 +533,33 @@ class SimulationEngine(MarketEngine):
             logger.info(f"Simulation log directory changed: {v.simulation.logDir} -> {event.logDir}")
             self._notify_seed_log_dir_change(event.logDir)
             v.simulation.logDir = event.logDir
-        # Reset simulation_id so on_tick re-derives it from the new logDir
-        v.simulation.simulation_id = None
-        logger.info("Clearing open positions (simulation-specific state)...")
-        v.open_positions = defaultdict(lambda: defaultdict(lambda: {
-            'longs': deque(),
-            'shorts': deque()
-        }))
+        # simulation_id lifecycle. A genuine new episode resets the clock to ~0
+        # (start="0"), so on_tick should re-derive the id from the new logDir.
+        # But a restart/reconnect that resumes an in-progress run fires this same
+        # event with the clock already past the grace period AND (because the
+        # simulator writes a wall-clock-named output dir) a rotated logDir —
+        # re-deriving there mints a NEW id for the same run, which makes the data
+        # service classify it as a new simulation and prune the entire in-progress
+        # run's history. So: fresh episode (or no prior id) → reset + re-derive;
+        # mid-run resume → preserve the locked id, decoupling it from the logDir.
+        _grace = int(getattr(v.simulation, "grace_period", 0) or 0)
+        _fresh_threshold = max(_grace, _FRESH_EPISODE_FLOOR_NS)
+        if not _prev_sim_id or new_simulation_timestamp <= _fresh_threshold:
+            v.simulation.simulation_id = None
+            logger.info(
+                f"Fresh episode (t={new_simulation_timestamp} <= {_fresh_threshold}ns) — "
+                "simulation_id will re-derive from logDir"
+            )
+        else:
+            v.simulation.simulation_id = _prev_sim_id
+            logger.warning(
+                f"Preserving simulation_id {_prev_sim_id!r} across restart "
+                f"(t={new_simulation_timestamp} > grace {_fresh_threshold}ns) — mid-run resume, "
+                "not re-deriving from logDir (avoids data-service prune of the in-progress run)"
+            )
+        # open_positions / initial_balances / recent_trades / recent_miner_trades
+        # resets are handled inside shift_simulation_histories (shared with the
+        # shadow scoring service).
 
         self.compress_outputs(start=True)
 
@@ -674,17 +572,6 @@ class SimulationEngine(MarketEngine):
         logger.info("-"*40)
 
         self.load_fundamental()
-        v.initial_balances = {
-            uid : {
-                bookId : {'BASE' : None, 'QUOTE' : None, 'WEALTH' : v.simulation.miner_wealth}
-                for bookId in range(v.simulation.book_count)
-            } for uid in range(v.effective_max_uids)
-        }
-        v.recent_trades = {bookId : [] for bookId in range(v.simulation.book_count)}
-        v.recent_miner_trades = {
-            uid : {bookId : [] for bookId in range(v.simulation.book_count)}
-            for uid in range(v.effective_max_uids)
-        }
 
         asyncio.run_coroutine_threadsafe(v._save_state_sync(), v.main_loop).result()
         logger.info("Simulation restart complete")
@@ -699,6 +586,9 @@ class SimulationEngine(MarketEngine):
         v = self.validator
         logger.info("SIMULATION ENDED")
         v.simulation.logDir = None
+        # Clear the locked id on a clean end so a restart afterwards re-derives a
+        # fresh id for the NEXT episode instead of restoring this (ended) run's id.
+        v.simulation.simulation_id = None
         self._notify_seed_log_dir_change(None)
         v.fundamental_price = {bookId: None for bookId in range(v.simulation.book_count)}
         v.pending_notices = {uid: [] for uid in range(v.effective_max_uids)}
@@ -765,19 +655,13 @@ class SimulationEngine(MarketEngine):
         Failed resets trigger a pagerduty alert.
         """
         v = self.validator
-        _reset_types = frozenset({
-            'RDRA', 'RESPONSE_DISTRIBUTED_RESET_AGENT',
-            'ERDRA', 'ERROR_RESPONSE_DISTRIBUTED_RESET_AGENT',
-        })
-        for notice in state.notices.get(v.uid, []):
-            if notice.get('y') in _reset_types:
-                for reset in notice.get('r', []):
-                    if reset.get('u'):
-                        pending.add(reset['a'])
-                    else:
-                        v.pagerduty_alert(
-                            f"Failed to Reset Agent {reset.get('a')} : {reset.get('m')}"
-                        )
+        from taos.im.validator.trade import collect_reset_uids
+        ok, failed = collect_reset_uids(state, v.uid)
+        pending.update(ok)
+        for reset in failed:
+            v.pagerduty_alert(
+                f"Failed to Reset Agent {reset.get('a')} : {reset.get('m')}"
+            )
 
     # ─────────────────────────────────────────────────────────────────────────
     # Simulation-specific helpers (moved from validator.py)
@@ -1202,6 +1086,16 @@ class SimulationEngine(MarketEngine):
             },
             "pending_notices": v.pending_notices,
             "simulation.logDir": v.simulation.logDir,
+            # Persist the locked id so a process restart reloads it instead of
+            # re-deriving from the (possibly rotated) logDir — which would mint a
+            # new id for the same run and trigger a data-service prune.
+            "simulation.simulation_id": v.simulation.simulation_id,
+            # External-order UUID threading maps: resting exchange-API orders can
+            # fill hours later and across restarts; losing these breaks the data
+            # service's FILLED transitions (counter persists to avoid cloid reuse).
+            "ext_cloid_to_uuid": dict(getattr(self, "_ext_cloid_to_uuid", {})),
+            "ext_engineoid_to_uuid": dict(getattr(self, "_ext_engineoid_to_uuid", {})),
+            "ext_cloid_counter": getattr(self, "_ext_cloid_counter", 0),
         }
 
     def restore_simulation_state(self, data: dict) -> None:
@@ -1213,6 +1107,15 @@ class SimulationEngine(MarketEngine):
         v.initial_balances = data.get("initial_balances", v.initial_balances)
         if "simulation.logDir" in data and v.simulation:
             v.simulation.logDir = data["simulation.logDir"]
+        # Restore the locked simulation_id (set after _load_config resets it) so
+        # on_tick does not re-derive a new id from a rotated logDir on restart.
+        if data.get("simulation.simulation_id") and v.simulation:
+            v.simulation.simulation_id = data["simulation.simulation_id"]
+            logger.info(f"Restored simulation_id: {v.simulation.simulation_id!r}")
+        # External-order UUID maps (JSON round-trips stringify int keys).
+        self._ext_cloid_to_uuid = {int(k): str(u) for k, u in (data.get("ext_cloid_to_uuid") or {}).items()}
+        self._ext_engineoid_to_uuid = {int(k): str(u) for k, u in (data.get("ext_engineoid_to_uuid") or {}).items()}
+        self._ext_cloid_counter = int(data.get("ext_cloid_counter") or 0)
         # recent_trades and recent_miner_trades are deserialized in load_state()
         # pending_notices are deserialized in load_state()
 
@@ -1228,50 +1131,23 @@ class SimulationEngine(MarketEngine):
         logger.debug(f"UID {uid} Deregistered - Scheduled for reset.")
 
     def apply_resets(self, pending: set) -> None:
-        """Zero all scoring state for each UID in pending."""
+        """Zero all scoring state for each UID in pending.
+
+        The history/scoring zeroing lives in trade.reset_agent_histories —
+        shared verbatim with the shadow scoring service (which receives a
+        ("resets", uids) frame). Main-only bookkeeping stays here.
+        """
         v = self.validator
+        if not pending:
+            return
+        from taos.im.validator.trade import reset_agent_histories
+        # NOTE: no frame to the scoring service — it derives the same resets
+        # from the teed state (collect_reset_uids) at the same position.
+        import bittensor as bt
+        bt.logging.info(f"Applying agent resets: {sorted(pending)}")
         for uid in pending:
-            logger.info(f"Agent {uid} Balances Reset!")
-            v.kappa_values[uid] = {
-                'books': {bookId: None for bookId in self.book_ids},
-                'books_weighted': {bookId: 0.0 for bookId in self.book_ids},
-                'total': None, 'average': None, 'median': None,
-                'normalized_average': 0.0, 'normalized_median': 0.0,
-                'normalized_total': 0.0,
-                'activity_weighted_normalized_median': 0.0,
-                'penalty': 0.0, 'score': 0.0,
-            }
+            reset_agent_histories(v, uid, self.book_ids)
             v.unnormalized_scores[uid] = 0.0
-            v.activity_factors[uid] = {bookId: 0.0 for bookId in self.book_ids}
-            v.pnl_factors[uid] = {bookId: 1.0 for bookId in self.book_ids}
-            v.inventory_history[uid] = {}
-            v.trade_volumes[uid] = {
-                bookId: {'total': {}, 'maker': {}, 'taker': {}, 'self': {}}
-                for bookId in self.book_ids
-            }
-            for book_id in self.book_ids:
-                v.volume_sums[uid][book_id] = 0.0
-                v.maker_volume_sums[uid][book_id] = 0.0
-                v.taker_volume_sums[uid][book_id] = 0.0
-                v.self_volume_sums[uid][book_id] = 0.0
-            from collections import defaultdict, deque
-            v.roundtrip_volumes[uid] = defaultdict(lambda: defaultdict(float))
-            for book_id in self.book_ids:
-                v.roundtrip_volume_sums[uid][book_id] = 0.0
-            v.realized_pnl_history[uid] = {}
-            # Reset the corresponding MVTRX push running totals for this uid
-            # to match — otherwise agent_pnl_book would keep the deregistered
-            # miner's stale sum for the next miner that takes the slot.
-            if hasattr(v, 'agent_pnl_by_book'):
-                v.agent_pnl_by_book.pop(uid, None)
-                v.agent_pnl_total.pop(uid, None)
-            v.open_positions[uid] = defaultdict(lambda: {
-                'longs': deque(), 'shorts': deque()
-            })
-            v.initial_balances[uid] = {
-                bookId: {'BASE': None, 'QUOTE': None, 'WEALTH': None}
-                for bookId in self.book_ids
-            }
             v.initial_balances_published[uid] = False
             if uid in v.deregistered_uids:
                 v.deregistered_uids.remove(uid)
@@ -1279,7 +1155,6 @@ class SimulationEngine(MarketEngine):
                 'requests': 0, 'timeouts': 0, 'failures': 0,
                 'rejections': 0, 'call_time': []
             }
-            v.recent_miner_trades[uid] = {bookId: [] for bookId in self.book_ids}
 
     # ─────────────────────────────────────────────────────────────────────────
     # Seed service (moved from validator)
