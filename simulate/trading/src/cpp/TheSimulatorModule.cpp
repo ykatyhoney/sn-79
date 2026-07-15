@@ -253,12 +253,16 @@ PYBIND11_EMBEDDED_MODULE(thesimulator, m)
         m, "EventOrderMarketPayload")
         .def(py::init<MarketOrder>())
         .def_readonly("order", &EventOrderMarketPayload::order)
+        .def_readonly("bookId", &EventOrderMarketPayload::bookId)
+        .def_readonly("agentId", &EventOrderMarketPayload::agentId)
         ;
 
     py::class_<EventOrderLimitPayload, MessagePayload, std::shared_ptr<EventOrderLimitPayload>>(
         m, "EventOrderLimitPayload")
         .def(py::init<LimitOrder>())
         .def_readonly("order", &EventOrderLimitPayload::order)
+        .def_readonly("bookId", &EventOrderLimitPayload::bookId)
+        .def_readonly("agentId", &EventOrderLimitPayload::agentId)
         ;
 
     py::class_<Trade, Trade::Ptr>(m, "Trade")

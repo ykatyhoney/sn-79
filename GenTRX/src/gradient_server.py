@@ -3271,6 +3271,27 @@ class GradientAggregator:
             "overlap_max": max(pair_overlaps),
         }
 
+    def _is_gradient_acceptable(self, score: float, assignment: dict) -> bool:
+        """Gate deciding which scored gradients enter the aggregation that produces
+        the published proposal (training-integrity critical; unit-tested in
+        tests/test_gradient_accept.py).
+
+        - Below/at the effective min score: rejected (not a positive signal).
+        - Version-mismatched (outside warmup): trained against an older model than
+          the one we'd apply to — its direction-of-improvement is for a checkpoint
+          that no longer exists; letting it in pollutes the proposal (and, on a
+          fresh-regime random init, can push the apply over fp32 stability).
+          During warmup anything is accepted (model bootstrapping from scratch).
+        - No held-out loader (outside warmup): the score is own-data loss
+          (memorization), not a generalization signal."""
+        if score <= self._effective_min_score:
+            return False
+        if not self._in_warmup and assignment.get("_version_mismatched"):
+            return False
+        if not self._in_warmup and assignment.get("_no_held"):
+            return False
+        return True
+
     def _aggregate_accepted(
         self,
         scored: list,
@@ -3303,24 +3324,8 @@ class GradientAggregator:
 
         threshold = self._effective_min_score
 
-        # Version-mismatched gradients are trained against an older model
-        # than the one we'd apply them to — their direction-of-improvement is
-        # for a checkpoint that no longer exists. Letting them into the
-        # aggregation pollutes the proposal (and, on a fresh-regime random
-        # init, can push the apply over fp32 stability). Drop them outside
-        # warmup; during warmup we accept anything since the model is being
-        # bootstrapped from scratch.
         def _is_acceptable(s: float, a: dict) -> bool:
-            if s <= threshold:
-                return False
-            if not self._in_warmup and a.get("_version_mismatched"):
-                return False
-            # No held-out loader could be built for this miner — the score is
-            # its own-data loss (memorization), not a generalization signal.
-            # Exclude from reward + aggregation outside warmup.
-            if not self._in_warmup and a.get("_no_held"):
-                return False
-            return True
+            return self._is_gradient_acceptable(s, a)
 
         accepted = [(m, w, s, c, a) for m, w, s, c, a in scored if _is_acceptable(s, a)]
         rejected = [(m, w, s, a) for m, w, s, _, a in scored if not _is_acceptable(s, a)]

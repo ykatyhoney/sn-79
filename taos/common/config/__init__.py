@@ -238,10 +238,41 @@ def add_validator_args(cls, parser):
     )
 
 
-def config(cls):
-    """
-    Returns the configuration object specific to this miner or validator after adding relevant arguments.
-    """
+def _prune_default_shadow_configs(cfg, parser):
+    """bittensor >=10.3 builds every dotted-arg sub-namespace as a full
+    Config() instance, which self-populates the standard default sections
+    (axon/logging/priority/subtensor/wallet + config/strict/no_version_checking)
+    at EVERY nesting level — so config.prometheus, config.neuron, etc. each
+    shadow a complete default bittensor config with wrong values (wallet
+    'default', finney endpoint) and the boot "Config:" dump explodes
+    combinatorially. Prune every nested key the parser did not actually
+    define, keeping intermediate groups on the path to real args."""
+    legit = set()
+    for action in parser._actions:
+        if action.dest and action.dest != "help":
+            parts = action.dest.split(".")
+            for i in range(1, len(parts) + 1):
+                legit.add(tuple(parts[:i]))
+    for key in ("config", "strict", "no_version_checking"):
+        legit.add((key,))
+
+    def walk(node, path):
+        if not isinstance(node, bt.Config):
+            return
+        for key in list(node.keys()):
+            if key.startswith("_"):
+                continue
+            sub_path = path + (key,)
+            if sub_path not in legit:
+                if path:
+                    del node[key]
+                continue
+            walk(node[key], sub_path)
+
+    walk(cfg, ())
+
+
+def _build_parser(cls):
     parser = argparse.ArgumentParser()
     bt.Wallet.add_args(parser)
     bt.Subtensor.add_args(parser)
@@ -249,4 +280,22 @@ def config(cls):
     bt.Axon.add_args(parser)
     prometheus.add_args( parser )
     cls.add_args(parser)
-    return bt.Config(parser)
+    return parser
+
+
+def prune_config(cfg, cls):
+    """Re-prune the default-config shadows for a neuron class's config.
+    bt.Config.merge() rebuilds nested sections as fresh Config() instances,
+    re-injecting the default shadows — so this must run again after any
+    merge (see BaseNeuron.__init__), not only at construction."""
+    _prune_default_shadow_configs(cfg, _build_parser(cls))
+
+
+def config(cls):
+    """
+    Returns the configuration object specific to this miner or validator after adding relevant arguments.
+    """
+    parser = _build_parser(cls)
+    cfg = bt.Config(parser)
+    _prune_default_shadow_configs(cfg, parser)
+    return cfg

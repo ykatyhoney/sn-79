@@ -392,10 +392,41 @@ def add_im_validator_args(cls, parser):
     parser.add_argument(
         "--rewarding.pareto.shape",
         type=float,
-        help="Shape parameter for Pareto distribution used in allocating rewards.",
-        default=1.42,
+        help="Shape parameter for Pareto distribution used in allocating rewards. Lower "
+             "= steeper payout curve concentrated on top performers. Default 1.0 "
+             "concentrates rewards to blunt bulk-registration farms (a fleet of "
+             "merely-adequate UIDs earns little); 1.42 was the flatter legacy curve.",
+        default=1.0,
     )
-    
+
+    parser.add_argument(
+        "--rewarding.floor.enabled",
+        type=bool,
+        help="Enable the soft score floor: taper below-percentile trading scores toward "
+             "zero before Pareto allocation, so merely-adequate UID fleets stop earning "
+             "and rewards concentrate on genuine performers. Enabled by default; the "
+             "taper is gentle enough that a genuinely-improving newcomer clears it well "
+             "inside the 24 h immunity window.",
+        default=True,
+    )
+
+    parser.add_argument(
+        "--rewarding.floor.percentile",
+        type=float,
+        help="Percentile of active (positive) trading scores below which the soft floor "
+             "tapers rewards toward zero. Default 50 (median).",
+        default=50.0,
+    )
+
+    parser.add_argument(
+        "--rewarding.floor.softness",
+        type=float,
+        help="Soft-floor taper width in (0, 1]: scores ramp linearly from 0 at "
+             "threshold*(1-softness) up to full at the threshold. Smaller = sharper "
+             "(→ hard cliff); 1.0 = gentlest. Default 0.5.",
+        default=0.5,
+    )
+
     parser.add_argument(
         "--reporting.disabled",
         action="store_true",

@@ -81,17 +81,37 @@ def build_validator_state(
         # miner_gauges requests/timeouts/call_time series reappear in Grafana.
         # Per-uid dict + call_time list are copied to tolerate concurrent
         # update_stats() mutation on the main loop (no await between here).
-        "miner_stats": {
-            uid: {
-                "requests": s.get("requests", 0),
-                "timeouts": s.get("timeouts", 0),
-                "failures": s.get("failures", 0),
-                "rejections": s.get("rejections", 0),
-                "call_time": list(s.get("call_time", [])),
-            }
-            for uid, s in dict(getattr(self, "miner_stats", {})).items()
-            if isinstance(s, dict)
-        },
+        "miner_stats": snapshot_miner_stats(self),
+    }
+
+
+def snapshot_miner_stats(self: Validator):
+    return {
+        uid: {
+            "requests": s.get("requests", 0),
+            "timeouts": s.get("timeouts", 0),
+            "failures": s.get("failures", 0),
+            "rejections": s.get("rejections", 0),
+            "call_time": list(s.get("call_time", [])),
+        }
+        for uid, s in dict(getattr(self, "miner_stats", {})).items()
+        if isinstance(s, dict)
+    }
+
+
+def build_save_light_fields(self: Validator) -> dict:
+    """The main-only fields of the validator save file, shipped to the scoring
+    service when it writes the file from its replica (save offload). Cheap
+    copies, built on the main loop so they are atomic wrt round handling."""
+    return {
+        "step": self.step,
+        "simulation_timestamp": self.simulation_timestamp,
+        "hotkeys": list(self.hotkeys),
+        "scores": [score.item() for score in self.scores],
+        "gentrx_scores": [score.item() for score in self.gentrx_scores],
+        "unnormalized_scores": dict(self.unnormalized_scores),
+        "deregistered_uids": list(self.deregistered_uids),
+        "miner_stats": snapshot_miner_stats(self),
     }
 
 
@@ -233,6 +253,19 @@ async def construct_save_data_async(self: Validator):
     )
     await asyncio.sleep(0)
 
+    validator_state_data = await construct_validator_state_async(self)
+
+    prep_time = time.time() - start
+    bt.logging.info(f"Prepared save data async ({prep_time:.4f}s)")
+    return simulation_state_data, validator_state_data, prep_time
+
+
+async def construct_validator_state_async(self: Validator):
+    """Build only the validator-state dict (snapshot hops on the save executor,
+    yielding between steps). Split out of construct_save_data_async so the
+    save-offload fallback can construct it without re-building simulation state."""
+    loop = asyncio.get_event_loop()
+
     bt.logging.debug("Creating snapshots...")
     snapshot_start = time.time()
 
@@ -274,7 +307,7 @@ async def construct_save_data_async(self: Validator):
 
     bt.logging.debug(f"Created snapshots ({time.time()-snapshot_start:.4f}s)")
 
-    validator_state_data = build_validator_state(
+    return build_validator_state(
         self,
         inventory_snapshot,
         realized_pnl_snapshot,
@@ -283,10 +316,6 @@ async def construct_save_data_async(self: Validator):
         roundtrip_volumes_snapshot,
         open_positions_snapshot
     )
-
-    prep_time = time.time() - start
-    bt.logging.info(f"Prepared save data async ({prep_time:.4f}s)")
-    return simulation_state_data, validator_state_data, prep_time
 
 
 def defragment_histories(self: Validator):
@@ -458,20 +487,47 @@ async def save_state_async(self: Validator) -> bool:
                 )
             self._last_defrag_hour = simulation_hour
 
-        async with self._reward_lock:
-            total_inv_entries = sum(len(hist) for hist in self.inventory_history.values())
-            total_pnl_entries = sum(len(hist) for hist in self.realized_pnl_history.values())
-            total_vol_entries = sum(
-                sum(len(roles.get('total', {})) for roles in books.values())
-                for books in self.trade_volumes.values()
-            )
+        # Save offload (Stage B v2): when the cutover scoring service is live,
+        # the child writes the heavy validator-state file from its parity-
+        # verified replica — main ships only the light main-only fields and
+        # skips the multi-second snapshot+pack GIL hold entirely. Any failure
+        # (child dead, uninitialized, timeout, write error) falls back to the
+        # in-process path below. SAVE_OFFLOAD=0 disables.
+        _shadow = getattr(self, '_scoring_shadow', None)
+        _offload_req = None
+        if (
+            getattr(self, '_scoring_proc_cutover', False)
+            and _shadow is not None
+            and not _is_exchange_mode
+            and os.environ.get("SAVE_OFFLOAD", "1") != "0"
+        ):
+            _offload_req = _shadow.request_save(self.validator_state_file, build_save_light_fields(self))
 
-            bt.logging.info(
-                f"Save prep: {total_inv_entries} inventory entries, "
-                f"{total_pnl_entries} P&L entries, {total_vol_entries} volume entries"
-            )
+        validator_state_data = None
+        if _offload_req is not None:
+            bt.logging.info(f"[SAVE-OFFLOAD] validator state delegated to scoring service (ts={_offload_req[0]})")
+            prep_start = time.time()
+            async with self._reward_lock:
+                simulation_state_data = await asyncio.get_event_loop().run_in_executor(
+                    self.save_state_executor,
+                    self.engine.build_simulation_state
+                )
+            prep_time = time.time() - prep_start
+        else:
+            async with self._reward_lock:
+                total_inv_entries = sum(len(hist) for hist in self.inventory_history.values())
+                total_pnl_entries = sum(len(hist) for hist in self.realized_pnl_history.values())
+                total_vol_entries = sum(
+                    sum(len(roles.get('total', {})) for roles in books.values())
+                    for books in self.trade_volumes.values()
+                )
 
-            simulation_state_data, validator_state_data, prep_time = await construct_save_data_async(self)
+                bt.logging.info(
+                    f"Save prep: {total_inv_entries} inventory entries, "
+                    f"{total_pnl_entries} P&L entries, {total_vol_entries} volume entries"
+                )
+
+                simulation_state_data, validator_state_data, prep_time = await construct_save_data_async(self)
 
         async def wait_for_query_and_receive(process):
             """
@@ -539,22 +595,49 @@ async def save_state_async(self: Validator) -> bool:
                     raise ex
                 sim_time = time.time() - sim_start
 
-                await wait_for_query_and_receive('serializing validator state')
-                val_start = time.time()
-                val_temp = f"{self.validator_state_file}.tmp.{save_timestamp}"
-                try:
-                    val_total = await loop.run_in_executor(
-                        self.save_state_executor,
-                        _pack_stream_fsync, val_temp, validator_state_data)
-                    await aiofiles.os.replace(val_temp, self.validator_state_file)
-                except Exception as ex:
-                    if os.path.exists(val_temp):
+                _val_data = validator_state_data
+                _child_result = None
+                if _offload_req is not None:
+                    val_start = time.time()
+
+                    def _wait_child(fut=_offload_req[1]):
                         try:
-                            await aiofiles.os.remove(val_temp)
+                            return fut.result(timeout=180.0)
                         except Exception:
-                            pass
-                    raise ex
-                val_time = time.time() - val_start
+                            return None
+
+                    _child_result = await loop.run_in_executor(self.save_state_executor, _wait_child)
+                    if _child_result is not None:
+                        val_total, _child_io = _child_result
+                        val_time = time.time() - val_start
+                        bt.logging.info(
+                            f"[SAVE-OFFLOAD] validator state written by scoring service "
+                            f"({val_total/1024/1024:.2f}MB, child io={_child_io:.2f}s, waited {val_time:.2f}s)"
+                        )
+                    else:
+                        bt.logging.warning(
+                            "[SAVE-OFFLOAD] scoring service save failed — in-process fallback"
+                        )
+                        async with self._reward_lock:
+                            _val_data = await construct_validator_state_async(self)
+
+                if _child_result is None:
+                    await wait_for_query_and_receive('serializing validator state')
+                    val_start = time.time()
+                    val_temp = f"{self.validator_state_file}.tmp.{save_timestamp}"
+                    try:
+                        val_total = await loop.run_in_executor(
+                            self.save_state_executor,
+                            _pack_stream_fsync, val_temp, _val_data)
+                        await aiofiles.os.replace(val_temp, self.validator_state_file)
+                    except Exception as ex:
+                        if os.path.exists(val_temp):
+                            try:
+                                await aiofiles.os.remove(val_temp)
+                            except Exception:
+                                pass
+                        raise ex
+                    val_time = time.time() - val_start
 
                 sim_mb = sim_total / 1024 / 1024
                 val_mb = val_total / 1024 / 1024

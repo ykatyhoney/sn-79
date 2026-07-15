@@ -1069,6 +1069,9 @@ void MultiBookExchangeAgent::handleDistributedPlaceMarketOrder(const Message::Pt
         subPayload->takeProfit,
         subPayload->placeholder);
 
+    // Gap fix: miner (distributed) market orders fire the subscriber event too.
+    notifyMarketOrderSubscribers(order, subPayload->bookId, payload->agentId);
+
     if (simulation()->m_replayMode && !simulation()->isReplacedAgent(msg->source)) return;
 
     const auto retSubPayload =
@@ -1150,6 +1153,10 @@ void MultiBookExchangeAgent::handleDistributedPlaceLimitOrder(const Message::Ptr
         subPayload->takeProfit,
         subPayload->placeholder);
 
+    // Miner (distributed) limit orders fire the same subscriber event as local ones so
+    // subscribers see both origins; isRemote=true also reaches miner-only subscribers.
+    notifyLimitOrderSubscribers(order, subPayload->bookId, payload->agentId, true);
+
     if (simulation()->m_replayMode && !simulation()->isReplacedAgent(msg->source)) return;
 
     const auto retSubPayload =
@@ -1162,7 +1169,13 @@ void MultiBookExchangeAgent::handleDistributedPlaceLimitOrder(const Message::Ptr
             MessagePayload::create<PlaceOrderLimitResponsePayload>(order->id(), subPayload)),
         0);
 
-    if (subPayload->timeInForce == taosim::TimeInForce::GTT && subPayload->expiryPeriod.has_value()) {
+    // In exchange-service mode the sim clock (m_time.current) is set per instruction to
+    // instr.delay and never advances monotonically, so a time-scheduled expiry queued here
+    // would never fire (and would leak in the queue). GTT expiry is instead driven per batch
+    // off the block clock by Exchange::expireGTTOrders. Keep the scheduler for the stepped
+    // distributed sim, where the message queue is drained by Simulation::step().
+    if (subPayload->timeInForce == taosim::TimeInForce::GTT && subPayload->expiryPeriod.has_value()
+        && !simulation()->proxy()->exchangeServiceMode()) {
         simulation()->dispatchMessage(
             simulation()->currentTimestamp(),
             subPayload->expiryPeriod.value(),
@@ -1396,6 +1409,9 @@ void MultiBookExchangeAgent::handleLocalMessage(const Message::Ptr&  msg)
     else if (msg->type == "SUBSCRIBE_EVENT_ORDER_LIMIT") {
         handleLocalLimitOrderSubscription(msg);
     }
+    else if (msg->type == "SUBSCRIBE_EVENT_ORDER_LIMIT_MINER") {
+        handleMinerLimitOrderSubscription(msg);
+    }
     else if (msg->type == "SUBSCRIBE_EVENT_TRADE") {
         handleLocalTradeSubscription(msg);
     }
@@ -1467,7 +1483,7 @@ void MultiBookExchangeAgent::handleLocalPlaceMarketOrder(const Message::Ptr&  ms
         payload->takeProfit,
         payload->placeholder);
 
-    notifyMarketOrderSubscribers(order);
+    notifyMarketOrderSubscribers(order, payload->bookId, accounts().lookupLocalAgentId(msg->source));
 
     if (simulation()->m_replayMode && !simulation()->isReplacedAgent(msg->source)) return;
 
@@ -1544,7 +1560,7 @@ void MultiBookExchangeAgent::handleLocalPlaceLimitOrder(const Message::Ptr&  msg
         payload->takeProfit,
         payload->placeholder);
 
-    notifyLimitOrderSubscribers(order);
+    notifyLimitOrderSubscribers(order, payload->bookId, accounts().lookupLocalAgentId(msg->source), false);
 
     if (simulation()->m_replayMode && !simulation()->isReplacedAgent(msg->source)) return;
 
@@ -1825,6 +1841,26 @@ void MultiBookExchangeAgent::handleLocalLimitOrderSubscription(const Message::Pt
 
 //-------------------------------------------------------------------------
 
+void MultiBookExchangeAgent::handleMinerLimitOrderSubscription(const Message::Ptr&  msg)
+{
+    const auto& sub = msg->source;
+
+    if (!m_minerLimitOrderSubscribers.add(sub)) {
+        return fastRespondToMessage(
+            msg,
+            "ERROR",
+            MessagePayload::create<ErrorResponsePayload>(
+                fmt::format("Agent {} is already subscribed to miner limit order events", sub)));
+    }
+
+    fastRespondToMessage(
+        msg,
+        MessagePayload::create<SuccessResponsePayload>(
+            fmt::format("Agent {} subscribed successfully to miner limit order events", sub)));
+}
+
+//-------------------------------------------------------------------------
+
 void MultiBookExchangeAgent::handleLocalTradeSubscription(const Message::Ptr&  msg)
 {
     const auto& sub = msg->source;
@@ -1880,7 +1916,8 @@ void MultiBookExchangeAgent::handleLocalUnknownMessage(const Message::Ptr&  msg)
 
 //-------------------------------------------------------------------------
 
-void MultiBookExchangeAgent::notifyMarketOrderSubscribers(const MarketOrder::Ptr& marketOrder)
+void MultiBookExchangeAgent::notifyMarketOrderSubscribers(
+    const MarketOrder::Ptr& marketOrder, BookId bookId, AgentId agentId)
 {
     const Timestamp now = simulation()->currentTimestamp();
 
@@ -1897,31 +1934,40 @@ void MultiBookExchangeAgent::notifyMarketOrderSubscribers(const MarketOrder::Ptr
             name(),
             sub,
             "EVENT_ORDER_MARKET",
-            MessagePayload::create<EventOrderMarketPayload>(*marketOrder));
+            MessagePayload::create<EventOrderMarketPayload>(*marketOrder, bookId, agentId));
     }
 }
 
 //-------------------------------------------------------------------------
 
-void MultiBookExchangeAgent::notifyLimitOrderSubscribers(const LimitOrder::Ptr& limitOrder)
+void MultiBookExchangeAgent::notifyLimitOrderSubscribers(
+    const LimitOrder::Ptr& limitOrder, BookId bookId, AgentId agentId, bool isRemote)
 {
     const Timestamp now = simulation()->currentTimestamp();
 
-    auto subs = m_localLimitOrderSubscribers
-        | views::filter([&](auto&& sub) {
-            if (!simulation()->m_replayMode) return true;
-            return simulation()->isReplacedAgent(sub);
-        });
+    auto dispatch = [&](auto&& registry) {
+        auto subs = registry
+            | views::filter([&](auto&& sub) {
+                if (!simulation()->m_replayMode) return true;
+                return simulation()->isReplacedAgent(sub);
+            });
+        for (const auto& sub : subs) {
+            simulation()->dispatchMessage(
+                now,
+                0,  // deliver at the order's rest timestamp so a reactive subscriber can
+                    // act before any later-delay order in the same batch (intra-round intercept)
+                name(),
+                sub,
+                "EVENT_ORDER_LIMIT",
+                MessagePayload::create<EventOrderLimitPayload>(*limitOrder, bookId, agentId));
+        }
+    };
 
-    for (const auto& sub : subs) {
-        simulation()->dispatchMessage(
-            now,
-            1,
-            name(),
-            sub,
-            "EVENT_ORDER_LIMIT",
-            MessagePayload::create<EventOrderLimitPayload>(*limitOrder));
-    }
+    // "all" subscribers see every order (local + miner) and distinguish origin via
+    // agentId; miner-only subscribers are dispatched solely for remote orders so they
+    // never pay the per-background-order dispatch cost.
+    dispatch(m_localLimitOrderSubscribers);
+    if (isRemote) dispatch(m_minerLimitOrderSubscribers);
 }
 
 //-------------------------------------------------------------------------

@@ -637,14 +637,6 @@ class QueryService:
                 e * (_version_int_base**i) for i, e in enumerate(reversed(_version_info))
             )
 
-            # Exchange mode normally restricts miners to loopback (co-located with the
-            # validator). On localnet the chain rejects loopback axon serves, so miners
-            # post the host's primary-interface IP; EXCHANGE_LOCAL_AXON_IPS (comma-sep)
-            # opt-in-allows those co-located IPs. Empty (mainnet default) => loopback only.
-            _extra_axon_ips = {
-                ip.strip() for ip in os.environ.get("EXCHANGE_LOCAL_AXON_IPS", "").split(",") if ip.strip()
-            }
-
             for uid, axon_data in enumerate(request_data['metagraph_axons']):
                 axon = bt.AxonInfo(
                     version=version_as_int,
@@ -657,13 +649,8 @@ class QueryService:
                     placeholder1=0,
                     placeholder2=0,
                 )
+                # Query every published axon (non-zero IP), same as simulation mode.
                 if axon_data['ip'] != "0.0.0.0":
-                    if (
-                        request_data.get('engine_mode') == 'exchange'
-                        and not axon_data['ip'].startswith('127.')
-                        and axon_data['ip'] not in _extra_axon_ips
-                    ):
-                        continue
                     axon_list.append(axon)
                     uid_list.append(uid)
 

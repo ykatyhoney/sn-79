@@ -335,6 +335,27 @@ bool Book::cancelOrder(OrderID orderId, std::optional<taosim::decimal_t> volumeT
 
 //-------------------------------------------------------------------------
 
+bool Book::restoreRestingOrderVolume(OrderID orderId, taosim::decimal_t deltaVolume)
+{
+    if (deltaVolume <= 0_dec) { return false; }
+
+    auto it = m_orderIdMap.find(orderId);
+    if (it == m_orderIdMap.end()) { return false; }
+
+    const auto& order = it->second;
+    auto& orderSideLevels = order->direction() == OrderDirection::BUY ? m_buyQueue : m_sellQueue;
+    auto levelIt = std::lower_bound(orderSideLevels.begin(), orderSideLevels.end(), order->price());
+    if (levelIt == orderSideLevels.end() || levelIt->price() != order->price()) { return false; }
+
+    order->setVolume(order->volume() + deltaVolume);
+    levelIt->updateVolume(deltaVolume);
+    m_topOfBook.invalidate();
+
+    return true;
+}
+
+//-------------------------------------------------------------------------
+
 std::optional<LimitOrder::Ptr> Book::getOrder(OrderID orderId) const
 {
     auto it = m_orderIdMap.find(orderId);
